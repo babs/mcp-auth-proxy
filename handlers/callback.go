@@ -7,8 +7,8 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/babs/mcp-auth-proxy/token"
+	"github.com/coreos/go-oidc/v3/oidc"
 	"go.uber.org/zap"
 	"golang.org/x/oauth2"
 )

@@ -6,8 +6,8 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/babs/mcp-auth-proxy/token"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
 

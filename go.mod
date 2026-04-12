@@ -1,6 +1,6 @@
 module github.com/babs/mcp-auth-proxy
 
-go 1.26.0
+go 1.26.1
 
 require (
 	github.com/coreos/go-oidc/v3 v3.10.0
