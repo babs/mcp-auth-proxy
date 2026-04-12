@@ -119,7 +119,7 @@ func Handler(upstreamURL string, logger *zap.Logger) (http.Handler, error) {
 		Transport:     &redirectFollowingTransport{base: http.DefaultTransport},
 		FlushInterval: -1, // Immediate flush for SSE/streaming
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			logger.Error("proxy error", zap.Error(err))
+			logger.Error("proxy_error", zap.Error(err))
 			http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		},
 	}

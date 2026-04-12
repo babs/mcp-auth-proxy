@@ -82,7 +82,7 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 
 		oauth2Token, err := oauth2Cfg.Exchange(exchangeCtx, upstreamCode)
 		if err != nil {
-			logger.Error("upstream token exchange failed", zap.Error(err))
+			logger.Error("upstream_token_exchange_failed", zap.Error(err))
 			writeOAuthError(w, http.StatusBadGateway, "server_error", "upstream authentication failed")
 			return
 		}
@@ -95,8 +95,8 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 
 		idToken, err := verify(r.Context(), rawIDToken)
 		if err != nil {
-			logger.Error("id_token verification failed", zap.Error(err))
-			writeOAuthError(w, http.StatusBadGateway, "server_error", "id_token verification failed")
+			logger.Error("id_token_verification_failed", zap.Error(err))
+			writeOAuthError(w, http.StatusBadGateway, "server_error", "id_token_verification_failed")
 			return
 		}
 
@@ -106,7 +106,7 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 			Name  string `json:"name"`
 		}
 		if err := idToken.Claims(&claims); err != nil {
-			logger.Error("failed to parse id_token claims", zap.Error(err))
+			logger.Error("id_token_claims_parse_failed", zap.Error(err))
 			writeOAuthError(w, http.StatusInternalServerError, "server_error", "failed to parse claims")
 			return
 		}
@@ -124,7 +124,7 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 
 		// Enforce group allowlist if configured
 		if len(cbCfg.AllowedGroups) > 0 && !hasOverlap(groups, cbCfg.AllowedGroups) {
-			logger.Warn("access denied: user not in allowed groups",
+			logger.Warn("access_denied_group",
 				zap.String("subject", claims.Sub),
 				zap.Strings("user_groups", groups),
 				zap.Strings("allowed_groups", cbCfg.AllowedGroups),
@@ -147,7 +147,7 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 
 		code, err := tm.SealJSON(sc)
 		if err != nil {
-			logger.Error("failed to seal authorization code", zap.Error(err))
+			logger.Error("authorization_code_seal_failed", zap.Error(err))
 			writeOAuthError(w, http.StatusInternalServerError, "server_error", "internal error")
 			return
 		}
@@ -166,7 +166,7 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 		redirectParsed.RawQuery = q2.Encode()
 		redirectURL := redirectParsed.String()
 
-		logger.Info("callback successful", zap.String("subject", claims.Sub))
+		logger.Info("callback_success", zap.String("subject", claims.Sub))
 		http.Redirect(w, r, redirectURL, http.StatusFound)
 	}
 }

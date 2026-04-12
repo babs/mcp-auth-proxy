@@ -115,8 +115,8 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 
 	accessToken, _, err := tm.Issue(audience, code.Subject, code.Email, client.ID, code.Groups, accessTokenTTL)
 	if err != nil {
-		logger.Error("failed to issue token", zap.Error(err))
-		writeOAuthError(w, http.StatusInternalServerError, "server_error", "failed to issue token")
+		logger.Error("token_issue_failed", zap.Error(err))
+		writeOAuthError(w, http.StatusInternalServerError, "server_error", "token_issue_failed")
 		return
 	}
 
@@ -132,12 +132,12 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 	}
 	refreshToken, err := tm.SealJSON(refresh)
 	if err != nil {
-		logger.Error("failed to seal refresh token", zap.Error(err))
+		logger.Error("refresh_token_seal_failed", zap.Error(err))
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "internal error")
 		return
 	}
 
-	logger.Info("token issued", zap.String("subject", code.Subject), zap.String("client_id", client.ID))
+	logger.Info("token_issued", zap.String("subject", code.Subject), zap.String("client_id", client.ID))
 
 	// RFC 6749 §5.1: token responses must not be cached
 	w.Header().Set("Cache-Control", "no-store")
@@ -173,7 +173,7 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 	// Without this check, REVOKE_BEFORE only invalidates access tokens and a
 	// compromised refresh token would silently mint fresh ones past the cutoff.
 	if !revokeBefore.IsZero() && refresh.IssuedAt.Before(revokeBefore) {
-		logger.Debug("refresh token revoked by iat cutoff",
+		logger.Debug("refresh_token_revoked_iat_cutoff",
 			zap.Time("issued_at", refresh.IssuedAt),
 			zap.Time("revoke_before", revokeBefore),
 		)
@@ -209,8 +209,8 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 
 	accessToken, _, err := tm.Issue(audience, refresh.Subject, refresh.Email, client.ID, refresh.Groups, accessTokenTTL)
 	if err != nil {
-		logger.Error("failed to issue token on refresh", zap.Error(err))
-		writeOAuthError(w, http.StatusInternalServerError, "server_error", "failed to issue token")
+		logger.Error("token_refresh_issue_failed", zap.Error(err))
+		writeOAuthError(w, http.StatusInternalServerError, "server_error", "token_issue_failed")
 		return
 	}
 
@@ -226,12 +226,12 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 	}
 	newRefreshToken, err := tm.SealJSON(newRefresh)
 	if err != nil {
-		logger.Error("failed to seal new refresh token", zap.Error(err))
+		logger.Error("refresh_token_reseal_failed", zap.Error(err))
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "internal error")
 		return
 	}
 
-	logger.Info("token refreshed", zap.String("subject", refresh.Subject), zap.String("client_id", client.ID))
+	logger.Info("token_refreshed", zap.String("subject", refresh.Subject), zap.String("client_id", client.ID))
 
 	// RFC 6749 §5.1: token responses must not be cached
 	w.Header().Set("Cache-Control", "no-store")

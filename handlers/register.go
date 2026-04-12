@@ -73,12 +73,12 @@ func Register(tm *token.Manager, logger *zap.Logger, audience string) http.Handl
 
 		clientID, err := tm.SealJSON(sc)
 		if err != nil {
-			logger.Error("failed to seal client", zap.Error(err))
+			logger.Error("client_seal_failed", zap.Error(err))
 			writeOAuthError(w, http.StatusInternalServerError, "server_error", "failed to register client")
 			return
 		}
 
-		logger.Info("client registered", zap.String("internal_id", sc.ID), zap.String("client_name", req.ClientName))
+		logger.Info("client_registered", zap.String("internal_id", sc.ID), zap.String("client_name", req.ClientName))
 
 		writeJSON(w, http.StatusCreated, registerResponse{
 			ClientID:                clientID,

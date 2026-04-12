@@ -114,7 +114,7 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 
 		internalState, err := tm.SealJSON(session)
 		if err != nil {
-			logger.Error("failed to seal session", zap.Error(err))
+			logger.Error("session_seal_failed", zap.Error(err))
 			writeOAuthError(w, http.StatusInternalServerError, "server_error", "internal error")
 			return
 		}
@@ -124,7 +124,7 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 			oauth2.SetAuthURLParam("response_mode", "query"),
 		)
 
-		logger.Debug("redirecting to IdP", zap.String("internal_client_id", client.ID))
+		logger.Debug("idp_redirect", zap.String("internal_client_id", client.ID))
 		http.Redirect(w, r, authURL, http.StatusFound)
 	}
 }

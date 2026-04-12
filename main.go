@@ -54,7 +54,7 @@ func main() {
 	defer discoveryCancel()
 	oidcProvider, err := oidc.NewProvider(discoveryCtx, cfg.OIDCIssuerURL)
 	if err != nil {
-		logger.Fatal("oidc discovery failed", zap.String("issuer", cfg.OIDCIssuerURL), zap.Error(err))
+		logger.Fatal("oidc_discovery_failed", zap.String("issuer", cfg.OIDCIssuerURL), zap.Error(err))
 	}
 
 	oauth2Cfg := &oauth2.Config{
@@ -69,12 +69,12 @@ func main() {
 
 	tm, err := token.NewManager(cfg.TokenSigningSecret)
 	if err != nil {
-		logger.Fatal("token manager init failed", zap.Error(err))
+		logger.Fatal("token_manager_init_failed", zap.Error(err))
 	}
 
 	proxyHandler, err := proxy.Handler(cfg.UpstreamMCPURL, logger)
 	if err != nil {
-		logger.Fatal("proxy handler init failed", zap.Error(err))
+		logger.Fatal("proxy_handler_init_failed", zap.Error(err))
 	}
 
 	authMW := middleware.NewAuth(tm, logger, cfg.ProxyBaseURL, cfg.RevokeBefore)
@@ -128,30 +128,30 @@ func main() {
 	defer stop()
 
 	go func() {
-		logger.Info("metrics listening", zap.String("addr", cfg.MetricsAddr))
+		logger.Info("metrics_listening", zap.String("addr", cfg.MetricsAddr))
 		if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Error("metrics listen error", zap.Error(err))
+			logger.Error("metrics_listen_error", zap.Error(err))
 		}
 	}()
 
 	go func() {
 		logger.Info("listening", zap.String("addr", cfg.ListenAddr))
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Fatal("listen error", zap.Error(err))
+			logger.Fatal("listen_error", zap.Error(err))
 		}
 	}()
 
 	<-ctx.Done()
-	logger.Info("shutting down", zap.Duration("timeout", cfg.ShutdownTimeout))
+	logger.Info("shutting_down", zap.Duration("timeout", cfg.ShutdownTimeout))
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		logger.Error("shutdown error", zap.Error(err))
+		logger.Error("shutdown_error", zap.Error(err))
 	}
 	if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
-		logger.Error("metrics shutdown error", zap.Error(err))
+		logger.Error("metrics_shutdown_error", zap.Error(err))
 	}
 }
 

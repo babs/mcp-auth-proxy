@@ -45,7 +45,7 @@ func (a *Auth) Validate(next http.Handler) http.Handler {
 
 		claims, err := a.tokenManager.Validate(tokenStr)
 		if err != nil {
-			a.logger.Debug("token validation failed", zap.Error(err))
+			a.logger.Debug("token_validation_failed", zap.Error(err))
 			a.writeAuthError(w, "invalid_token")
 			return
 		}
@@ -54,7 +54,7 @@ func (a *Auth) Validate(next http.Handler) http.Handler {
 		// proxy base URL that issued it. Two deployments accidentally sharing
 		// the same TOKEN_SIGNING_SECRET would otherwise be a confused deputy.
 		if claims.Audience != a.baseURL {
-			a.logger.Debug("token audience mismatch",
+			a.logger.Debug("token_audience_mismatch",
 				zap.String("got", claims.Audience),
 				zap.String("want", a.baseURL),
 			)
@@ -64,7 +64,7 @@ func (a *Auth) Validate(next http.Handler) http.Handler {
 
 		// Bulk revocation: reject tokens issued before the cutoff
 		if !a.revokeBefore.IsZero() && claims.IssuedAt.Before(a.revokeBefore) {
-			a.logger.Debug("token revoked by iat cutoff",
+			a.logger.Debug("token_revoked_iat_cutoff",
 				zap.Time("issued_at", claims.IssuedAt),
 				zap.Time("revoke_before", a.revokeBefore),
 			)
