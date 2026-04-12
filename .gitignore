@@ -1,0 +1,16 @@
+# Binaries
+/mcp-auth-proxy
+*.exe
+*.out
+
+# Test / coverage
+coverage.*
+*.test
+
+# Local dev
+misc/
+
+# Editor
+.idea/
+.vscode/
+*.swp
