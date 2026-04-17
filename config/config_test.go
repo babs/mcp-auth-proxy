@@ -303,3 +303,41 @@ func TestLoad_ShutdownTimeout_Negative(t *testing.T) {
 		t.Errorf("error %q should mention positive requirement", err)
 	}
 }
+
+func TestLoad_RedisKeyPrefix_Default(t *testing.T) {
+	setAllRequired(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.RedisKeyPrefix != "mcp-auth-proxy:" {
+		t.Errorf("RedisKeyPrefix default = %q, want %q", cfg.RedisKeyPrefix, "mcp-auth-proxy:")
+	}
+}
+
+func TestLoad_RedisKeyPrefix_Custom(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("REDIS_KEY_PREFIX", "tenant-42:")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.RedisKeyPrefix != "tenant-42:" {
+		t.Errorf("RedisKeyPrefix = %q, want %q", cfg.RedisKeyPrefix, "tenant-42:")
+	}
+}
+
+// TestLoad_RedisKeyPrefix_ExplicitEmpty verifies that setting REDIS_KEY_PREFIX
+// to the empty string is respected — operators can opt out of namespacing
+// without being overridden back to the default.
+func TestLoad_RedisKeyPrefix_ExplicitEmpty(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("REDIS_KEY_PREFIX", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.RedisKeyPrefix != "" {
+		t.Errorf("RedisKeyPrefix = %q, want empty (explicit opt-out)", cfg.RedisKeyPrefix)
+	}
+}

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 MODULE=$(grep module go.mod | cut -d\  -f2)

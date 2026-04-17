@@ -33,15 +33,19 @@ func NewAuth(tm *token.Manager, logger *zap.Logger, baseURL string, revokeBefore
 	return &Auth{tokenManager: tm, logger: logger, baseURL: baseURL, revokeBefore: revokeBefore}
 }
 
+// bearerPrefix is used for a case-insensitive match on the auth scheme,
+// per RFC 6750 §2.1 ("the scheme name is case-insensitive").
+const bearerPrefix = "Bearer "
+
 func (a *Auth) Validate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authHeader := r.Header.Get("Authorization")
-		if !strings.HasPrefix(authHeader, "Bearer ") {
+		if len(authHeader) <= len(bearerPrefix) || !strings.EqualFold(authHeader[:len(bearerPrefix)], bearerPrefix) {
 			a.writeAuthError(w, "missing or malformed Authorization header")
 			return
 		}
 
-		tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
+		tokenStr := strings.TrimSpace(authHeader[len(bearerPrefix):])
 
 		claims, err := a.tokenManager.Validate(tokenStr)
 		if err != nil {

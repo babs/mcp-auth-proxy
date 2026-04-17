@@ -7,14 +7,20 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/babs/mcp-auth-proxy/metrics"
 	"github.com/babs/mcp-auth-proxy/token"
 	"github.com/coreos/go-oidc/v3/oidc"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"golang.org/x/oauth2"
 )
 
 const (
-	codeTTL         = 5 * time.Minute
+	// OAuth 2.1 §4.1.3 / Security BCP §2.1.1: authorization codes must be
+	// short-lived. 60s is tight enough to narrow the replay window while
+	// still tolerating slow clients and network hops. Combined with PKCE
+	// and, when configured, the replay store, this approximates single-use.
+	codeTTL         = 60 * time.Second
 	oidcExchangeTTL = 10 * time.Second
 )
 
@@ -96,18 +102,33 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 		idToken, err := verify(r.Context(), rawIDToken)
 		if err != nil {
 			logger.Error("id_token_verification_failed", zap.Error(err))
-			writeOAuthError(w, http.StatusBadGateway, "server_error", "id_token_verification_failed")
+			writeOAuthError(w, http.StatusBadGateway, "server_error", "id token verification failed", "id_token_verification_failed")
 			return
 		}
 
 		var claims struct {
-			Sub   string `json:"sub"`
-			Email string `json:"email"`
-			Name  string `json:"name"`
+			Sub           string `json:"sub"`
+			Email         string `json:"email"`
+			EmailVerified *bool  `json:"email_verified"`
+			Name          string `json:"name"`
 		}
 		if err := idToken.Claims(&claims); err != nil {
 			logger.Error("id_token_claims_parse_failed", zap.Error(err))
 			writeOAuthError(w, http.StatusInternalServerError, "server_error", "failed to parse claims")
+			return
+		}
+
+		// Reject IdP-unverified emails: without this, a user who self-signs up
+		// with someone else's email at the IdP would have that email forwarded
+		// verbatim as X-User-Email to the upstream, which may authorize by email.
+		// If the claim is absent, we accept — some IdPs do not emit it.
+		if claims.EmailVerified != nil && !*claims.EmailVerified {
+			metrics.AccessDenied.WithLabelValues("email_unverified").Inc()
+			logger.Warn("access_denied_email_unverified",
+				zap.String("subject", claims.Sub),
+				zap.String("email", claims.Email),
+			)
+			writeOAuthError(w, http.StatusForbidden, "access_denied", "email address is not verified", "email_not_verified")
 			return
 		}
 
@@ -124,6 +145,7 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 
 		// Enforce group allowlist if configured
 		if len(cbCfg.AllowedGroups) > 0 && !hasOverlap(groups, cbCfg.AllowedGroups) {
+			metrics.AccessDenied.WithLabelValues("group").Inc()
 			logger.Warn("access_denied_group",
 				zap.String("subject", claims.Sub),
 				zap.Strings("user_groups", groups),
@@ -134,6 +156,7 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 		}
 
 		sc := sealedCode{
+			TokenID:       uuid.New().String(),
 			ClientID:      session.ClientID,
 			RedirectURI:   session.RedirectURI,
 			CodeChallenge: session.CodeChallenge,

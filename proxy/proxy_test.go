@@ -164,6 +164,48 @@ func TestProxy_NoGroupsHeader(t *testing.T) {
 	}
 }
 
+func TestProxy_StripsSpoofedIdentityHeaders(t *testing.T) {
+	var gotSub, gotEmail, gotGroups string
+	var hasGroups bool
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSub = r.Header.Get("X-User-Sub")
+		gotEmail = r.Header.Get("X-User-Email")
+		gotGroups = r.Header.Get("X-User-Groups")
+		_, hasGroups = r.Header["X-User-Groups"]
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	handler, err := Handler(upstream.URL, zap.NewNop())
+	if err != nil {
+		t.Fatalf("Handler: %v", err)
+	}
+
+	ctx := context.WithValue(context.Background(), middleware.ContextSubject, "real-sub")
+	ctx = context.WithValue(ctx, middleware.ContextEmail, "real@example.com")
+	req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/mcp", nil)
+	req.Header.Set("X-User-Sub", "spoofed-sub")
+	req.Header.Set("X-User-Email", "spoofed@example.com")
+	req.Header.Set("X-User-Groups", "admin,root")
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	if gotSub != "real-sub" {
+		t.Fatalf("expected X-User-Sub=real-sub, got %q", gotSub)
+	}
+	if gotEmail != "real@example.com" {
+		t.Fatalf("expected X-User-Email=real@example.com, got %q", gotEmail)
+	}
+	if hasGroups {
+		t.Fatalf("expected spoofed X-User-Groups to be removed, got %q", gotGroups)
+	}
+}
+
 func TestSingleJoiningSlash(t *testing.T) {
 	tests := []struct {
 		a, b, want string

@@ -11,6 +11,7 @@ import (
 type OAuthError struct {
 	Error            string `json:"error"`
 	ErrorDescription string `json:"error_description,omitempty"`
+	ErrorCode        string `json:"error_code,omitempty"`
 }
 
 // Sealed types: all OAuth flow state is encrypted into tokens/parameters,
@@ -40,7 +41,12 @@ type sealedSession struct {
 }
 
 // sealedCode is the encrypted payload inside an authorization code.
+// TokenID uniquely identifies the code and is used as the key for single-use
+// enforcement when a replay store is wired (RFC 6749 §4.1.2: codes MUST NOT
+// be reusable). Without a store, the code is still unique but replayable
+// within its TTL.
 type sealedCode struct {
+	TokenID       string    `json:"tid"`
 	ClientID      string    `json:"cid"`
 	RedirectURI   string    `json:"ru"`
 	CodeChallenge string    `json:"cc"`
@@ -55,7 +61,16 @@ type sealedCode struct {
 // sealedRefresh is the encrypted payload inside a refresh token.
 // IssuedAt enables REVOKE_BEFORE bulk revocation; without it, a compromised
 // refresh token would survive a cutoff and silently mint fresh access tokens.
+//
+// TokenID is unique per refresh; FamilyID is constant across rotations
+// (minted at the initial authorization_code grant, inherited by every
+// rotated token). When a replay store is wired, TokenID is claimed
+// single-use and any reuse revokes the whole FamilyID — OAuth 2.1 §6.1 /
+// RFC 6749 §10.4 refresh-rotation-with-reuse-detection. Without a store
+// both fields are set but unused (stateless fallback).
 type sealedRefresh struct {
+	TokenID   string    `json:"tid"`
+	FamilyID  string    `json:"fam"`
 	Subject   string    `json:"sub"`
 	Email     string    `json:"email"`
 	Groups    []string  `json:"grp,omitempty"`
@@ -74,8 +89,12 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
-func writeOAuthError(w http.ResponseWriter, status int, code, desc string) {
-	writeJSON(w, status, OAuthError{Error: code, ErrorDescription: desc})
+func writeOAuthError(w http.ResponseWriter, status int, code, desc string, errorCode ...string) {
+	oauthErr := OAuthError{Error: code, ErrorDescription: desc}
+	if len(errorCode) > 0 {
+		oauthErr.ErrorCode = errorCode[0]
+	}
+	writeJSON(w, status, oauthErr)
 }
 
 // hasOverlap returns true if any element in userGroups matches an element in allowed.

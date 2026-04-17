@@ -33,8 +33,13 @@
 - Federates authentication to **any OIDC-compliant IdP** via auto-discovery
   (no vendor lock-in, zero IdP-specific code)
 - Reverse-proxies to your **unmodified** upstream MCP server
-- **Stateless** — no database, no Redis, no sticky sessions; scale
+- **Stateless by default** — no database, no sticky sessions; scale
   horizontally by sharing one secret
+- **Optional Redis** unlocks strict single-use authorization codes and
+  refresh-rotation reuse detection (OAuth 2.1 §6.1) across replicas
+- Per-IP **rate limiting** on every pre-auth endpoint, `email_verified`
+  enforcement on the IdP id_token, and **Prometheus metrics** for every
+  security-relevant event
 
 ---
 
@@ -116,6 +121,9 @@ All configuration via **environment variables**. Bold = required.
 | `REVOKE_BEFORE` | (empty) | RFC3339 cutoff for bulk revocation (applies to access *and* refresh tokens) |
 | `PKCE_REQUIRED` | `true` | Set `false` for clients that omit PKCE (Cursor, MCP Inspector, ChatGPT) |
 | `SHUTDOWN_TIMEOUT` | `120s` | Graceful shutdown; must be ≥ longest expected SSE stream |
+| `REDIS_URL` | (empty) | Optional. Enables single-use authz codes + refresh-rotation reuse detection. `rediss://` for TLS |
+| `REDIS_KEY_PREFIX` | `mcp-auth-proxy:` | Key prefix for shared Redis; set to empty to opt out of namespacing |
+| `RATE_LIMIT_ENABLED` | `true` | Per-IP rate limiting on pre-auth endpoints. Disable only behind a WAF that already enforces it |
 
 ---
 
@@ -132,7 +140,7 @@ required to operate this service.
 |---|---|---|
 | Client registration | `client_id` | 24h |
 | Authorize session | IdP `state` parameter | 10min |
-| Authorization code | `code` parameter | 5min |
+| Authorization code | `code` parameter | 60s |
 | Access token | Opaque bearer | 1h |
 | Refresh token | Opaque bearer | 7d |
 
@@ -156,7 +164,8 @@ rollout notes, and K8s deployment shape.
 | `GET  /authorize` | PKCE authorization endpoint |
 | `GET  /callback` | OIDC callback from the IdP |
 | `POST /token` | `authorization_code` + `refresh_token` grants |
-| `GET  /healthz` | Liveness / readiness probe |
+| `GET  /healthz` | Liveness probe (always 200 while the process is up) |
+| `GET  /readyz` | Readiness probe (503 when Redis is configured but unreachable) |
 | `*` (any other path) | Reverse-proxied to `UPSTREAM_MCP_URL` after Bearer check |
 | `GET /metrics` (port 9090) | Prometheus metrics |
 
@@ -166,10 +175,20 @@ rollout notes, and K8s deployment shape.
 
 - **Structured logs** — zap, JSON in production, console when run on a TTY.
   Every request carries a `request_id` in the log and in the
-  `X-Request-Id` response header.
-- **Metrics** — Prometheus on a dedicated port so it's never exposed
-  through the public listener.
-- **Health** — `GET /healthz` returns `200 OK`.
+  `X-Request-Id` response header. Inbound `X-Request-Id` is stripped to
+  prevent log-forgery.
+- **Metrics** — Prometheus on a dedicated port (`:9090`, separate listener,
+  not exposed through the public router). Alongside the default Go
+  runtime counters, the proxy emits:
+  - `mcp_auth_tokens_issued_total{grant_type}` — access tokens minted
+  - `mcp_auth_access_denied_total{reason}` — group / `email_unverified`
+    / `refresh_family_revoked` rejections
+  - `mcp_auth_replay_detected_total{kind}` — `code` or `refresh` replays
+    caught by the Redis-backed store
+  - `mcp_auth_rate_limited_total{endpoint}` — httprate 429s by endpoint
+  - `mcp_auth_clients_registered_total` — RFC 7591 registrations
+- **Health** — `GET /healthz` (liveness) and `GET /readyz` (reflects
+  Redis reachability when `REDIS_URL` is set).
 
 ---
 

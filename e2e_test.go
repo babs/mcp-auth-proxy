@@ -28,9 +28,10 @@ import (
 
 // mockOIDCProvider spins up a fake OIDC provider with discovery, JWKS, and token endpoint.
 type mockOIDCProvider struct {
-	Server     *httptest.Server
-	PrivateKey *rsa.PrivateKey
-	ClientID   string
+	Server        *httptest.Server
+	PrivateKey    *rsa.PrivateKey
+	ClientID      string
+	EmailVerified *bool // when non-nil, included in issued id_tokens
 }
 
 func newMockOIDCProvider(t *testing.T) *mockOIDCProvider {
@@ -74,7 +75,7 @@ func newMockOIDCProvider(t *testing.T) *mockOIDCProvider {
 	})
 
 	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
-		idToken := m.signIDToken(t, "test-subject-123", "user@example.com", "Test User", []string{"mcp-users", "dev"})
+		idToken := m.signIDToken(t, "test-subject-123", "user@example.com", "Test User", []string{"mcp-users", "dev"}, m.EmailVerified)
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
@@ -89,7 +90,7 @@ func newMockOIDCProvider(t *testing.T) *mockOIDCProvider {
 	return m
 }
 
-func (m *mockOIDCProvider) signIDToken(t *testing.T, sub, email, name string, groups []string) string {
+func (m *mockOIDCProvider) signIDToken(t *testing.T, sub, email, name string, groups []string, emailVerified *bool) string {
 	t.Helper()
 
 	signer, err := jose.NewSigner(
@@ -112,6 +113,9 @@ func (m *mockOIDCProvider) signIDToken(t *testing.T, sub, email, name string, gr
 	}
 	if len(groups) > 0 {
 		claims["groups"] = groups
+	}
+	if emailVerified != nil {
+		claims["email_verified"] = *emailVerified
 	}
 
 	raw, err := josejwt.Signed(signer).Claims(claims).Serialize()
@@ -200,7 +204,7 @@ func buildTestProxy(t *testing.T, oidcProvider *mockOIDCProvider, mcpServer *moc
 	r.Get("/callback", handlers.Callback(tm, zap.NewNop(), proxyBaseURL, oauth2Cfg, verifier, handlers.CallbackConfig{
 		GroupsClaim: "groups",
 	}))
-	r.Post("/token", handlers.Token(tm, zap.NewNop(), proxyBaseURL, time.Time{}))
+	r.Post("/token", handlers.Token(tm, zap.NewNop(), proxyBaseURL, time.Time{}, nil))
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
 	r.Group(func(r chi.Router) {
 		r.Use(authMW.Validate)
@@ -526,4 +530,152 @@ func TestE2E_FullOAuthMCPFlow(t *testing.T) {
 			t.Fatalf("expected 200, got %d", resp.StatusCode)
 		}
 	})
+}
+
+// driveAuthToCallback walks a client through registration → authorize → callback
+// against the given proxy and returns the /callback response. It is shared by
+// the email_verified tests which only differ in the id_token the mock IdP
+// emits.
+func driveAuthToCallback(t *testing.T, client *http.Client, proxyURL string) *http.Response {
+	t.Helper()
+
+	redirectURI := "https://claude.ai/api/mcp/auth_callback"
+	body := fmt.Sprintf(`{"redirect_uris":["%s"],"client_name":"Claude"}`, redirectURI)
+
+	regReq, err := http.NewRequestWithContext(t.Context(), http.MethodPost, proxyURL+"/register", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("build /register: %v", err)
+	}
+	regReq.Header.Set("Content-Type", "application/json")
+	regResp, err := client.Do(regReq)
+	if err != nil {
+		t.Fatalf("POST /register: %v", err)
+	}
+	var reg map[string]any
+	if err := json.NewDecoder(regResp.Body).Decode(&reg); err != nil {
+		t.Fatalf("decode /register: %v", err)
+	}
+	if err := regResp.Body.Close(); err != nil {
+		t.Fatalf("close /register body: %v", err)
+	}
+	clientID := reg["client_id"].(string)
+
+	codeVerifier := "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+	codeChallenge := handlers.ComputePKCEChallenge(codeVerifier)
+
+	params := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {clientID},
+		"redirect_uri":          {redirectURI},
+		"code_challenge":        {codeChallenge},
+		"code_challenge_method": {"S256"},
+		"state":                 {"s"},
+	}
+	authzReq, err := http.NewRequestWithContext(t.Context(), http.MethodGet, proxyURL+"/authorize?"+params.Encode(), nil)
+	if err != nil {
+		t.Fatalf("build /authorize: %v", err)
+	}
+	authzResp, err := client.Do(authzReq)
+	if err != nil {
+		t.Fatalf("GET /authorize: %v", err)
+	}
+	idpURL, err := url.Parse(authzResp.Header.Get("Location"))
+	if err != nil {
+		t.Fatalf("parse IdP redirect: %v", err)
+	}
+	if err := authzResp.Body.Close(); err != nil {
+		t.Fatalf("close /authorize body: %v", err)
+	}
+	state := idpURL.Query().Get("state")
+
+	cbReq, err := http.NewRequestWithContext(t.Context(), http.MethodGet, proxyURL+"/callback?code=fake&state="+url.QueryEscape(state), nil)
+	if err != nil {
+		t.Fatalf("build /callback: %v", err)
+	}
+	cbResp, err := client.Do(cbReq)
+	if err != nil {
+		t.Fatalf("GET /callback: %v", err)
+	}
+	return cbResp
+}
+
+// TestE2E_RejectsUnverifiedEmail verifies that when the IdP emits
+// email_verified: false in the id_token, /callback refuses to issue an
+// authorization code. Forwarding an unverified email to the upstream MCP
+// server would let a user impersonate any email they are willing to type
+// at a permissive IdP.
+func TestE2E_RejectsUnverifiedEmail(t *testing.T) {
+	oidcMock := newMockOIDCProvider(t)
+	defer oidcMock.Close()
+	verified := false
+	oidcMock.EmailVerified = &verified
+
+	mcpMock := newMockMCPServer(t)
+	defer mcpMock.Close()
+
+	proxyServer := httptest.NewServer(buildTestProxy(t, oidcMock, mcpMock, "http://proxy.test"))
+	defer proxyServer.Close()
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	cbResp := driveAuthToCallback(t, client, proxyServer.URL)
+	defer func() {
+		if err := cbResp.Body.Close(); err != nil {
+			t.Errorf("close /callback body: %v", err)
+		}
+	}()
+
+	if cbResp.StatusCode != http.StatusForbidden {
+		b, _ := io.ReadAll(cbResp.Body)
+		t.Fatalf("expected 403 for unverified email, got %d: %s", cbResp.StatusCode, b)
+	}
+
+	var cbErr map[string]any
+	if err := json.NewDecoder(cbResp.Body).Decode(&cbErr); err != nil {
+		t.Fatalf("decode /callback: %v", err)
+	}
+	if cbErr["error"] != "access_denied" {
+		t.Errorf("expected error=access_denied, got %v", cbErr["error"])
+	}
+	if cbErr["error_code"] != "email_not_verified" {
+		t.Errorf("expected error_code=email_not_verified, got %v", cbErr["error_code"])
+	}
+}
+
+// TestE2E_AcceptsVerifiedEmail confirms that when the IdP explicitly asserts
+// email_verified=true, the callback succeeds — i.e. the new check is not
+// overly strict when the claim is present and truthful.
+func TestE2E_AcceptsVerifiedEmail(t *testing.T) {
+	oidcMock := newMockOIDCProvider(t)
+	defer oidcMock.Close()
+	verified := true
+	oidcMock.EmailVerified = &verified
+
+	mcpMock := newMockMCPServer(t)
+	defer mcpMock.Close()
+
+	proxyServer := httptest.NewServer(buildTestProxy(t, oidcMock, mcpMock, "http://proxy.test"))
+	defer proxyServer.Close()
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	cbResp := driveAuthToCallback(t, client, proxyServer.URL)
+	defer func() {
+		if err := cbResp.Body.Close(); err != nil {
+			t.Errorf("close /callback body: %v", err)
+		}
+	}()
+
+	if cbResp.StatusCode != http.StatusFound {
+		b, _ := io.ReadAll(cbResp.Body)
+		t.Fatalf("expected 302 for verified email, got %d: %s", cbResp.StatusCode, b)
+	}
 }

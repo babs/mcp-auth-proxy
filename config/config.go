@@ -22,6 +22,9 @@ type Config struct {
 	RevokeBefore       time.Time     // tokens issued before this time are rejected (zero = disabled)
 	PKCERequired       bool          // require PKCE on /authorize (default true, set false for Cursor/MCP Inspector)
 	ShutdownTimeout    time.Duration // graceful shutdown deadline; raise to drain long-lived SSE streams
+	RedisURL           string        // optional; when set, enables single-use authorization codes (replay protection)
+	RedisKeyPrefix     string        // prefix applied to every Redis key (for shared-Redis deployments); default "mcp-auth-proxy:"
+	RateLimitEnabled   bool          // enable per-IP rate limiting on pre-auth endpoints (default true)
 }
 
 func Load() (*Config, error) {
@@ -101,6 +104,16 @@ func Load() (*Config, error) {
 			}
 		}
 	}
+
+	c.RedisURL = os.Getenv("REDIS_URL")
+	// LookupEnv so operators can opt into an empty prefix explicitly
+	// (REDIS_KEY_PREFIX="") without tripping the default.
+	if v, ok := os.LookupEnv("REDIS_KEY_PREFIX"); ok {
+		c.RedisKeyPrefix = v
+	} else {
+		c.RedisKeyPrefix = "mcp-auth-proxy:"
+	}
+	c.RateLimitEnabled = strings.ToLower(os.Getenv("RATE_LIMIT_ENABLED")) != "false"
 
 	return c, nil
 }

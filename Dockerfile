@@ -19,7 +19,10 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
       -X 'main.ProjectURL=${PROJECT_URL}'" \
     -o mcp-auth-proxy ./main.go
 
-FROM debian:bookworm-slim
+# distroless/static-debian13:nonroot ships ca-certificates and runs as UID
+# 65532 by default — no shell, no apt, minimal attack surface. The static
+# Go binary (CGO_ENABLED=0) needs nothing else.
+FROM gcr.io/distroless/static-debian13:nonroot
 
 ARG BUILD_TIMESTAMP="1970-01-01T00:00:00+00:00"
 ARG COMMIT_HASH="00000000-dirty"
@@ -31,13 +34,8 @@ LABEL org.opencontainers.image.created=${BUILD_TIMESTAMP}
 LABEL org.opencontainers.image.version=${VERSION}
 LABEL org.opencontainers.image.revision=${COMMIT_HASH}
 
-# Security: install CA certs for TLS, then run as non-root
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && groupadd -r app && useradd -r -g app -s /usr/sbin/nologin app
-
 COPY --from=builder /app/mcp-auth-proxy /usr/local/bin/mcp-auth-proxy
 
-USER app:app
-EXPOSE 8080
-ENTRYPOINT ["mcp-auth-proxy"]
+USER nonroot:nonroot
+EXPOSE 8080 9090
+ENTRYPOINT ["/usr/local/bin/mcp-auth-proxy"]
