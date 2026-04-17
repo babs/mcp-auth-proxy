@@ -12,8 +12,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/babs/mcp-auth-proxy/replay"
 	"github.com/babs/mcp-auth-proxy/token"
 	"github.com/coreos/go-oidc/v3/oidc"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"golang.org/x/oauth2"
 )
@@ -116,6 +118,54 @@ func sealRefresh(t *testing.T, tm *token.Manager, subject, email, clientUUID str
 		t.Fatalf("SealJSON: %v", err)
 	}
 	return tok
+}
+
+func TestWriteOAuthError_OmitsErrorCodeByDefault(t *testing.T) {
+	rr := httptest.NewRecorder()
+
+	writeOAuthError(rr, http.StatusBadRequest, "invalid_request", "missing required parameters")
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rr.Code)
+	}
+
+	var oauthErr OAuthError
+	if err := json.NewDecoder(rr.Body).Decode(&oauthErr); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if oauthErr.Error != "invalid_request" {
+		t.Fatalf("expected invalid_request, got %q", oauthErr.Error)
+	}
+	if oauthErr.ErrorDescription != "missing required parameters" {
+		t.Fatalf("expected human-readable description, got %q", oauthErr.ErrorDescription)
+	}
+	if oauthErr.ErrorCode != "" {
+		t.Fatalf("expected empty error_code, got %q", oauthErr.ErrorCode)
+	}
+}
+
+func TestWriteOAuthError_IncludesOptionalErrorCode(t *testing.T) {
+	rr := httptest.NewRecorder()
+
+	writeOAuthError(rr, http.StatusBadGateway, "server_error", "id token verification failed", "id_token_verification_failed")
+
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502, got %d", rr.Code)
+	}
+
+	var oauthErr OAuthError
+	if err := json.NewDecoder(rr.Body).Decode(&oauthErr); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if oauthErr.Error != "server_error" {
+		t.Fatalf("expected server_error, got %q", oauthErr.Error)
+	}
+	if oauthErr.ErrorDescription != "id token verification failed" {
+		t.Fatalf("expected human-readable description, got %q", oauthErr.ErrorDescription)
+	}
+	if oauthErr.ErrorCode != "id_token_verification_failed" {
+		t.Fatalf("expected error_code id_token_verification_failed, got %q", oauthErr.ErrorCode)
+	}
 }
 
 // --- Discovery ---
@@ -524,7 +574,7 @@ func TestTokenAuthCodeFlow(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rr := httptest.NewRecorder()
 
-	Token(tm, logger, testBaseURL, time.Time{})(rr, req)
+	Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
@@ -590,7 +640,7 @@ func TestTokenAuthCode_InvalidCode(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rr := httptest.NewRecorder()
 
-	Token(tm, logger, testBaseURL, time.Time{})(rr, req)
+	Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", rr.Code)
@@ -640,7 +690,7 @@ func TestTokenAuthCode_ExpiredCode(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rr := httptest.NewRecorder()
 
-	Token(tm, logger, testBaseURL, time.Time{})(rr, req)
+	Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
@@ -679,7 +729,7 @@ func TestTokenAuthCode_BadPKCE(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rr := httptest.NewRecorder()
 
-	Token(tm, logger, testBaseURL, time.Time{})(rr, req)
+	Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
@@ -722,7 +772,7 @@ func TestTokenAuthCode_ClientMismatch(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rr := httptest.NewRecorder()
 
-	Token(tm, logger, testBaseURL, time.Time{})(rr, req)
+	Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
@@ -756,7 +806,7 @@ func TestTokenRefreshFlow(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rr := httptest.NewRecorder()
 
-	Token(tm, logger, testBaseURL, time.Time{})(rr, req)
+	Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
@@ -828,7 +878,7 @@ func TestTokenRefresh_ExpiredRefresh(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rr := httptest.NewRecorder()
 
-	Token(tm, logger, testBaseURL, time.Time{})(rr, req)
+	Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
@@ -862,7 +912,7 @@ func TestTokenRefresh_ClientMismatch(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rr := httptest.NewRecorder()
 
-	Token(tm, logger, testBaseURL, time.Time{})(rr, req)
+	Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
@@ -1013,7 +1063,7 @@ func TestToken_UnsupportedGrantType(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rr := httptest.NewRecorder()
 
-	Token(tm, logger, testBaseURL, time.Time{})(rr, req)
+	Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", rr.Code)
@@ -1241,7 +1291,7 @@ func TestTokenAuthCode_ExpiredClient(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rr := httptest.NewRecorder()
 
-	Token(tm, logger, testBaseURL, time.Time{})(rr, req)
+	Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
@@ -1283,7 +1333,7 @@ func TestTokenRefresh_ExpiredClient(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rr := httptest.NewRecorder()
 
-	Token(tm, logger, testBaseURL, time.Time{})(rr, req)
+	Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
@@ -1320,7 +1370,7 @@ func TestTokenAuthCode_VerifierTooShort(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rr := httptest.NewRecorder()
 
-	Token(tm, logger, testBaseURL, time.Time{})(rr, req)
+	Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
@@ -1355,7 +1405,7 @@ func TestTokenAuthCode_VerifierTooLong(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rr := httptest.NewRecorder()
 
-	Token(tm, logger, testBaseURL, time.Time{})(rr, req)
+	Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
@@ -1407,7 +1457,7 @@ func TestTokenAuthCodeFlow_GroupsPreserved(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rr := httptest.NewRecorder()
 
-	Token(tm, logger, testBaseURL, time.Time{})(rr, req)
+	Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
@@ -1456,7 +1506,7 @@ func TestTokenRefreshFlow_GroupsPreserved(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rr := httptest.NewRecorder()
 
-	Token(tm, logger, testBaseURL, time.Time{})(rr, req)
+	Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
@@ -1738,7 +1788,7 @@ func TestTokenAuthCode_RejectsForeignCode(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rr := httptest.NewRecorder()
 
-	Token(tm, logger, testBaseURL, time.Time{})(rr, req)
+	Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for foreign-audience code, got %d: %s", rr.Code, rr.Body.String())
@@ -1779,7 +1829,7 @@ func TestTokenRefresh_RejectsForeignRefresh(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rr := httptest.NewRecorder()
 
-	Token(tm, logger, testBaseURL, time.Time{})(rr, req)
+	Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for foreign-audience refresh, got %d: %s", rr.Code, rr.Body.String())
@@ -1827,7 +1877,7 @@ func TestTokenRefresh_RevokedByCutoff(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rr := httptest.NewRecorder()
 
-	Token(tm, logger, testBaseURL, cutoff)(rr, req)
+	Token(tm, logger, testBaseURL, cutoff, nil)(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for revoked refresh, got %d: %s", rr.Code, rr.Body.String())
@@ -1870,7 +1920,7 @@ func TestTokenRefresh_NotRevokedAfterCutoff(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rr := httptest.NewRecorder()
 
-	Token(tm, logger, testBaseURL, cutoff)(rr, req)
+	Token(tm, logger, testBaseURL, cutoff, nil)(rr, req)
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200 for refresh after cutoff, got %d: %s", rr.Code, rr.Body.String())
@@ -1906,7 +1956,7 @@ func TestTokenRefresh_NewTokenCarriesIssuedAt(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rr := httptest.NewRecorder()
-	Token(tm, logger, testBaseURL, time.Time{})(rr, req)
+	Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
@@ -1924,5 +1974,257 @@ func TestTokenRefresh_NewTokenCarriesIssuedAt(t *testing.T) {
 	}
 	if newRefresh.Audience != testBaseURL {
 		t.Errorf("rotated refresh audience: got %q, want %q", newRefresh.Audience, testBaseURL)
+	}
+}
+
+// --- Replay protection (single-use authorization codes) ---
+
+// TestTokenAuthCode_ReplayStore_RejectsSecondUse verifies that when a replay
+// store is wired, a second attempt to exchange the same authorization code is
+// rejected with invalid_grant — the stateless proxy cannot detect this on its
+// own and relies on the store for single-use enforcement (RFC 6749 §4.1.2).
+func TestTokenAuthCode_ReplayStore_RejectsSecondUse(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+	store := replay.NewMemoryStore()
+
+	redirectURI := "https://app.example.com/callback"
+	encClientID, internalID := registerClient(t, tm, []string{redirectURI})
+
+	codeVerifier := "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+	codeChallenge := pkceChallenge(codeVerifier)
+
+	sc := sealedCode{
+		TokenID:       uuid.New().String(),
+		ClientID:      internalID,
+		RedirectURI:   redirectURI,
+		CodeChallenge: codeChallenge,
+		Subject:       "user-sub",
+		Email:         "user@example.com",
+		Audience:      testBaseURL,
+		ExpiresAt:     time.Now().Add(60 * time.Second),
+	}
+	authCode, err := tm.SealJSON(sc)
+	if err != nil {
+		t.Fatalf("SealJSON: %v", err)
+	}
+
+	exchange := func() *httptest.ResponseRecorder {
+		form := url.Values{
+			"grant_type":    {"authorization_code"},
+			"code":          {authCode},
+			"redirect_uri":  {redirectURI},
+			"client_id":     {encClientID},
+			"code_verifier": {codeVerifier},
+		}
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/token", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rr := httptest.NewRecorder()
+		Token(tm, logger, testBaseURL, time.Time{}, store)(rr, req)
+		return rr
+	}
+
+	// First exchange: must succeed.
+	first := exchange()
+	if first.Code != http.StatusOK {
+		t.Fatalf("first exchange: want 200, got %d: %s", first.Code, first.Body.String())
+	}
+
+	// Second exchange with the same code: must be rejected.
+	second := exchange()
+	if second.Code != http.StatusBadRequest {
+		t.Fatalf("second exchange: want 400, got %d: %s", second.Code, second.Body.String())
+	}
+	var oauthErr OAuthError
+	if err := json.NewDecoder(second.Body).Decode(&oauthErr); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if oauthErr.Error != "invalid_grant" {
+		t.Errorf("expected invalid_grant, got %q", oauthErr.Error)
+	}
+	if oauthErr.ErrorCode != "code_replay" {
+		t.Errorf("expected error_code=code_replay, got %q", oauthErr.ErrorCode)
+	}
+}
+
+// TestTokenRefresh_ReplayStore_ReuseRevokesFamily verifies RFC 6749 §10.4 /
+// OAuth 2.1 §6.1 refresh-rotation-with-reuse-detection. Legitimate rotation
+// works; replaying an already-rotated refresh is detected and revokes every
+// sibling token in the family — including the freshly minted one the
+// legitimate client is holding.
+func TestTokenRefresh_ReplayStore_ReuseRevokesFamily(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+	store := replay.NewMemoryStore()
+
+	encClientID, internalID := registerClient(t, tm, []string{"https://app.example.com/callback"})
+
+	familyID := uuid.New().String()
+	originalRefresh := sealedRefresh{
+		TokenID:   uuid.New().String(),
+		FamilyID:  familyID,
+		Subject:   "user-sub",
+		Email:     "user@example.com",
+		ClientID:  internalID,
+		Audience:  testBaseURL,
+		IssuedAt:  time.Now(),
+		ExpiresAt: time.Now().Add(7 * 24 * time.Hour),
+	}
+	originalStr, err := tm.SealJSON(originalRefresh)
+	if err != nil {
+		t.Fatalf("SealJSON: %v", err)
+	}
+
+	refreshExchange := func(refreshStr string) *httptest.ResponseRecorder {
+		form := url.Values{
+			"grant_type":    {"refresh_token"},
+			"refresh_token": {refreshStr},
+			"client_id":     {encClientID},
+		}
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/token", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rr := httptest.NewRecorder()
+		Token(tm, logger, testBaseURL, time.Time{}, store)(rr, req)
+		return rr
+	}
+
+	// 1. First rotation: succeeds and returns a new refresh token with the
+	// same FamilyID.
+	first := refreshExchange(originalStr)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first rotation: want 200, got %d: %s", first.Code, first.Body.String())
+	}
+	var tok1 map[string]any
+	if err := json.NewDecoder(first.Body).Decode(&tok1); err != nil {
+		t.Fatalf("decode first: %v", err)
+	}
+	newRefreshStr := tok1["refresh_token"].(string)
+
+	var rotated sealedRefresh
+	if err := tm.OpenJSON(newRefreshStr, &rotated); err != nil {
+		t.Fatalf("OpenJSON rotated: %v", err)
+	}
+	if rotated.FamilyID != familyID {
+		t.Errorf("rotated FamilyID: got %q, want %q", rotated.FamilyID, familyID)
+	}
+	if rotated.TokenID == originalRefresh.TokenID {
+		t.Error("rotated TokenID should differ from original")
+	}
+
+	// 2. Replay the original (already-rotated) refresh token: must be
+	// rejected with reuse detection and the family must now be marked
+	// revoked.
+	replayAttempt := refreshExchange(originalStr)
+	if replayAttempt.Code != http.StatusBadRequest {
+		t.Fatalf("reuse: want 400, got %d: %s", replayAttempt.Code, replayAttempt.Body.String())
+	}
+	var reuseErr OAuthError
+	if err := json.NewDecoder(replayAttempt.Body).Decode(&reuseErr); err != nil {
+		t.Fatalf("decode reuse: %v", err)
+	}
+	if reuseErr.ErrorCode != "refresh_reuse_detected" {
+		t.Errorf("expected error_code=refresh_reuse_detected, got %q", reuseErr.ErrorCode)
+	}
+
+	// 3. The legitimate rotated refresh is now invalid too — the family is
+	// dead. The client has to re-authenticate via /authorize.
+	afterRevoke := refreshExchange(newRefreshStr)
+	if afterRevoke.Code != http.StatusBadRequest {
+		t.Fatalf("post-revoke rotated use: want 400, got %d: %s", afterRevoke.Code, afterRevoke.Body.String())
+	}
+	var revokedErr OAuthError
+	if err := json.NewDecoder(afterRevoke.Body).Decode(&revokedErr); err != nil {
+		t.Fatalf("decode revoked: %v", err)
+	}
+	if revokedErr.ErrorCode != "refresh_family_revoked" {
+		t.Errorf("expected error_code=refresh_family_revoked, got %q", revokedErr.ErrorCode)
+	}
+}
+
+// TestTokenRefresh_NoReplayStore_RotationStillWorks confirms that without a
+// replay store, rotation is non-strict: a refresh token remains usable
+// multiple times (pre-existing stateless behavior is preserved).
+func TestTokenRefresh_NoReplayStore_RotationStillWorks(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+
+	encClientID, internalID := registerClient(t, tm, []string{"https://app.example.com/callback"})
+
+	refreshStr := sealRefresh(t, tm, "user-sub", "user@example.com", internalID)
+
+	form := url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {refreshStr},
+		"client_id":     {encClientID},
+	}
+
+	// Two consecutive exchanges of the SAME refresh must both succeed when
+	// no replay store is wired — that is the current stateless contract.
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/token", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rr := httptest.NewRecorder()
+		Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("iteration %d: want 200, got %d", i, rr.Code)
+		}
+	}
+}
+
+// TestTokenAuthCode_ReplayStore_PKCEFailureDoesNotBurnCode verifies that the
+// single-use claim is only recorded after PKCE passes, so that a bad verifier
+// (typo, MITM) does not lock the legitimate client out of its own code.
+func TestTokenAuthCode_ReplayStore_PKCEFailureDoesNotBurnCode(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+	store := replay.NewMemoryStore()
+
+	redirectURI := "https://app.example.com/callback"
+	encClientID, internalID := registerClient(t, tm, []string{redirectURI})
+
+	correctVerifier := "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+	wrongVerifier := strings.Repeat("A", 43)
+	codeChallenge := pkceChallenge(correctVerifier)
+
+	sc := sealedCode{
+		TokenID:       uuid.New().String(),
+		ClientID:      internalID,
+		RedirectURI:   redirectURI,
+		CodeChallenge: codeChallenge,
+		Subject:       "user-sub",
+		Email:         "user@example.com",
+		Audience:      testBaseURL,
+		ExpiresAt:     time.Now().Add(60 * time.Second),
+	}
+	authCode, err := tm.SealJSON(sc)
+	if err != nil {
+		t.Fatalf("SealJSON: %v", err)
+	}
+
+	// First attempt with wrong verifier: PKCE fails, code must NOT be claimed.
+	form := url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {authCode},
+		"redirect_uri":  {redirectURI},
+		"client_id":     {encClientID},
+		"code_verifier": {wrongVerifier},
+	}
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rr := httptest.NewRecorder()
+	Token(tm, logger, testBaseURL, time.Time{}, store)(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("first (bad PKCE): want 400, got %d", rr.Code)
+	}
+
+	// Retry with correct verifier: must succeed because the bad PKCE attempt
+	// did not consume the code.
+	form.Set("code_verifier", correctVerifier)
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rr = httptest.NewRecorder()
+	Token(tm, logger, testBaseURL, time.Time{}, store)(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("retry with correct PKCE: want 200, got %d: %s", rr.Code, rr.Body.String())
 	}
 }

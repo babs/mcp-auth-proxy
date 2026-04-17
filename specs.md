@@ -60,7 +60,7 @@ All transient OAuth state (client registrations, authorize sessions, authorizati
 |---|---|---|
 | Client registration | `client_id` (encrypted blob, 24h TTL) | yes |
 | Authorize session | IdP `state` parameter (encrypted blob, 10min TTL) | yes |
-| Authorization code | `code` parameter (encrypted blob, 5min TTL) | yes |
+| Authorization code | `code` parameter (encrypted blob, 60s TTL) | yes |
 | Access token | Opaque token (encrypted claims, 1h TTL) | yes |
 | Refresh token | Opaque token (encrypted claims + `iat`, 7d TTL) | yes |
 
@@ -79,8 +79,17 @@ Within a single deployment this is invisible: the audience always matches and no
 
 Trade-offs:
 - **No per-token revocation** without a shared store. Mitigated by short access token TTL (1h), PKCE preventing code replay, and `REVOKE_BEFORE` for bulk revocation.
-- **Authorization codes are replayable** within their 5-minute TTL. Mitigated by PKCE — the attacker also needs the `code_verifier`.
+- **Authorization codes are replayable** within their 60-second TTL when no replay store is configured. Mitigated by PKCE (the attacker also needs the `code_verifier`) and the short window. Set `REDIS_URL` to make codes strictly single-use across replicas (RFC 6749 §4.1.2).
 - **Bulk revocation** via `REVOKE_BEFORE`: set to the current timestamp and redeploy — all existing access tokens AND refresh tokens with `iat` before the cutoff are rejected. Refresh tokens carry their own `iat` so an attacker holding a leaked refresh cannot keep minting fresh access tokens past the cutoff. Incident response: rotate `REVOKE_BEFORE` and watch a `kubectl rollout status` complete before assuming the cutoff is enforced fleet-wide.
+
+### Replay protection (optional)
+
+Set `REDIS_URL` (e.g. `redis://redis:6379/0`, or `rediss://` for TLS) to enable two layered protections backed by Redis `SET NX` / `EXISTS`. All Redis keys are namespaced with `REDIS_KEY_PREFIX` (default `mcp-auth-proxy:`) so multiple proxy deployments can safely share a single Redis DB without key collisions:
+
+- **Single-use authorization codes.** Each code carries a unique `tid` (UUID); `/token` claims the key atomically, so a second exchange attempt is rejected with `invalid_grant` + `error_code: code_replay`. Claim TTL matches the remaining code lifetime.
+- **Refresh rotation with reuse detection** (RFC 6749 §10.4 / OAuth 2.1 §6.1). Each refresh carries a unique `tid` and a `fam` (family ID shared by all rotations in the lineage). On rotation the old `tid` is claimed; replaying an already-rotated token is detected as reuse, revokes the whole family (`refresh_family_revoked:<fam>` marker, 7-day TTL), and any subsequent use of any sibling refresh is rejected with `error_code: refresh_family_revoked`. This kills the attacker and the legitimate holder simultaneously — both are forced back through `/authorize`, but the compromised lineage stops minting tokens.
+
+On Redis failure the handler fails closed (503 `server_error` / `error_code: replay_store_unavailable`) rather than issuing tokens against an unknown replay state. When `REDIS_URL` is unset the proxy stays fully stateless: codes remain replayable within the 60s TTL (mitigated by PKCE), and refresh tokens rotate without reuse detection.
 
 ---
 
@@ -104,6 +113,9 @@ All configuration is via environment variables.
 | `REVOKE_BEFORE` | RFC3339 timestamp — both access tokens AND refresh tokens with `iat` before this are rejected (bulk revocation). Empty = disabled | `2026-03-28T12:00:00Z` |
 | `PKCE_REQUIRED` | Require PKCE on /authorize (default `true`). Set `false` for Cursor, MCP Inspector, ChatGPT compat | `true` |
 | `SHUTDOWN_TIMEOUT` | Graceful shutdown deadline. Raise above the longest expected SSE stream so rolling deploys do not cut MCP sessions mid-stream. Match `terminationGracePeriodSeconds` in K8s | `120s` (default) |
+| `REDIS_URL` | Optional. When set, enables single-use authorization codes and refresh rotation with reuse detection (OAuth 2.1 §6.1) across replicas. `rediss://` for TLS. On Redis failure the proxy fails closed (503) | `redis://redis:6379/0` |
+| `REDIS_KEY_PREFIX` | Prefix applied to every Redis key (default `mcp-auth-proxy:`). Override when sharing a Redis DB between multiple proxy deployments to avoid key collisions. Set explicitly to empty (`REDIS_KEY_PREFIX=`) to opt out of namespacing | `prod-mcp:` |
+| `RATE_LIMIT_ENABLED` | Per-IP rate limiting on pre-auth endpoints (default `true`). httprate keys on `X-Forwarded-For`/`X-Real-IP`/`RemoteAddr`, so front the proxy with a trusted L4/L7 load balancer to prevent header-spoof bypass | `true` |
 
 ---
 
@@ -130,6 +142,12 @@ mcp-auth-proxy/
 │   └── proxy.go               # reverse proxy to upstream MCP server
 ├── token/
 │   └── token.go               # AES-GCM seal/open, access token issue/validate
+├── replay/
+│   ├── replay.go              # Store interface + ErrAlreadyClaimed
+│   ├── redis.go               # Redis-backed Store (SET NX, SET, EXISTS with prefix)
+│   └── memory.go              # In-process Store (tests / single replica)
+├── metrics/
+│   └── metrics.go             # Prometheus counters for security events
 └── Dockerfile
 ```
 
@@ -147,8 +165,10 @@ require (
     github.com/coreos/go-oidc/v3             // OIDC discovery + id_token verification (any IdP)
     golang.org/x/oauth2                      // OAuth2 flow
     github.com/go-chi/chi/v5                 // HTTP router
+    github.com/go-chi/httprate               // per-IP rate limiter
     github.com/google/uuid                   // ID generation
     github.com/prometheus/client_golang      // Prometheus metrics
+    github.com/redis/go-redis/v9             // optional replay store
     go.uber.org/zap                          // structured logging
     golang.org/x/term                        // TTY detection for log format
 )
@@ -275,20 +295,22 @@ No authentication required on this endpoint.
 2. Decrypt the `state` → retrieve the session, verify not expired
 3. Exchange the code with the IdP (POST token endpoint, 10s timeout) to obtain `id_token` + `access_token`
 4. Validate the `id_token` via go-oidc (JWKS signature auto-discovery, issuer, audience)
-5. Extract claims: `sub`, `email`, `name`
-6. Extract groups from the configured claim (`GROUPS_CLAIM`, default `groups`)
-7. If `ALLOWED_GROUPS` is configured, verify the user belongs to at least one allowed group → 403 otherwise
-8. Encrypt an internal authorization code with AES-GCM (5min TTL):
+5. Extract claims: `sub`, `email`, `email_verified`, `name`
+6. If `email_verified` is present and false, reject with 403 `access_denied` + `error_code: email_not_verified` (absent claim is accepted — not all IdPs emit it)
+7. Extract groups from the configured claim (`GROUPS_CLAIM`, default `groups`)
+8. If `ALLOWED_GROUPS` is configured, verify the user belongs to at least one allowed group → 403 otherwise
+9. Encrypt an internal authorization code with AES-GCM (60s TTL):
    ```
    {
+     token_id (UUID, used for single-use replay check),
      client_id (internal UUID),
      redirect_uri, code_challenge,
      subject, email, name, groups,
      expires_at
    }
    ```
-9. Redirect 302 to `redirect_uri?code={encrypted_code}&state={original_state}`
-   - Built via `url.Parse` + merged query params (safe even if redirect_uri already contains query params)
+10. Redirect 302 to `redirect_uri?code={encrypted_code}&state={original_state}`
+    - Built via `url.Parse` + merged query params (safe even if redirect_uri already contains query params)
 
 ---
 
@@ -318,14 +340,18 @@ grant_type=refresh_token
 3. Decrypt the `client_id`, verify not expired
 4. Verify `client_id` (internal UUID) and `redirect_uri` match the code
 5. Validate PKCE: base64url-encoded `SHA256(code_verifier)` == stored `code_challenge` (constant-time comparison)
-6. Issue an opaque access token (AES-GCM, 1h TTL) and a refresh token (AES-GCM, 7d TTL)
+6. If `REDIS_URL` is configured, atomically claim the code's `token_id` via `SET NX`. A second attempt is rejected with `invalid_grant` + `error_code: code_replay`; Redis failures fail closed with 503
+7. Issue an opaque access token (AES-GCM, 1h TTL) and a refresh token (AES-GCM, 7d TTL)
 
 **Behavior — refresh_token:**
 1. Decrypt the refresh token, verify its `audience` matches `PROXY_BASE_URL`
 2. If `REVOKE_BEFORE` is configured, reject if refresh `iat` < cutoff (bulk revocation applies to refresh tokens too, not only access tokens)
 3. Verify the refresh is not expired
 4. Decrypt the `client_id`, verify audience + not expired + UUID matches the refresh
-5. Issue new access + refresh tokens (the new refresh carries an `iat` set to `now`, so it survives the next `REVOKE_BEFORE` application)
+5. If `REDIS_URL` is configured:
+   a. Reject if `refresh_family_revoked:<fam>` is set (prior reuse killed the family)
+   b. Atomically claim `refresh:<tid>` via `SET NX`. If already claimed → reuse detected: mark the family revoked for 7 days, reject with `error_code: refresh_reuse_detected`. Any subsequent sibling refresh also gets rejected in step 5a
+6. Issue new access + refresh tokens. The new refresh inherits the original `fam` (so reuse detection spans the lineage) and gets a fresh `tid`. `iat` is set to `now` so it survives the next `REVOKE_BEFORE` application
 
 **Response 200 JSON:**
 ```json
@@ -341,14 +367,20 @@ Header `Cache-Control: no-store` required (RFC 6749 §5.1).
 
 **Standard OAuth2 errors:**
 ```json
-{ "error": "invalid_grant", "error_description": "..." }
+{ "error": "invalid_grant", "error_description": "...", "error_code": "..." }
 ```
+
+`error_code` is an optional extension field for machine-readable internal
+error identifiers. Clients must treat it as advisory and rely on the
+standard `error` field for OAuth behavior.
 
 ---
 
 ## Internal token
 
 Opaque format: JSON → AES-GCM encryption with `TOKEN_SIGNING_SECRET` → base64url.
+
+**Access token payload:**
 
 ```go
 type Claims struct {
@@ -359,6 +391,22 @@ type Claims struct {
     Groups    []string  // from GROUPS_CLAIM in id_token
     ClientID  string
     IssuedAt  time.Time
+    ExpiresAt time.Time
+}
+```
+
+**Refresh token payload** (sealed identically; `TokenID` and `FamilyID` drive the optional Redis-backed reuse detection):
+
+```go
+type sealedRefresh struct {
+    TokenID   string    // UUID, unique per refresh (single-use key when Redis is wired)
+    FamilyID  string    // UUID, constant across rotations — shared by every sibling in the lineage
+    Subject   string
+    Email     string
+    Groups    []string
+    ClientID  string
+    Audience  string
+    IssuedAt  time.Time // used by REVOKE_BEFORE bulk revocation
     ExpiresAt time.Time
 }
 ```
@@ -397,7 +445,7 @@ r.Header.Del("Authorization")  // do not leak the internal token
 // Support Streamable HTTP (chunked): immediate flush
 ```
 
-Use `httputil.ReverseProxy` with `FlushInterval: -1` (immediate flush) to support SSE and streaming. The transport follows 307/308 redirects server-side (Python FastAPI/Starlette backends), same-host only, body replayed, max 10 hops.
+Use `httputil.ReverseProxy` with `FlushInterval: -1` (immediate flush) to support SSE and streaming. The underlying `*http.Transport` sets `ResponseHeaderTimeout: 30s` so a wedged upstream fails fast during header negotiation — stream bodies themselves remain uncapped. The transport follows 307/308 redirects server-side (Python FastAPI/Starlette backends), same-host only, body replayed, max 10 hops. On exhaustion the proxy returns the last redirect response rather than re-issuing the request (doubling side effects). Proxied request bodies are capped at 16 MiB via `http.MaxBytesReader` to bound the memory the redirect-follow buffer can hold.
 
 ---
 
@@ -411,23 +459,32 @@ r.Use(chimw.RequestID)
 r.Use(zapMiddleware(logger))
 r.Use(chimw.Recoverer)
 
-// OAuth endpoints (no auth)
+// OAuth endpoints (no auth). /register, /authorize, /callback, /token are
+// wrapped in per-IP rate limiters (httprate.LimitByIP) when
+// cfg.RateLimitEnabled is true — otherwise a passthrough middleware is used
+// so the router composition stays identical in both modes. replayStore is
+// optional (nil when REDIS_URL is unset); when non-nil, /token enforces
+// single-use authorization codes and refresh rotation with reuse detection.
 r.Get("/.well-known/oauth-protected-resource", handlers.ResourceMetadata(cfg.ProxyBaseURL))
 r.Get("/.well-known/oauth-authorization-server", handlers.Discovery(cfg.ProxyBaseURL))
-r.Post("/register", handlers.Register(tm, logger, cfg.ProxyBaseURL))
-r.Get("/authorize", handlers.Authorize(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, handlers.AuthorizeConfig{
+r.With(registerLimit).Post("/register", handlers.Register(tm, logger, cfg.ProxyBaseURL))
+r.With(authorizeLimit).Get("/authorize", handlers.Authorize(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, handlers.AuthorizeConfig{
     PKCERequired: cfg.PKCERequired,
 }))
-r.Get("/callback", handlers.Callback(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, idTokenVerifier, handlers.CallbackConfig{
+r.With(callbackLimit).Get("/callback", handlers.Callback(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, idTokenVerifier, handlers.CallbackConfig{
     AllowedGroups: cfg.AllowedGroups,
     GroupsClaim:   cfg.GroupsClaim,
 }))
-r.Post("/token", handlers.Token(tm, logger, cfg.ProxyBaseURL, cfg.RevokeBefore))
+r.With(tokenLimit).Post("/token", handlers.Token(tm, logger, cfg.ProxyBaseURL, cfg.RevokeBefore, replayStore))
 
-// Health
+// Liveness: 200 as long as the process is up.
 r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
     w.WriteHeader(http.StatusOK)
 })
+
+// Readiness: probes Redis (1s timeout) when REDIS_URL is set, so a
+// degraded pod drops out of a K8s Service until Redis recovers.
+r.Get("/readyz", readyzHandler(replayStore, logger))
 
 // MCP proxy (auth required)
 r.Group(func(r chi.Router) {
@@ -446,13 +503,23 @@ Always return errors conforming to RFC 6749:
 type OAuthError struct {
     Error            string `json:"error"`
     ErrorDescription string `json:"error_description,omitempty"`
+    ErrorCode        string `json:"error_code,omitempty"`
 }
-
-// Error codes to use:
-// invalid_request, invalid_client, invalid_grant,
-// unauthorized_client, unsupported_grant_type,
-// invalid_scope, server_error
 ```
+
+**Standard `error` values** (RFC 6749 §5.2): `invalid_request`, `invalid_client`, `invalid_grant`, `unauthorized_client`, `unsupported_grant_type`, `invalid_scope`, `server_error`, `access_denied`, `temporarily_unavailable`.
+
+**Extension `error_code` values** (proxy-specific, advisory — clients MUST rely on `error` for OAuth behavior):
+
+| `error_code` | When | Paired `error` |
+|---|---|---|
+| `code_replay` | Authorization code reused (requires Redis) | `invalid_grant` |
+| `refresh_reuse_detected` | Refresh token replayed after rotation → family revoked (requires Redis) | `invalid_grant` |
+| `refresh_family_revoked` | Refresh token whose family was previously revoked | `invalid_grant` |
+| `email_not_verified` | id_token `email_verified` is `false` | `access_denied` |
+| `replay_store_unavailable` | Redis unreachable; handler fails closed | `server_error` |
+| `id_token_verification_failed` | go-oidc rejected the IdP id_token | `server_error` |
+| `token_issue_failed` | AES-GCM seal error when minting an access token | `server_error` |
 
 ---
 
@@ -480,7 +547,10 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
       -X 'main.ProjectURL=${PROJECT_URL}'" \
     -o mcp-auth-proxy ./main.go
 
-FROM debian:bookworm-slim
+# distroless/static-debian13:nonroot ships ca-certificates and runs as UID
+# 65532 by default — no shell, no apt, minimal attack surface. The static
+# Go binary (CGO_ENABLED=0) needs nothing else.
+FROM gcr.io/distroless/static-debian13:nonroot
 
 ARG BUILD_TIMESTAMP="1970-01-01T00:00:00+00:00"
 ARG COMMIT_HASH="00000000-dirty"
@@ -492,16 +562,11 @@ LABEL org.opencontainers.image.created=${BUILD_TIMESTAMP}
 LABEL org.opencontainers.image.version=${VERSION}
 LABEL org.opencontainers.image.revision=${COMMIT_HASH}
 
-# Security: install CA certs for TLS, then run as non-root
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && groupadd -r app && useradd -r -g app -s /usr/sbin/nologin app
-
 COPY --from=builder /app/mcp-auth-proxy /usr/local/bin/mcp-auth-proxy
 
-USER app:app
-EXPOSE 8080
-ENTRYPOINT ["mcp-auth-proxy"]
+USER nonroot:nonroot
+EXPOSE 8080 9090
+ENTRYPOINT ["/usr/local/bin/mcp-auth-proxy"]
 ```
 
 ---
@@ -515,16 +580,20 @@ ENTRYPOINT ["mcp-auth-proxy"]
 - **Audience binding**: every sealed payload (client_id, session, code, refresh, access token) carries `PROXY_BASE_URL` as `audience` and is rejected if a sibling instance with a different baseURL receives it. Defends against accidental cross-deployment secret reuse
 - **Refresh-token bulk revocation**: `REVOKE_BEFORE` applies to refresh tokens too — a leaked refresh cannot mint fresh access tokens past the cutoff. Refresh tokens carry their own `iat` for this check
 - **redirect_uri**: exact match, HTTPS required except loopback (`localhost`, `127.0.0.1`, `::1`)
-- **Structured logs**: zap, JSON format, include `request_id` in each log
+- **Structured logs**: zap, JSON format, include `request_id` in each log. Inbound `X-Request-Id` is stripped before chi mints one, to prevent log-forgery via client-controlled IDs
+- **Business metrics**: alongside the Prometheus Go runtime counters, the `metrics` package emits `mcp_auth_tokens_issued_total{grant_type}`, `mcp_auth_access_denied_total{reason}`, `mcp_auth_replay_detected_total{kind}`, `mcp_auth_rate_limited_total{endpoint}`, and `mcp_auth_clients_registered_total` so security-relevant events are alertable
 - **Graceful shutdown**: context with SIGINT/SIGTERM signals, deadline configurable via `SHUTDOWN_TIMEOUT` (default 120s) — calibrate to the expected SSE stream duration to avoid cutting ongoing MCP sessions during a rolling deploy. The K8s `terminationGracePeriodSeconds` must be ≥ `SHUTDOWN_TIMEOUT`
 - **Timeouts**: `ReadTimeout: 30s`, `WriteTimeout: 0` (SSE), `IdleTimeout: 120s`
 - **Proxy must support SSE**: do not buffer `text/event-stream` responses, immediate flush required
 - **Body size limit**: POST endpoints limited to 1 MB (`MaxBytesReader`)
+- **Rate limiting**: per-IP rate limits on `/register` (10/min), `/authorize` (30/min), `/callback` (30/min), `/token` (60/min). Enabled by default; disable via `RATE_LIMIT_ENABLED=false`. The limiter keys on `X-Forwarded-For`/`X-Real-IP`/`RemoteAddr`, so deployments must terminate behind a trusted L4/L7 frontend — otherwise the headers can be spoofed
+- **Email verification**: `email_verified=false` in the id_token is rejected at `/callback` with 403 `access_denied` + `error_code: email_not_verified`. Missing claim is accepted — not all IdPs emit it
+- **Replay protection (optional, Redis-gated)**: set `REDIS_URL` to enable two layered controls — (1) single-use authorization codes via `SET NX` on the code's `tid`, and (2) refresh rotation with reuse detection per OAuth 2.1 §6.1: each refresh carries a `tid` + `fam` (family id, shared across rotations); replaying an already-rotated refresh revokes the whole family for 7 days, forcing the lineage back through `/authorize`. On Redis failure the handler fails closed with 503. Without Redis, codes are replayable within the 60s TTL (mitigated by PKCE + audience) and refresh tokens rotate without reuse detection
 - **Group filtering**: optional via `ALLOWED_GROUPS` — enforced at callback time (403 before code issuance). Groups propagated through sealed chain to upstream `X-User-Groups` header
 - **State parameter**: if client omits `state` (MCP Inspector, Cursor), a random 32-char hex value is generated server-side
 - **307/308 redirect following**: proxy follows 307/308 redirects server-side for Python MCP backends (FastAPI/Starlette redirect `/mcp` → `/mcp/`). Same-host only, body replayed, max 10 hops
 - **Resource URI**: `/.well-known/oauth-protected-resource` returns `resource` with trailing slash for Claude.ai compatibility (RFC 8707)
-- **Tests**: unit tests on PKCE validation, token issue/validate, `/register`, `/authorize`, `/token` handlers, group filtering, audience-rejection across all sealed types, REVOKE_BEFORE on refresh tokens, plus a full E2E test with a mock OIDC provider
+- **Tests**: unit tests on PKCE validation, token issue/validate, `/register`, `/authorize`, `/token` handlers, group filtering, audience-rejection across all sealed types, `REVOKE_BEFORE` on refresh tokens, authorization-code single-use (with an in-memory replay store), PKCE failure not burning a code, refresh rotation with reuse detection revoking the whole family, miniredis-backed tests for Redis prefixing and cross-deployment isolation, Go 1.22 fuzz targets on the AES-GCM open path (`FuzzOpenJSON`, `FuzzValidate`), and a full E2E flow against a mock OIDC provider including `email_verified=false` rejection and `email_verified=true` acceptance
 
 ---
 
@@ -536,7 +605,7 @@ The stateless design supports horizontal scaling without sticky sessions. Requir
 2. **`PROXY_BASE_URL`** — must be the public DNS name reached by clients, not a per-pod hostname. Audience binding enforces this — a pod with a wrong `PROXY_BASE_URL` will reject every token minted by its siblings.
 3. **`OIDC_*`** — same registration on the same IdP.
 4. **`UPSTREAM_MCP_URL`** — same in-cluster service URL.
-5. **`PKCE_REQUIRED`, `ALLOWED_GROUPS`, `GROUPS_CLAIM`, `REVOKE_BEFORE`** — any asymmetry produces "works on some pods, not others" bugs.
+5. **`PKCE_REQUIRED`, `ALLOWED_GROUPS`, `GROUPS_CLAIM`, `REVOKE_BEFORE`, `REDIS_URL`, `REDIS_KEY_PREFIX`, `RATE_LIMIT_ENABLED`** — any asymmetry produces "works on some pods, not others" bugs. `REDIS_URL` + `REDIS_KEY_PREFIX` in particular must match across all replicas, otherwise single-use and reuse-detection guarantees only hold within each pod's local set of clients.
 
 Recommended Deployment shape:
 

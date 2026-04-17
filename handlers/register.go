@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/babs/mcp-auth-proxy/metrics"
 	"github.com/babs/mcp-auth-proxy/token"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -78,6 +79,7 @@ func Register(tm *token.Manager, logger *zap.Logger, audience string) http.Handl
 			return
 		}
 
+		metrics.ClientsRegistered.Inc()
 		logger.Info("client_registered", zap.String("internal_id", sc.ID), zap.String("client_name", req.ClientName))
 
 		writeJSON(w, http.StatusCreated, registerResponse{

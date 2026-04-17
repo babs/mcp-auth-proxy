@@ -14,10 +14,11 @@ jobs:
   build-image:
     name: "Build OCI image"
     runs-on: ${{ matrix.os }}
+    # Build job only reads source and pushes images — no release creation
+    # happens here, so contents:read is sufficient.
     permissions:
-      contents: write
+      contents: read
       packages: write
-      attestations: write
       id-token: write
 
     strategy:
@@ -115,13 +116,14 @@ jobs:
     name: "Merge platform images into one"
     needs: build-image
     runs-on: ubuntu-latest
+    # contents:write is required to create the GitHub Release below.
+    # packages:write lets docker manifest push into GHCR.
     permissions:
       contents: write
       packages: write
-      attestations: write
-      id-token: write
 
     steps:
+      - uses: actions/checkout@v4
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3.4.0
         with:
@@ -148,7 +150,17 @@ jobs:
             done
           done
 
-      - uses: "marvinpinto/action-automatic-releases@latest"
-        with:
-          repo_token: "${{ secrets.GITHUB_TOKEN }}"
-          prerelease: false
+      # Use the preinstalled gh CLI instead of a third-party release action.
+      # Only runs on tag pushes; skipped on workflow_dispatch against main.
+      - name: Create GitHub Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release create "${GITHUB_REF_NAME}" \
+              --title "${GITHUB_REF_NAME}" \
+              --generate-notes
+          else
+            echo "Release ${GITHUB_REF_NAME} already exists; skipping."
+          fi
