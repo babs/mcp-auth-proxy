@@ -1,0 +1,15 @@
+# PodDisruptionBudget — ensures at least one replica remains available during
+# node drains or voluntary disruptions, preventing the auth plane from going
+# fully offline during cluster maintenance.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mcp-auth-proxy
+  namespace: mcp-auth-proxy
+  labels:
+    app.kubernetes.io/name: mcp-auth-proxy
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: mcp-auth-proxy

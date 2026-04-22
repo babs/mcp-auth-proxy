@@ -1,0 +1,101 @@
+# mcp-auth-proxy — turn-key demo stack
+#
+# Services:
+#   keycloak    — OIDC IdP, dev mode, imports realm-export.json on first boot
+#   redis       — replay store (single-use codes + refresh-token reuse detection)
+#   mcp-server  — tiny FastMCP hello-world server (Streamable HTTP)
+#   mcp-auth-proxy — this proxy, built from the project root
+#
+# Prerequisites: add "127.0.0.1 keycloak" to your /etc/hosts (see README).
+# Quick start:   bash scripts/up.sh
+# Teardown:      bash scripts/down.sh
+
+name: mcp-auth-proxy-demo
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Keycloak (OIDC IdP)
+  # Exposed on host port 8180 to avoid conflicting with the proxy on 8080.
+  # The proxy reaches it via Docker DNS as keycloak:8080.
+  # ---------------------------------------------------------------------------
+  keycloak:
+    image: quay.io/keycloak/keycloak:latest
+    command: start-dev --import-realm
+    environment:
+      # Old-style admin credentials (Keycloak < 26)
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      # New-style bootstrap credentials (Keycloak ≥ 26)
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HTTP_ENABLED: "true"
+      KC_HOSTNAME_STRICT: "false"
+      KC_HOSTNAME_STRICT_HTTPS: "false"
+      KC_HEALTH_ENABLED: "true"
+    ports:
+      - "8180:8080"
+    volumes:
+      - ./keycloak:/opt/keycloak/data/import:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8080/health/ready | grep -q UP || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # Redis (replay store)
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    # Disable persistence for the demo — purely ephemeral.
+    command: redis-server --save "" --appendonly no
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # Demo MCP server (FastMCP hello-world, Streamable HTTP)
+  # Exposes three tools: hello, add, echo — enough to smoke-test the auth flow.
+  # MCP endpoint: http://localhost:3000/mcp (external) | http://mcp-server:8000/mcp (internal)
+  # ---------------------------------------------------------------------------
+  mcp-server:
+    build:
+      context: ./mcp-server
+    ports:
+      - "3000:8000"
+    healthcheck:
+      # TCP port check — avoids curl/wget dependency in the Python slim image.
+      test: ["CMD", "python", "-c",
+             "import socket; s=socket.socket(); s.connect(('localhost', 8000)); s.close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # mcp-auth-proxy (built from project root)
+  # ---------------------------------------------------------------------------
+  mcp-auth-proxy:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    env_file: .env
+    ports:
+      - "8080:8080"   # MCP + OAuth endpoints
+      - "9090:9090"   # Prometheus metrics
+    depends_on:
+      keycloak:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mcp-server:
+        condition: service_healthy
+    # No healthcheck: distroless image has no shell or utilities.
+    # up.sh polls http://localhost:8080/healthz from the host instead.
+    restart: unless-stopped

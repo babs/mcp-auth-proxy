@@ -98,8 +98,8 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.ListenAddr != ":8080" {
 		t.Errorf("ListenAddr = %q, want %q", cfg.ListenAddr, ":8080")
 	}
-	if cfg.MetricsAddr != ":9090" {
-		t.Errorf("MetricsAddr = %q, want %q", cfg.MetricsAddr, ":9090")
+	if cfg.MetricsAddr != "127.0.0.1:9090" {
+		t.Errorf("MetricsAddr = %q, want %q", cfg.MetricsAddr, "127.0.0.1:9090")
 	}
 	if cfg.LogLevel != "info" {
 		t.Errorf("LogLevel = %q, want %q", cfg.LogLevel, "info")
@@ -339,5 +339,350 @@ func TestLoad_RedisKeyPrefix_ExplicitEmpty(t *testing.T) {
 	}
 	if cfg.RedisKeyPrefix != "" {
 		t.Errorf("RedisKeyPrefix = %q, want empty (explicit opt-out)", cfg.RedisKeyPrefix)
+	}
+}
+
+// REDIS_REQUIRED defaults to true so the safe (replay-protected) mode is
+// the default. main.go refuses to start when REDIS_URL is unset and this
+// flag is true.
+func TestLoad_RedisRequired_Default(t *testing.T) {
+	setAllRequired(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.RedisRequired {
+		t.Error("RedisRequired should default to true")
+	}
+}
+
+func TestLoad_RedisRequired_False(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("REDIS_REQUIRED", "false")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.RedisRequired {
+		t.Error("RedisRequired should be false when REDIS_REQUIRED=false")
+	}
+}
+
+// COMPAT_ALLOW_STATELESS defaults to false — strict mode refuses /authorize
+// requests that omit state. Explicit opt-in restores the legacy behavior
+// for MCP Inspector / Cursor compatibility.
+func TestLoad_CompatAllowStateless_Default(t *testing.T) {
+	setAllRequired(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.CompatAllowStateless {
+		t.Error("CompatAllowStateless should default to false (strict)")
+	}
+}
+
+func TestLoad_CompatAllowStateless_True(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("COMPAT_ALLOW_STATELESS", "true")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.CompatAllowStateless {
+		t.Error("CompatAllowStateless should be true when COMPAT_ALLOW_STATELESS=true")
+	}
+}
+
+func TestLoad_MCPLogBodyMax_Default(t *testing.T) {
+	setAllRequired(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.MCPLogBodyMax != 65536 {
+		t.Errorf("MCPLogBodyMax default = %d, want 65536", cfg.MCPLogBodyMax)
+	}
+}
+
+func TestLoad_MCPLogBodyMax_Zero(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("MCP_LOG_BODY_MAX", "0")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.MCPLogBodyMax != 0 {
+		t.Errorf("MCPLogBodyMax = %d, want 0", cfg.MCPLogBodyMax)
+	}
+}
+
+func TestLoad_MCPLogBodyMax_Custom(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("MCP_LOG_BODY_MAX", "32768")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.MCPLogBodyMax != 32768 {
+		t.Errorf("MCPLogBodyMax = %d, want 32768", cfg.MCPLogBodyMax)
+	}
+}
+
+func TestLoad_MCPLogBodyMax_Invalid(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("MCP_LOG_BODY_MAX", "not-a-number")
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected error for invalid MCP_LOG_BODY_MAX")
+	}
+	if !strings.Contains(err.Error(), "MCP_LOG_BODY_MAX") {
+		t.Errorf("error %q should mention MCP_LOG_BODY_MAX", err)
+	}
+}
+
+func TestLoad_MCPLogBodyMax_Negative(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("MCP_LOG_BODY_MAX", "-1")
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected error for negative MCP_LOG_BODY_MAX")
+	}
+	if !strings.Contains(err.Error(), "MCP_LOG_BODY_MAX") {
+		t.Errorf("error %q should mention MCP_LOG_BODY_MAX", err)
+	}
+}
+
+// TRUST_PROXY_HEADERS defaults to false. Enabling it opts in to keying the
+// rate limiter by XFF/X-Real-IP — only safe behind a trusted frontend.
+func TestLoad_TrustProxyHeaders_Default(t *testing.T) {
+	setAllRequired(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.TrustProxyHeaders {
+		t.Error("TrustProxyHeaders should default to false")
+	}
+}
+
+func TestLoad_TrustProxyHeaders_True(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("TRUST_PROXY_HEADERS", "true")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.TrustProxyHeaders {
+		t.Error("TrustProxyHeaders should be true when TRUST_PROXY_HEADERS=true")
+	}
+}
+
+func TestLoad_PerSubjectConcurrency_Default(t *testing.T) {
+	setAllRequired(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.PerSubjectConcurrency != 16 {
+		t.Errorf("PerSubjectConcurrency default = %d, want 16", cfg.PerSubjectConcurrency)
+	}
+}
+
+func TestLoad_PerSubjectConcurrency_Custom(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("MCP_PER_SUBJECT_CONCURRENCY", "64")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.PerSubjectConcurrency != 64 {
+		t.Errorf("PerSubjectConcurrency = %d, want 64", cfg.PerSubjectConcurrency)
+	}
+}
+
+func TestLoad_PerSubjectConcurrency_Zero(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("MCP_PER_SUBJECT_CONCURRENCY", "0")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.PerSubjectConcurrency != 0 {
+		t.Errorf("PerSubjectConcurrency = %d, want 0 (disabled)", cfg.PerSubjectConcurrency)
+	}
+}
+
+func TestLoad_PerSubjectConcurrency_Invalid(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("MCP_PER_SUBJECT_CONCURRENCY", "not-a-number")
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected error for invalid MCP_PER_SUBJECT_CONCURRENCY")
+	}
+	if !strings.Contains(err.Error(), "MCP_PER_SUBJECT_CONCURRENCY") {
+		t.Errorf("error %q should mention MCP_PER_SUBJECT_CONCURRENCY", err)
+	}
+}
+
+func TestLoad_PerSubjectConcurrency_Negative(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("MCP_PER_SUBJECT_CONCURRENCY", "-1")
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected error for negative MCP_PER_SUBJECT_CONCURRENCY")
+	}
+}
+
+// L1: TOKEN_SIGNING_SECRET with fewer than 16 distinct bytes surfaces a
+// non-fatal weakness warning that main.go logs at startup. High-entropy
+// secrets yield no warning.
+func TestLoad_SecretWeaknessWarning_LowEntropy(t *testing.T) {
+	setAllRequired(t)
+	// 32 bytes but only one distinct byte → 1 < 16.
+	t.Setenv("TOKEN_SIGNING_SECRET", strings.Repeat("a", 32))
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	w := cfg.SecretWeaknessWarning()
+	if w == "" {
+		t.Fatal("expected non-empty weakness warning for 1-distinct-byte secret")
+	}
+	if !strings.Contains(w, "distinct bytes") {
+		t.Errorf("warning %q should explain the distinct-byte count", w)
+	}
+}
+
+func TestLoad_SecretWeaknessWarning_HighEntropy(t *testing.T) {
+	setAllRequired(t)
+	// 32 distinct chars → ≥16.
+	t.Setenv("TOKEN_SIGNING_SECRET", "abcdefghijklmnopqrstuvwxyz012345")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if w := cfg.SecretWeaknessWarning(); w != "" {
+		t.Errorf("unexpected weakness warning for high-entropy secret: %q", w)
+	}
+}
+
+// L2: SHUTDOWN_TIMEOUT above 15m is fatal.
+func TestLoad_ShutdownTimeout_Over15mFatal(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("SHUTDOWN_TIMEOUT", "16m")
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected error for SHUTDOWN_TIMEOUT >15m")
+	}
+	if !strings.Contains(err.Error(), "15m") {
+		t.Errorf("error %q should mention the 15m cap", err)
+	}
+}
+
+func TestLoad_ShutdownTimeout_AtBoundary(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("SHUTDOWN_TIMEOUT", "15m")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("15m should be accepted, got %v", err)
+	}
+	if cfg.ShutdownTimeout != 15*time.Minute {
+		t.Errorf("ShutdownTimeout = %v, want 15m", cfg.ShutdownTimeout)
+	}
+}
+
+// L3: REDIS_KEY_PREFIX rejects cluster-hash tags and control bytes.
+// (setenv refuses NUL, so the NUL case is covered by
+// TestValidateRedisKeyPrefix_DirectNUL below.)
+func TestLoad_RedisKeyPrefix_ForbiddenBytes(t *testing.T) {
+	bad := []string{
+		"tenant-{42}:",
+		"tenant{:",
+		"tenant}:",
+		"tenant\r:",
+		"tenant\n:",
+		"tenant\t:",
+		"tenant\x7f:", // DEL
+		"tenanté:",    // non-ASCII
+	}
+	for _, p := range bad {
+		t.Run(p, func(t *testing.T) {
+			setAllRequired(t)
+			t.Setenv("REDIS_KEY_PREFIX", p)
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("expected error for REDIS_KEY_PREFIX=%q", p)
+			}
+			if !strings.Contains(err.Error(), "REDIS_KEY_PREFIX") {
+				t.Errorf("error %q should mention REDIS_KEY_PREFIX", err)
+			}
+		})
+	}
+}
+
+// The setenv path refuses NUL in env values on most OSes; hit the
+// validator directly so the NUL byte is still covered.
+func TestValidateRedisKeyPrefix_DirectNUL(t *testing.T) {
+	if err := validateRedisKeyPrefix("tenant\x00:"); err == nil {
+		t.Fatal("validateRedisKeyPrefix should reject NUL")
+	}
+}
+
+func TestLoad_RedisKeyPrefix_AllowsPrintable(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("REDIS_KEY_PREFIX", "prod-mcp-v2:")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("expected printable prefix to be accepted: %v", err)
+	}
+	if cfg.RedisKeyPrefix != "prod-mcp-v2:" {
+		t.Errorf("RedisKeyPrefix = %q, want %q", cfg.RedisKeyPrefix, "prod-mcp-v2:")
+	}
+}
+
+// L8: PROXY_BASE_URL validation — https required, or http+loopback; no
+// userinfo, no fragment, no non-root path.
+func TestLoad_ProxyBaseURL_RejectsInvalid(t *testing.T) {
+	cases := []struct {
+		name, url string
+	}{
+		{"http_non_loopback", "http://example.com"},
+		{"ftp_scheme", "ftp://example.com"},
+		{"with_userinfo", "https://user:pass@example.com"},
+		{"with_fragment", "https://example.com/#frag"},
+		{"with_path", "https://example.com/base"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setAllRequired(t)
+			t.Setenv("PROXY_BASE_URL", tc.url)
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("expected error for PROXY_BASE_URL=%q", tc.url)
+			}
+			if !strings.Contains(err.Error(), "PROXY_BASE_URL") {
+				t.Errorf("error %q should mention PROXY_BASE_URL", err)
+			}
+		})
+	}
+}
+
+func TestLoad_ProxyBaseURL_AllowsValid(t *testing.T) {
+	cases := []string{
+		"https://proxy.example.com",
+		"https://proxy.example.com/", // trailing slash trimmed
+		"http://localhost:8080",
+		"http://127.0.0.1:9090",
+		"http://[::1]:8080",
+	}
+	for _, u := range cases {
+		t.Run(u, func(t *testing.T) {
+			setAllRequired(t)
+			t.Setenv("PROXY_BASE_URL", u)
+			if _, err := Load(); err != nil {
+				t.Fatalf("PROXY_BASE_URL=%q should be accepted: %v", u, err)
+			}
+		})
 	}
 }

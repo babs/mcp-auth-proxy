@@ -159,3 +159,82 @@ func TestNewRedisStore_BadURL(t *testing.T) {
 		t.Fatal("expected error for malformed REDIS_URL")
 	}
 }
+
+// --- M4 — ClaimOrCheckFamily collapses revoked-check + single-use into one round trip ---
+
+func TestRedisStore_ClaimOrCheckFamily_FreshClaim(t *testing.T) {
+	s, mr := newTestRedis(t, "p:")
+	ctx := context.Background()
+
+	revoked, claimed, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimOrCheckFamily: %v", err)
+	}
+	if revoked || claimed {
+		t.Fatalf("fresh claim: revoked=%v claimed=%v (want both false)", revoked, claimed)
+	}
+	if !mr.Exists("p:tid:A") {
+		t.Errorf("expected claim key present, keys=%v", mr.Keys())
+	}
+}
+
+func TestRedisStore_ClaimOrCheckFamily_AlreadyClaimed(t *testing.T) {
+	s, _ := newTestRedis(t, "")
+	ctx := context.Background()
+
+	if _, _, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute); err != nil {
+		t.Fatalf("first claim: %v", err)
+	}
+
+	revoked, claimed, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute)
+	if err != nil {
+		t.Fatalf("second claim: %v", err)
+	}
+	if revoked {
+		t.Errorf("second claim must not flag familyRevoked")
+	}
+	if !claimed {
+		t.Errorf("second claim must flag alreadyClaimed")
+	}
+}
+
+func TestRedisStore_ClaimOrCheckFamily_FamilyRevoked(t *testing.T) {
+	s, mr := newTestRedis(t, "")
+	ctx := context.Background()
+
+	if err := s.Mark(ctx, "fam:1", time.Minute); err != nil {
+		t.Fatalf("Mark: %v", err)
+	}
+
+	revoked, claimed, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimOrCheckFamily: %v", err)
+	}
+	if !revoked {
+		t.Errorf("expected familyRevoked=true")
+	}
+	if claimed {
+		t.Errorf("revoked family must NOT also report alreadyClaimed")
+	}
+	// Critical: the claim MUST NOT happen when the family is revoked —
+	// otherwise a leaked tid silently consumes a claim slot for a
+	// lineage the server has already declared dead.
+	if mr.Exists("tid:A") {
+		t.Errorf("revoked family must not claim tid, keys=%v", mr.Keys())
+	}
+}
+
+func TestRedisStore_ClaimOrCheckFamily_AppliesPrefix(t *testing.T) {
+	s, mr := newTestRedis(t, "proxy-a:")
+	ctx := context.Background()
+
+	if _, _, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute); err != nil {
+		t.Fatalf("ClaimOrCheckFamily: %v", err)
+	}
+	if !mr.Exists("proxy-a:tid:A") {
+		t.Errorf("expected prefixed claim key, keys=%v", mr.Keys())
+	}
+	if mr.Exists("tid:A") {
+		t.Errorf("bare key must not exist under prefix, keys=%v", mr.Keys())
+	}
+}

@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-auth-proxy
+  namespace: mcp-auth-proxy
+  labels:
+    app.kubernetes.io/name: mcp-auth-proxy
+spec:
+  # No sticky sessions: the stateless design (AES-GCM opaque tokens) means
+  # any replica can handle any request.
+  sessionAffinity: None
+  selector:
+    app: mcp-auth-proxy
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+      protocol: TCP

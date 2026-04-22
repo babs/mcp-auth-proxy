@@ -79,6 +79,51 @@ func (s *RedisStore) Exists(ctx context.Context, key string) (bool, error) {
 	return n > 0, nil
 }
 
+// claimOrCheckFamilyScript collapses the family-revoked check and the
+// single-use claim into one Redis round trip. Running inside EVAL makes
+// the two ops linearizable on the primary, which closes the TOCTOU
+// window that lets a stale replica read miss a freshly-Mark'd family
+// marker between the Exists and the SetNX.
+//
+// KEYS[1] = family_revoked key
+// KEYS[2] = claim key (refresh token id)
+// ARGV[1] = claim TTL in milliseconds
+// Returns {familyRevoked, alreadyClaimed} as integers in {0,1}.
+var claimOrCheckFamilyScript = redis.NewScript(`
+if redis.call("EXISTS", KEYS[1]) == 1 then
+  return {1, 0}
+end
+local ok = redis.call("SET", KEYS[2], "1", "NX", "PX", ARGV[1])
+if ok then
+  return {0, 0}
+end
+return {0, 1}
+`)
+
+// ClaimOrCheckFamily implements replay.Store.ClaimOrCheckFamily. See the
+// interface doc for semantics. claimTTL is truncated to millisecond
+// resolution (Redis PX).
+func (s *RedisStore) ClaimOrCheckFamily(ctx context.Context, familyKey, claimKey string, claimTTL time.Duration) (familyRevoked bool, alreadyClaimed bool, err error) {
+	ttlMs := max(claimTTL.Milliseconds(), 1)
+	res, err := claimOrCheckFamilyScript.Run(
+		ctx,
+		s.client,
+		[]string{s.k(familyKey), s.k(claimKey)},
+		ttlMs,
+	).Result()
+	if err != nil {
+		return false, false, fmt.Errorf("redis eval: %w", err)
+	}
+
+	arr, ok := res.([]any)
+	if !ok || len(arr) != 2 {
+		return false, false, fmt.Errorf("redis eval: unexpected result %T", res)
+	}
+	revoked, _ := arr[0].(int64)
+	claimed, _ := arr[1].(int64)
+	return revoked == 1, claimed == 1, nil
+}
+
 // Close releases the underlying Redis connection pool.
 func (s *RedisStore) Close() error {
 	return s.client.Close()

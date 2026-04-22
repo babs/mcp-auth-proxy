@@ -14,3 +14,7 @@ misc/
 .idea/
 .vscode/
 *.swp
+
+# Local audit artifacts (not committed)
+SECURITY_AUDIT_REDTEAM.md
+PLAN_AUDIT_LOGGING.md

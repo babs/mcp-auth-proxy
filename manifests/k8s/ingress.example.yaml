@@ -1,0 +1,35 @@
+# Ingress example — fill in your hostname and TLS secret.
+# Tested with ingress-nginx; adjust annotations for other controllers.
+#
+# WARNING: mcp-auth-proxy MUST be served over HTTPS in any real deployment.
+# OAuth 2.1 requires HTTPS for all endpoints; HTTP will leak tokens.
+# Do not point Claude.ai at an HTTP-only deployment.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mcp-auth-proxy
+  namespace: mcp-auth-proxy
+  labels:
+    app.kubernetes.io/name: mcp-auth-proxy
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"   # SSE streams can be long-lived
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"        # required for SSE / streaming
+    # cert-manager.io/cluster-issuer: letsencrypt-prod        # uncomment if using cert-manager
+spec:
+  ingressClassName: nginx   # TODO: set to your ingress class
+  tls:
+    - hosts:
+        - mcp-proxy.example.com   # TODO: replace with your hostname
+      secretName: mcp-auth-proxy-tls   # TODO: TLS secret (cert-manager or manual)
+  rules:
+    - host: mcp-proxy.example.com   # TODO: replace with your hostname
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: mcp-auth-proxy
+                port:
+                  name: http

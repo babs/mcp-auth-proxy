@@ -167,7 +167,7 @@ func TestSealOpenJSON(t *testing.T) {
 	}
 
 	original := payload{Name: "test", Value: 42}
-	sealed, err := m.SealJSON(original)
+	sealed, err := m.SealJSON(original, PurposeClient)
 	if err != nil {
 		t.Fatalf("SealJSON: %v", err)
 	}
@@ -176,7 +176,7 @@ func TestSealOpenJSON(t *testing.T) {
 	}
 
 	var decoded payload
-	if err := m.OpenJSON(sealed, &decoded); err != nil {
+	if err := m.OpenJSON(sealed, &decoded, PurposeClient); err != nil {
 		t.Fatalf("OpenJSON: %v", err)
 	}
 
@@ -190,9 +190,66 @@ func TestOpenJSON_InvalidData(t *testing.T) {
 
 	for _, bad := range []string{"", "not-valid", "!!!bad-base64!!!", "AAAA"} {
 		var v struct{}
-		if err := m.OpenJSON(bad, &v); err == nil {
+		if err := m.OpenJSON(bad, &v, PurposeClient); err == nil {
 			t.Errorf("expected error for %q", bad)
 		}
+	}
+}
+
+// TestCrossTypeSubstitution verifies that a payload sealed under one purpose
+// cannot be opened as any other purpose.
+// Every pairing in the 5x5 matrix except the diagonal must fail.
+func TestCrossTypeSubstitution(t *testing.T) {
+	m := mustNewManager(t, make([]byte, 32))
+
+	purposes := []string{PurposeClient, PurposeSession, PurposeCode, PurposeAccess, PurposeRefresh}
+	sealed := make(map[string]string, len(purposes))
+	for _, p := range purposes {
+		s, err := m.SealJSON(map[string]string{"p": p}, p)
+		if err != nil {
+			t.Fatalf("SealJSON(%s): %v", p, err)
+		}
+		sealed[p] = s
+	}
+
+	for _, sealPurpose := range purposes {
+		for _, openPurpose := range purposes {
+			var v map[string]string
+			err := m.OpenJSON(sealed[sealPurpose], &v, openPurpose)
+			if sealPurpose == openPurpose {
+				if err != nil {
+					t.Errorf("open(%s, %s) should succeed: %v", sealPurpose, openPurpose, err)
+				}
+				continue
+			}
+			if err == nil {
+				t.Errorf("open(sealed=%s, as=%s) should have failed but did not", sealPurpose, openPurpose)
+			}
+		}
+	}
+}
+
+// L6: the per-Manager seal counter increments on every Seal call and is
+// exposed via SealCount() for operator introspection / tests.
+func TestSealCount_IncrementsOnEverySeal(t *testing.T) {
+	m := mustNewManager(t, make([]byte, 32))
+	if got := m.SealCount(); got != 0 {
+		t.Fatalf("initial SealCount = %d, want 0", got)
+	}
+	for i := 0; i < 5; i++ {
+		if _, err := m.SealJSON(map[string]int{"i": i}, PurposeClient); err != nil {
+			t.Fatalf("SealJSON: %v", err)
+		}
+	}
+	if got := m.SealCount(); got != 5 {
+		t.Errorf("SealCount = %d, want 5", got)
+	}
+	// Issue also seals.
+	if _, _, err := m.Issue("aud", "sub", "e@e", "cid", nil, time.Minute); err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if got := m.SealCount(); got != 6 {
+		t.Errorf("SealCount after Issue = %d, want 6", got)
 	}
 }
 
@@ -206,13 +263,13 @@ func TestSealJSON_DifferentSecrets(t *testing.T) {
 	m2 := mustNewManager(t, s2)
 
 	type payload struct{ X int }
-	sealed, err := m1.SealJSON(payload{X: 1})
+	sealed, err := m1.SealJSON(payload{X: 1}, PurposeClient)
 	if err != nil {
 		t.Fatalf("SealJSON: %v", err)
 	}
 
 	var v payload
-	if err := m2.OpenJSON(sealed, &v); err == nil {
+	if err := m2.OpenJSON(sealed, &v, PurposeClient); err == nil {
 		t.Fatal("expected error when opening with different secret")
 	}
 }

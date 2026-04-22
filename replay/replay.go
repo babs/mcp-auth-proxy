@@ -31,6 +31,21 @@ type Store interface {
 	// Exists returns true if the key is currently set.
 	Exists(ctx context.Context, key string) (bool, error)
 
+	// ClaimOrCheckFamily atomically tests familyKey for presence AND, when
+	// the family is not revoked, claims claimKey single-use with claimTTL.
+	// Collapses the three-call sequence (Exists → ClaimOnce → Mark-on-reuse)
+	// into one round trip, closing the TOCTOU window that allows one extra
+	// rotation against a revoked family when Redis reads are routed to a
+	// replica lagging behind the primary.
+	//
+	// Returns:
+	//   familyRevoked=true  → family marker present; caller MUST refuse.
+	//   alreadyClaimed=true → family OK but claimKey already consumed;
+	//                          caller MUST refuse AND revoke the family
+	//                          (reuse detection).
+	//   both false          → fresh claim; caller MAY proceed.
+	ClaimOrCheckFamily(ctx context.Context, familyKey, claimKey string, claimTTL time.Duration) (familyRevoked bool, alreadyClaimed bool, err error)
+
 	// Close releases any underlying resources (connections, goroutines).
 	Close() error
 }

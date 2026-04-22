@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-auth-proxy-config
+  namespace: mcp-auth-proxy
+  labels:
+    app.kubernetes.io/name: mcp-auth-proxy
+data:
+  # TODO: fill in — OIDC discovery base URL (no trailing slash).
+  # Examples:
+  #   Keycloak:    https://keycloak.example.com/realms/myrealm
+  #   Entra ID:    https://login.microsoftonline.com/{tenant}/v2.0
+  #   Auth0:       https://your-tenant.auth0.com
+  OIDC_ISSUER_URL: ""
+
+  # TODO: fill in — client ID registered with the IdP.
+  OIDC_CLIENT_ID: ""
+
+  # TODO: fill in — public URL this proxy is reachable at by MCP clients.
+  # Must match the hostname in your Ingress TLS cert.
+  PROXY_BASE_URL: ""
+
+  # TODO: fill in — in-cluster URL of the upstream MCP server.
+  UPSTREAM_MCP_URL: ""
+
+  # Redis replay store.
+  # Single-use codes and refresh-token reuse detection (OAuth 2.1 §6.1).
+  # Override REDIS_KEY_PREFIX when sharing a Redis instance across deployments.
+  REDIS_URL: "redis://redis:6379/0"
+  REDIS_REQUIRED: "true"
+  REDIS_KEY_PREFIX: "mcp-auth-proxy:"
+
+  LISTEN_ADDR: ":8080"
+  METRICS_ADDR: ":9090"
+  LOG_LEVEL: "info"
+  PKCE_REQUIRED: "true"
+  RATE_LIMIT_ENABLED: "true"
+  # Graceful shutdown — must be ≤ terminationGracePeriodSeconds in Deployment.
+  SHUTDOWN_TIMEOUT: "120s"
+  GROUPS_CLAIM: "groups"
+  # ALLOWED_GROUPS: "admin,mcp-users"   # uncomment to restrict access
+  # REVOKE_BEFORE: ""                    # RFC3339 bulk-revocation cutoff
+  COMPAT_ALLOW_STATELESS: "false"

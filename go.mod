@@ -13,6 +13,7 @@ require (
 	github.com/redis/go-redis/v9 v9.18.0
 	go.uber.org/zap v1.27.0
 	golang.org/x/oauth2 v0.30.0
+	golang.org/x/sync v0.13.0
 	golang.org/x/term v0.41.0
 )
 

@@ -76,7 +76,7 @@ func registerClient(t *testing.T, tm *token.Manager, redirectURIs []string) (enc
 	}
 
 	var sc sealedClient
-	if err := tm.OpenJSON(resp.ClientID, &sc); err != nil {
+	if err := tm.OpenJSON(resp.ClientID, &sc, token.PurposeClient); err != nil {
 		t.Fatalf("registerClient: OpenJSON: %v", err)
 	}
 
@@ -87,15 +87,17 @@ func registerClient(t *testing.T, tm *token.Manager, redirectURIs []string) (enc
 func sealCode(t *testing.T, tm *token.Manager, clientUUID, redirectURI, codeChallenge, subject, email string) string {
 	t.Helper()
 	sc := sealedCode{
+		TokenID:       uuid.New().String(),
 		ClientID:      clientUUID,
 		RedirectURI:   redirectURI,
 		CodeChallenge: codeChallenge,
 		Subject:       subject,
 		Email:         email,
+		Typ:           token.PurposeCode,
 		Audience:      testBaseURL,
 		ExpiresAt:     time.Now().Add(5 * time.Minute),
 	}
-	code, err := tm.SealJSON(sc)
+	code, err := tm.SealJSON(sc, token.PurposeCode)
 	if err != nil {
 		t.Fatalf("SealJSON: %v", err)
 	}
@@ -106,14 +108,17 @@ func sealCode(t *testing.T, tm *token.Manager, clientUUID, redirectURI, codeChal
 func sealRefresh(t *testing.T, tm *token.Manager, subject, email, clientUUID string) string {
 	t.Helper()
 	sr := sealedRefresh{
+		TokenID:   uuid.New().String(),
+		FamilyID:  uuid.New().String(),
 		Subject:   subject,
 		Email:     email,
 		ClientID:  clientUUID,
+		Typ:       token.PurposeRefresh,
 		Audience:  testBaseURL,
 		IssuedAt:  time.Now(),
 		ExpiresAt: time.Now().Add(7 * 24 * time.Hour),
 	}
-	tok, err := tm.SealJSON(sr)
+	tok, err := tm.SealJSON(sr, token.PurposeRefresh)
 	if err != nil {
 		t.Fatalf("SealJSON: %v", err)
 	}
@@ -247,7 +252,7 @@ func TestRegister_Success(t *testing.T) {
 
 	// Verify the client_id is a valid encrypted payload
 	var sc sealedClient
-	if err := tm.OpenJSON(resp.ClientID, &sc); err != nil {
+	if err := tm.OpenJSON(resp.ClientID, &sc, token.PurposeClient); err != nil {
 		t.Errorf("client_id is not a valid sealed client: %v", err)
 	}
 	if sc.ID == "" {
@@ -514,10 +519,11 @@ func TestAuthorize_ExpiredClient(t *testing.T) {
 		ID:           "expired-client",
 		RedirectURIs: []string{"https://app.example.com/callback"},
 		ClientName:   "expired",
+		Typ:          token.PurposeClient,
 		Audience:     testBaseURL,
 		ExpiresAt:    time.Now().Add(-1 * time.Hour),
 	}
-	encClientID, err := tm.SealJSON(sc)
+	encClientID, err := tm.SealJSON(sc, token.PurposeClient)
 	if err != nil {
 		t.Fatalf("SealJSON: %v", err)
 	}
@@ -665,15 +671,17 @@ func TestTokenAuthCode_ExpiredCode(t *testing.T) {
 	expiredVerifier := "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
 	// Create an expired code
 	sc := sealedCode{
+		TokenID:       uuid.New().String(),
 		ClientID:      internalID,
 		RedirectURI:   redirectURI,
 		CodeChallenge: pkceChallenge(expiredVerifier),
 		Subject:       "user-sub",
 		Email:         "user@example.com",
+		Typ:           token.PurposeCode,
 		Audience:      testBaseURL,
 		ExpiresAt:     time.Now().Add(-1 * time.Minute),
 	}
-	expiredCode, err := tm.SealJSON(sc)
+	expiredCode, err := tm.SealJSON(sc, token.PurposeCode)
 	if err != nil {
 		t.Fatalf("SealJSON: %v", err)
 	}
@@ -856,14 +864,17 @@ func TestTokenRefresh_ExpiredRefresh(t *testing.T) {
 	encClientID, internalID := registerClient(t, tm, []string{"https://app.example.com/callback"})
 
 	sr := sealedRefresh{
+		TokenID:   uuid.New().String(),
+		FamilyID:  uuid.New().String(),
 		Subject:   "user",
 		Email:     "user@example.com",
 		ClientID:  internalID,
+		Typ:       token.PurposeRefresh,
 		Audience:  testBaseURL,
 		IssuedAt:  time.Now().Add(-2 * time.Hour),
 		ExpiresAt: time.Now().Add(-1 * time.Hour),
 	}
-	expiredRefresh, err := tm.SealJSON(sr)
+	expiredRefresh, err := tm.SealJSON(sr, token.PurposeRefresh)
 	if err != nil {
 		t.Fatalf("SealJSON: %v", err)
 	}
@@ -976,6 +987,7 @@ func TestAuthorize_AcceptsResourceParam(t *testing.T) {
 		"&redirect_uri=" + url.QueryEscape(redirectURI) +
 		"&code_challenge=" + codeChallenge +
 		"&code_challenge_method=S256" +
+		"&state=s" +
 		"&resource=" + url.QueryEscape(testBaseURL)
 
 	req := httptest.NewRequest(http.MethodGet, target, nil)
@@ -1142,6 +1154,83 @@ func TestCallback_OIDCErrorResponse(t *testing.T) {
 	}
 }
 
+// L4: IdP-supplied error strings outside the RFC 6749 §4.1.2.1 allowlist
+// are rewritten to server_error. error_description is truncated at 200
+// chars and stripped of non-ASCII-printable bytes.
+func TestCallback_OIDCError_AllowlistAndSanitize(t *testing.T) {
+	tm := newTestTokenManager(t)
+	oauth2Cfg := testOAuth2Config()
+	verifyFunc := func(_ context.Context, _ string) (*oidc.IDToken, error) {
+		panic("verifyFunc must not be called when IdP returns error")
+	}
+
+	longDesc := strings.Repeat("A", 250) + "<will-be-trimmed>"
+
+	tests := []struct {
+		name       string
+		query      string
+		wantErr    string
+		wantDescIs func(string) bool
+	}{
+		{
+			name:    "unknown_error_collapsed_to_server_error",
+			query:   "/callback?error=attacker-controlled_value&error_description=hi&state=s",
+			wantErr: "server_error",
+			wantDescIs: func(s string) bool {
+				return s == "hi"
+			},
+		},
+		{
+			name:    "description_truncated_to_200",
+			query:   "/callback?error=access_denied&error_description=" + url.QueryEscape(longDesc) + "&state=s",
+			wantErr: "access_denied",
+			wantDescIs: func(s string) bool {
+				return len(s) == 200 && strings.HasPrefix(s, "AAAA")
+			},
+		},
+		{
+			name:    "crlf_stripped",
+			query:   "/callback?error=invalid_request&error_description=" + url.QueryEscape("line1\r\nline2") + "&state=s",
+			wantErr: "invalid_request",
+			wantDescIs: func(s string) bool {
+				return !strings.ContainsAny(s, "\r\n") && strings.Contains(s, "line1line2")
+			},
+		},
+		{
+			name:    "non_ascii_stripped",
+			query:   "/callback?error=access_denied&error_description=" + url.QueryEscape("café naïve") + "&state=s",
+			wantErr: "access_denied",
+			wantDescIs: func(s string) bool {
+				// é and ï collapse to empty (> 0x7E), so we're left with "caf nave"
+				return strings.Contains(s, "caf") && !strings.ContainsRune(s, 'é')
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, tc.query, nil)
+			rr := httptest.NewRecorder()
+
+			CallbackWithVerifyFunc(tm, zap.NewNop(), testBaseURL, oauth2Cfg, verifyFunc, CallbackConfig{})(rr, req)
+
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
+			}
+			var cbErr OAuthError
+			if err := json.NewDecoder(rr.Body).Decode(&cbErr); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if cbErr.Error != tc.wantErr {
+				t.Errorf("error = %q, want %q", cbErr.Error, tc.wantErr)
+			}
+			if !tc.wantDescIs(cbErr.ErrorDescription) {
+				t.Errorf("unexpected error_description %q", cbErr.ErrorDescription)
+			}
+		})
+	}
+}
+
 // --- Register: HTTPS redirect_uri validation ---
 
 func TestRegister_RejectsHTTPNonLoopback(t *testing.T) {
@@ -1267,10 +1356,11 @@ func TestTokenAuthCode_ExpiredClient(t *testing.T) {
 		ID:           "expired-client-id",
 		RedirectURIs: []string{redirectURI},
 		ClientName:   "expired",
+		Typ:          token.PurposeClient,
 		Audience:     testBaseURL,
 		ExpiresAt:    time.Now().Add(-1 * time.Hour),
 	}
-	encClientID, err := tm.SealJSON(sc)
+	encClientID, err := tm.SealJSON(sc, token.PurposeClient)
 	if err != nil {
 		t.Fatalf("SealJSON: %v", err)
 	}
@@ -1313,10 +1403,11 @@ func TestTokenRefresh_ExpiredClient(t *testing.T) {
 		ID:           "expired-client-id",
 		RedirectURIs: []string{"https://app.example.com/callback"},
 		ClientName:   "expired",
+		Typ:          token.PurposeClient,
 		Audience:     testBaseURL,
 		ExpiresAt:    time.Now().Add(-1 * time.Hour),
 	}
-	encClientID, err := tm.SealJSON(sc)
+	encClientID, err := tm.SealJSON(sc, token.PurposeClient)
 	if err != nil {
 		t.Fatalf("SealJSON: %v", err)
 	}
@@ -1431,16 +1522,18 @@ func TestTokenAuthCodeFlow_GroupsPreserved(t *testing.T) {
 	codeChallenge := pkceChallenge(codeVerifier)
 
 	sc := sealedCode{
+		TokenID:       uuid.New().String(),
 		ClientID:      internalID,
 		RedirectURI:   redirectURI,
 		CodeChallenge: codeChallenge,
 		Subject:       "user-sub",
 		Email:         "user@example.com",
 		Groups:        []string{"admin", "dev"},
+		Typ:           token.PurposeCode,
 		Audience:      testBaseURL,
 		ExpiresAt:     time.Now().Add(5 * time.Minute),
 	}
-	authCode, err := tm.SealJSON(sc)
+	authCode, err := tm.SealJSON(sc, token.PurposeCode)
 	if err != nil {
 		t.Fatalf("SealJSON: %v", err)
 	}
@@ -1483,15 +1576,18 @@ func TestTokenRefreshFlow_GroupsPreserved(t *testing.T) {
 	encClientID, internalID := registerClient(t, tm, []string{"https://app.example.com/callback"})
 
 	sr := sealedRefresh{
+		TokenID:   uuid.New().String(),
+		FamilyID:  uuid.New().String(),
 		Subject:   "user-sub",
 		Email:     "user@example.com",
 		Groups:    []string{"editors"},
 		ClientID:  internalID,
+		Typ:       token.PurposeRefresh,
 		Audience:  testBaseURL,
 		IssuedAt:  time.Now(),
 		ExpiresAt: time.Now().Add(7 * 24 * time.Hour),
 	}
-	refreshTokenStr, err := tm.SealJSON(sr)
+	refreshTokenStr, err := tm.SealJSON(sr, token.PurposeRefresh)
 	if err != nil {
 		t.Fatalf("SealJSON: %v", err)
 	}
@@ -1527,7 +1623,7 @@ func TestTokenRefreshFlow_GroupsPreserved(t *testing.T) {
 	// Verify new refresh token also carries groups
 	newRefreshStr := resp["refresh_token"].(string)
 	var newRefresh sealedRefresh
-	if err := tm.OpenJSON(newRefreshStr, &newRefresh); err != nil {
+	if err := tm.OpenJSON(newRefreshStr, &newRefresh, token.PurposeRefresh); err != nil {
 		t.Fatalf("OpenJSON refresh: %v", err)
 	}
 	if len(newRefresh.Groups) != 1 || newRefresh.Groups[0] != "editors" {
@@ -1632,16 +1728,21 @@ func TestAuthorize_PKCEOptional_RejectsPlain(t *testing.T) {
 	}
 }
 
-// --- Authorize: server-side state generation ---
+// --- Authorize: state handling (H7) ---
+//
+// Default (strict) mode refuses /authorize when the client omits state —
+// a missing state hides a client-side CSRF bug. COMPAT_ALLOW_STATELESS=true
+// keeps the legacy Cursor/MCP Inspector behavior of synthesizing one
+// server-side. Either way we emit mcp_auth_access_denied_total{reason=
+// "state_missing"} so operators can see which clients still rely on it.
 
-func TestAuthorize_GeneratesStateWhenMissing(t *testing.T) {
+func TestAuthorize_RefusesStatelessByDefault(t *testing.T) {
 	tm := newTestTokenManager(t)
 	logger := zap.NewNop()
 	redirectURI := "https://app.example.com/callback"
 	encClientID, _ := registerClient(t, tm, []string{redirectURI})
 	challenge := pkceChallenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk")
 
-	// No state parameter at all
 	params := url.Values{
 		"response_type":         {"code"},
 		"client_id":             {encClientID},
@@ -1649,20 +1750,235 @@ func TestAuthorize_GeneratesStateWhenMissing(t *testing.T) {
 		"code_challenge":        {challenge},
 		"code_challenge_method": {"S256"},
 	}
-
 	req := httptest.NewRequest(http.MethodGet, "/authorize?"+params.Encode(), nil)
 	rr := httptest.NewRecorder()
 
 	Authorize(tm, logger, testBaseURL, testOAuth2Config(), AuthorizeConfig{PKCERequired: true})(rr, req)
 
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 state_missing in strict mode, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var oe OAuthError
+	_ = json.NewDecoder(rr.Body).Decode(&oe)
+	if oe.Error != "invalid_request" {
+		t.Errorf("expected invalid_request, got %q", oe.Error)
+	}
+}
+
+func TestAuthorize_CompatGeneratesStateWhenMissing(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+	redirectURI := "https://app.example.com/callback"
+	encClientID, _ := registerClient(t, tm, []string{redirectURI})
+	challenge := pkceChallenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk")
+
+	params := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {encClientID},
+		"redirect_uri":          {redirectURI},
+		"code_challenge":        {challenge},
+		"code_challenge_method": {"S256"},
+	}
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/authorize?"+params.Encode(), nil)
+	rr := httptest.NewRecorder()
+
+	Authorize(tm, logger, testBaseURL, testOAuth2Config(), AuthorizeConfig{
+		PKCERequired:         true,
+		CompatAllowStateless: true,
+	})(rr, req)
+
+	if rr.Code != http.StatusFound {
+		t.Fatalf("expected 302 in compat mode, got %d: %s", rr.Code, rr.Body.String())
+	}
+	loc := rr.Header().Get("Location")
+	if !strings.Contains(loc, "state=") {
+		t.Errorf("redirect should contain server-generated state: %s", loc)
+	}
+}
+
+// --- H6: server-side PKCE in relaxed mode ---
+//
+// When PKCE_REQUIRED=false and the client omits code_challenge, the proxy
+// mints a downstream PKCE pair itself so the code is still anchored to a
+// verifier — /token verifies it internally and the replay store enforces
+// single-use. The client sends no code_verifier in this path.
+
+func TestAuthorize_ServerSidePKCE_WhenClientOmits(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+	redirectURI := "https://app.example.com/callback"
+	encClientID, _ := registerClient(t, tm, []string{redirectURI})
+
+	params := url.Values{
+		"response_type": {"code"},
+		"client_id":     {encClientID},
+		"redirect_uri":  {redirectURI},
+		"state":         {"s"},
+	}
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/authorize?"+params.Encode(), nil)
+	rr := httptest.NewRecorder()
+
+	Authorize(tm, logger, testBaseURL, testOAuth2Config(), AuthorizeConfig{PKCERequired: false})(rr, req)
 	if rr.Code != http.StatusFound {
 		t.Fatalf("expected 302, got %d: %s", rr.Code, rr.Body.String())
 	}
 
-	// The redirect to IdP should have a state parameter (server-generated)
-	loc := rr.Header().Get("Location")
-	if !strings.Contains(loc, "state=") {
-		t.Errorf("redirect should contain server-generated state: %s", loc)
+	idpURL, err := url.Parse(rr.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse Location: %v", err)
+	}
+	internalState := idpURL.Query().Get("state")
+	if internalState == "" {
+		t.Fatal("expected sealed state in IdP redirect")
+	}
+
+	var session sealedSession
+	if err := tm.OpenJSON(internalState, &session, token.PurposeSession); err != nil {
+		t.Fatalf("OpenJSON session: %v", err)
+	}
+	if session.SvrVerifier == "" || session.SvrChallenge == "" {
+		t.Fatal("expected server-side PKCE pair to be populated on sealedSession")
+	}
+	if session.CodeChallenge != session.SvrChallenge {
+		t.Errorf("CodeChallenge should mirror SvrChallenge when H6 kicks in")
+	}
+	if ComputePKCEChallenge(session.SvrVerifier) != session.SvrChallenge {
+		t.Errorf("SvrChallenge must be S256 of SvrVerifier")
+	}
+}
+
+func TestAuthorize_ServerSidePKCE_NotSet_WhenClientProvides(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+	redirectURI := "https://app.example.com/callback"
+	encClientID, _ := registerClient(t, tm, []string{redirectURI})
+	challenge := pkceChallenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk")
+
+	params := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {encClientID},
+		"redirect_uri":          {redirectURI},
+		"code_challenge":        {challenge},
+		"code_challenge_method": {"S256"},
+		"state":                 {"s"},
+	}
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/authorize?"+params.Encode(), nil)
+	rr := httptest.NewRecorder()
+
+	Authorize(tm, logger, testBaseURL, testOAuth2Config(), AuthorizeConfig{PKCERequired: false})(rr, req)
+	if rr.Code != http.StatusFound {
+		t.Fatalf("expected 302, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	idpURL, _ := url.Parse(rr.Header().Get("Location"))
+	internalState := idpURL.Query().Get("state")
+	var session sealedSession
+	if err := tm.OpenJSON(internalState, &session, token.PurposeSession); err != nil {
+		t.Fatalf("OpenJSON session: %v", err)
+	}
+	if session.SvrVerifier != "" || session.SvrChallenge != "" {
+		t.Errorf("server-side PKCE must stay empty when client supplied its own challenge")
+	}
+	if session.CodeChallenge != challenge {
+		t.Errorf("session CodeChallenge should mirror client-supplied challenge")
+	}
+}
+
+// TestToken_ServerSidePKCE_ClientOmitsVerifier: when the proxy minted
+// the downstream PKCE pair at /authorize (ServerPKCE=true), /token accepts
+// the code without the client sending a code_verifier because the code
+// carries the matching SvrVerifier internally.
+func TestToken_ServerSidePKCE_ClientOmitsVerifier(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+	redirectURI := "https://app.example.com/callback"
+	encClientID, internalID := registerClient(t, tm, []string{redirectURI})
+
+	svrVerifier := "server-minted-verifier-that-is-plenty-long-enough-xyz"
+	svrChallenge := ComputePKCEChallenge(svrVerifier)
+
+	sc := sealedCode{
+		TokenID:       uuid.New().String(),
+		ClientID:      internalID,
+		RedirectURI:   redirectURI,
+		CodeChallenge: svrChallenge,
+		Subject:       "user-sub",
+		Email:         "u@example.com",
+		ServerPKCE:    true,
+		SvrVerifier:   svrVerifier,
+		Typ:           token.PurposeCode,
+		Audience:      testBaseURL,
+		ExpiresAt:     time.Now().Add(5 * time.Minute),
+	}
+	code, err := tm.SealJSON(sc, token.PurposeCode)
+	if err != nil {
+		t.Fatalf("SealJSON: %v", err)
+	}
+
+	form := url.Values{
+		"grant_type":   {"authorization_code"},
+		"code":         {code},
+		"redirect_uri": {redirectURI},
+		"client_id":    {encClientID},
+		// no code_verifier on purpose — H6 path
+	}
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rr := httptest.NewRecorder()
+
+	Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 with H6 server-side PKCE, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestToken_ServerSidePKCE_RejectsWrongClientVerifier: even in H6 mode, a
+// client that tries to send its own verifier must not be able to bypass
+// the server-minted challenge. This stops a party that captured the code
+// from claiming ownership by brute-force supplying any verifier; only the
+// empty "client omitted verifier" case is allowed.
+func TestToken_ServerSidePKCE_RejectsWrongClientVerifier(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+	redirectURI := "https://app.example.com/callback"
+	encClientID, internalID := registerClient(t, tm, []string{redirectURI})
+
+	svrVerifier := "server-minted-verifier-that-is-plenty-long-enough-xyz"
+	svrChallenge := ComputePKCEChallenge(svrVerifier)
+	sc := sealedCode{
+		TokenID:       uuid.New().String(),
+		ClientID:      internalID,
+		RedirectURI:   redirectURI,
+		CodeChallenge: svrChallenge,
+		Subject:       "user-sub",
+		Email:         "u@example.com",
+		ServerPKCE:    true,
+		SvrVerifier:   svrVerifier,
+		Typ:           token.PurposeCode,
+		Audience:      testBaseURL,
+		ExpiresAt:     time.Now().Add(5 * time.Minute),
+	}
+	code, err := tm.SealJSON(sc, token.PurposeCode)
+	if err != nil {
+		t.Fatalf("SealJSON: %v", err)
+	}
+
+	form := url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {code},
+		"redirect_uri":  {redirectURI},
+		"client_id":     {encClientID},
+		"code_verifier": {"attacker-supplied-verifier-that-wont-match-the-svr-pair"},
+	}
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rr := httptest.NewRecorder()
+
+	Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for wrong client-supplied verifier, got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -1683,10 +1999,11 @@ func TestCallback_RejectsForeignSession(t *testing.T) {
 		RedirectURI:   "https://app.example.com/callback",
 		CodeChallenge: "",
 		OriginalState: "abc",
+		Typ:           token.PurposeSession,
 		Audience:      "https://other-proxy.example.com",
 		ExpiresAt:     time.Now().Add(5 * time.Minute),
 	}
-	state, err := tm.SealJSON(foreign)
+	state, err := tm.SealJSON(foreign, token.PurposeSession)
 	if err != nil {
 		t.Fatalf("SealJSON: %v", err)
 	}
@@ -1721,10 +2038,11 @@ func TestAuthorize_RejectsForeignClient(t *testing.T) {
 		ID:           "foreign-client",
 		RedirectURIs: []string{redirectURI},
 		ClientName:   "from-other-proxy",
+		Typ:          token.PurposeClient,
 		Audience:     "https://other-proxy.example.com",
 		ExpiresAt:    time.Now().Add(1 * time.Hour),
 	}
-	encClientID, err := tm.SealJSON(foreign)
+	encClientID, err := tm.SealJSON(foreign, token.PurposeClient)
 	if err != nil {
 		t.Fatalf("SealJSON: %v", err)
 	}
@@ -1764,15 +2082,17 @@ func TestTokenAuthCode_RejectsForeignCode(t *testing.T) {
 
 	// Code minted for a different proxy.
 	foreignCode := sealedCode{
+		TokenID:       uuid.New().String(),
 		ClientID:      internalID,
 		RedirectURI:   redirectURI,
 		CodeChallenge: codeChallenge,
 		Subject:       "user-sub",
 		Email:         "u@example.com",
+		Typ:           token.PurposeCode,
 		Audience:      "https://other-proxy.example.com",
 		ExpiresAt:     time.Now().Add(5 * time.Minute),
 	}
-	authCode, err := tm.SealJSON(foreignCode)
+	authCode, err := tm.SealJSON(foreignCode, token.PurposeCode)
 	if err != nil {
 		t.Fatalf("SealJSON: %v", err)
 	}
@@ -1808,14 +2128,17 @@ func TestTokenRefresh_RejectsForeignRefresh(t *testing.T) {
 	encClientID, internalID := registerClient(t, tm, []string{"https://app.example.com/callback"})
 
 	foreign := sealedRefresh{
+		TokenID:   uuid.New().String(),
+		FamilyID:  uuid.New().String(),
 		Subject:   "user",
 		Email:     "u@example.com",
 		ClientID:  internalID,
+		Typ:       token.PurposeRefresh,
 		Audience:  "https://other-proxy.example.com",
 		IssuedAt:  time.Now(),
 		ExpiresAt: time.Now().Add(7 * 24 * time.Hour),
 	}
-	refreshTokenStr, err := tm.SealJSON(foreign)
+	refreshTokenStr, err := tm.SealJSON(foreign, token.PurposeRefresh)
 	if err != nil {
 		t.Fatalf("SealJSON: %v", err)
 	}
@@ -1853,14 +2176,17 @@ func TestTokenRefresh_RevokedByCutoff(t *testing.T) {
 
 	// Refresh token issued 1 hour ago...
 	old := sealedRefresh{
+		TokenID:   uuid.New().String(),
+		FamilyID:  uuid.New().String(),
 		Subject:   "user",
 		Email:     "u@example.com",
 		ClientID:  internalID,
+		Typ:       token.PurposeRefresh,
 		Audience:  testBaseURL,
 		IssuedAt:  time.Now().Add(-1 * time.Hour),
 		ExpiresAt: time.Now().Add(7 * 24 * time.Hour),
 	}
-	refreshTokenStr, err := tm.SealJSON(old)
+	refreshTokenStr, err := tm.SealJSON(old, token.PurposeRefresh)
 	if err != nil {
 		t.Fatalf("SealJSON: %v", err)
 	}
@@ -1899,14 +2225,17 @@ func TestTokenRefresh_NotRevokedAfterCutoff(t *testing.T) {
 	cutoff := time.Now().Add(-1 * time.Hour)
 
 	fresh := sealedRefresh{
+		TokenID:   uuid.New().String(),
+		FamilyID:  uuid.New().String(),
 		Subject:   "user",
 		Email:     "u@example.com",
 		ClientID:  internalID,
+		Typ:       token.PurposeRefresh,
 		Audience:  testBaseURL,
 		IssuedAt:  time.Now(), // after cutoff
 		ExpiresAt: time.Now().Add(7 * 24 * time.Hour),
 	}
-	refreshTokenStr, err := tm.SealJSON(fresh)
+	refreshTokenStr, err := tm.SealJSON(fresh, token.PurposeRefresh)
 	if err != nil {
 		t.Fatalf("SealJSON: %v", err)
 	}
@@ -1936,14 +2265,17 @@ func TestTokenRefresh_NewTokenCarriesIssuedAt(t *testing.T) {
 	encClientID, internalID := registerClient(t, tm, []string{"https://app.example.com/callback"})
 
 	old := sealedRefresh{
+		TokenID:   uuid.New().String(),
+		FamilyID:  uuid.New().String(),
 		Subject:   "user",
 		Email:     "u@example.com",
 		ClientID:  internalID,
+		Typ:       token.PurposeRefresh,
 		Audience:  testBaseURL,
 		IssuedAt:  time.Now().Add(-2 * time.Hour),
 		ExpiresAt: time.Now().Add(7 * 24 * time.Hour),
 	}
-	oldRefreshTokenStr, err := tm.SealJSON(old)
+	oldRefreshTokenStr, err := tm.SealJSON(old, token.PurposeRefresh)
 	if err != nil {
 		t.Fatalf("SealJSON: %v", err)
 	}
@@ -1966,7 +2298,7 @@ func TestTokenRefresh_NewTokenCarriesIssuedAt(t *testing.T) {
 
 	newRefreshStr := resp["refresh_token"].(string)
 	var newRefresh sealedRefresh
-	if err := tm.OpenJSON(newRefreshStr, &newRefresh); err != nil {
+	if err := tm.OpenJSON(newRefreshStr, &newRefresh, token.PurposeRefresh); err != nil {
 		t.Fatalf("OpenJSON: %v", err)
 	}
 	if newRefresh.IssuedAt.Before(time.Now().Add(-1 * time.Minute)) {
@@ -2001,10 +2333,11 @@ func TestTokenAuthCode_ReplayStore_RejectsSecondUse(t *testing.T) {
 		CodeChallenge: codeChallenge,
 		Subject:       "user-sub",
 		Email:         "user@example.com",
+		Typ:           token.PurposeCode,
 		Audience:      testBaseURL,
 		ExpiresAt:     time.Now().Add(60 * time.Second),
 	}
-	authCode, err := tm.SealJSON(sc)
+	authCode, err := tm.SealJSON(sc, token.PurposeCode)
 	if err != nil {
 		t.Fatalf("SealJSON: %v", err)
 	}
@@ -2066,11 +2399,12 @@ func TestTokenRefresh_ReplayStore_ReuseRevokesFamily(t *testing.T) {
 		Subject:   "user-sub",
 		Email:     "user@example.com",
 		ClientID:  internalID,
+		Typ:       token.PurposeRefresh,
 		Audience:  testBaseURL,
 		IssuedAt:  time.Now(),
 		ExpiresAt: time.Now().Add(7 * 24 * time.Hour),
 	}
-	originalStr, err := tm.SealJSON(originalRefresh)
+	originalStr, err := tm.SealJSON(originalRefresh, token.PurposeRefresh)
 	if err != nil {
 		t.Fatalf("SealJSON: %v", err)
 	}
@@ -2101,7 +2435,7 @@ func TestTokenRefresh_ReplayStore_ReuseRevokesFamily(t *testing.T) {
 	newRefreshStr := tok1["refresh_token"].(string)
 
 	var rotated sealedRefresh
-	if err := tm.OpenJSON(newRefreshStr, &rotated); err != nil {
+	if err := tm.OpenJSON(newRefreshStr, &rotated, token.PurposeRefresh); err != nil {
 		t.Fatalf("OpenJSON rotated: %v", err)
 	}
 	if rotated.FamilyID != familyID {
@@ -2193,10 +2527,11 @@ func TestTokenAuthCode_ReplayStore_PKCEFailureDoesNotBurnCode(t *testing.T) {
 		CodeChallenge: codeChallenge,
 		Subject:       "user-sub",
 		Email:         "user@example.com",
+		Typ:           token.PurposeCode,
 		Audience:      testBaseURL,
 		ExpiresAt:     time.Now().Add(60 * time.Second),
 	}
-	authCode, err := tm.SealJSON(sc)
+	authCode, err := tm.SealJSON(sc, token.PurposeCode)
 	if err != nil {
 		t.Fatalf("SealJSON: %v", err)
 	}

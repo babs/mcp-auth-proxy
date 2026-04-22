@@ -105,7 +105,7 @@ All configuration is via environment variables.
 | `PROXY_BASE_URL` | Public URL of this proxy | `https://mcp-proxy.example.com` |
 | `UPSTREAM_MCP_URL` | URL of the target MCP server (path prefix preserved) | `http://mcp-server:8080` or `http://mcp-server:8080/api` |
 | `LISTEN_ADDR` | Bind address | `:8080` |
-| `METRICS_ADDR` | Prometheus metrics bind address | `:9090` |
+| `METRICS_ADDR` | Prometheus metrics bind address. Default `127.0.0.1:9090` — loopback only so `/metrics` and `/readyz` are never exposed on the public interface. Override to `:9090` or a specific interface when a Prometheus scraper must reach the pod over the network | `127.0.0.1:9090` (default) |
 | `TOKEN_SIGNING_SECRET` | Secret for AES-GCM opaque tokens (min 32 bytes, shared across all instances) | `...` |
 | `LOG_LEVEL` | `debug`, `info`, `warn` | `info` |
 | `GROUPS_CLAIM` | Flat claim name in the OIDC id_token containing user groups | `groups` (default) |
@@ -113,9 +113,14 @@ All configuration is via environment variables.
 | `REVOKE_BEFORE` | RFC3339 timestamp — both access tokens AND refresh tokens with `iat` before this are rejected (bulk revocation). Empty = disabled | `2026-03-28T12:00:00Z` |
 | `PKCE_REQUIRED` | Require PKCE on /authorize (default `true`). Set `false` for Cursor, MCP Inspector, ChatGPT compat | `true` |
 | `SHUTDOWN_TIMEOUT` | Graceful shutdown deadline. Raise above the longest expected SSE stream so rolling deploys do not cut MCP sessions mid-stream. Match `terminationGracePeriodSeconds` in K8s | `120s` (default) |
-| `REDIS_URL` | Optional. When set, enables single-use authorization codes and refresh rotation with reuse detection (OAuth 2.1 §6.1) across replicas. `rediss://` for TLS. On Redis failure the proxy fails closed (503) | `redis://redis:6379/0` |
+| `REDIS_URL` | Enables single-use authorization codes and refresh rotation with reuse detection (OAuth 2.1 §6.1) across replicas. `rediss://` for TLS. On Redis failure the proxy fails closed (503) | `redis://redis:6379/0` |
+| `REDIS_REQUIRED` | Fail startup (`logger.Fatal`) when `REDIS_URL` is unset. Default `true` — stateless mode leaves authorization codes / refresh tokens replayable within their TTL (findings C3/C4). Set `false` only for dev or single-replica deployments that accept the trade-off | `true` (default) |
 | `REDIS_KEY_PREFIX` | Prefix applied to every Redis key (default `mcp-auth-proxy:`). Override when sharing a Redis DB between multiple proxy deployments to avoid key collisions. Set explicitly to empty (`REDIS_KEY_PREFIX=`) to opt out of namespacing | `prod-mcp:` |
-| `RATE_LIMIT_ENABLED` | Per-IP rate limiting on pre-auth endpoints (default `true`). httprate keys on `X-Forwarded-For`/`X-Real-IP`/`RemoteAddr`, so front the proxy with a trusted L4/L7 load balancer to prevent header-spoof bypass | `true` |
+| `RATE_LIMIT_ENABLED` | Per-IP rate limiting on pre-auth endpoints and on the authenticated MCP route (default `true`). Keyed on the stripped `RemoteAddr` by default; set `TRUST_PROXY_HEADERS=true` to honor `X-Forwarded-For`/`X-Real-IP`/`True-Client-IP` behind a trusted frontend | `true` |
+| `TRUST_PROXY_HEADERS` | Honor `X-Forwarded-For`/`X-Real-IP`/`True-Client-IP` when keying the rate limiter (default `false`). Enable **only** behind a trusted L4/L7 that sanitizes these headers — otherwise a client can trivially mint its own rate-limit key and bypass the limiter | `false` (default) |
+| `MCP_PER_SUBJECT_CONCURRENCY` | Per-subject in-flight request cap on the authenticated MCP route (default `16`). A runaway or compromised client identity cannot saturate the proxy / upstream pool at the expense of others. Entries for subjects with no in-flight work are reclaimed by a background pruner after ≥5 min idle so map memory stays proportional to active principals, not the lifetime set of ever-seen subjects. `0` disables the limit. Excess requests return 503 `temporarily_unavailable` with `Retry-After: 1` and increment `mcp_auth_access_denied_total{reason="subject_concurrency_exceeded"}` | `16` (default) |
+| `COMPAT_ALLOW_STATELESS` | When `true`, `/authorize` synthesizes a `state` server-side if the client omits it (legacy MCP Inspector / Cursor). Default `false` — strict mode refuses with 400 `invalid_request` because a silent server-synth hides client-side CSRF bugs. `mcp_auth_access_denied_total{reason="state_missing"}` is incremented either way so operators can see how many clients still rely on the compat path | `false` (default) |
+| `MCP_LOG_BODY_MAX` | Max bytes buffered per authenticated request for JSON-RPC method extraction into access logs (default `65536`). `0` disables buffering — no `rpc_method`/`rpc_tool`/`rpc_id` fields are emitted. Only triggered when `Content-Type: application/json` and `Content-Length` is set and within the limit; SSE / chunked uploads pass through untouched | `65536` (default) |
 
 ---
 
@@ -230,7 +235,7 @@ No authentication required on this endpoint.
 
 **Behavior:**
 - Validate that `redirect_uris` is present and non-empty
-- OAuth 2.1 §2.3.1: each `redirect_uri` must use HTTPS (except loopback: `localhost`, `127.0.0.1`, `::1`)
+- OAuth 2.1 §2.3.1: each `redirect_uri` must use HTTPS, or HTTP when pointing at a loopback host. Loopback is recognized via `net.ParseIP().IsLoopback()` (covers the full 127/8 range, `::1`, `::ffff:127.0.0.1`, `::0.0.0.1`) plus the literal `localhost` / `localhost.`. Non-http(s) schemes (e.g. `ftp://`, `ldap://`, `file://`, custom app schemes) are rejected unconditionally even when the host is loopback
 - Generate an internal UUID for the client
 - Encrypt the whole `{ id, redirect_uris, client_name, expires_at }` with AES-GCM → this is the returned `client_id`
 - TTL embedded in the encrypted blob: 24h (clients re-register)
@@ -445,7 +450,7 @@ r.Header.Del("Authorization")  // do not leak the internal token
 // Support Streamable HTTP (chunked): immediate flush
 ```
 
-Use `httputil.ReverseProxy` with `FlushInterval: -1` (immediate flush) to support SSE and streaming. The underlying `*http.Transport` sets `ResponseHeaderTimeout: 30s` so a wedged upstream fails fast during header negotiation — stream bodies themselves remain uncapped. The transport follows 307/308 redirects server-side (Python FastAPI/Starlette backends), same-host only, body replayed, max 10 hops. On exhaustion the proxy returns the last redirect response rather than re-issuing the request (doubling side effects). Proxied request bodies are capped at 16 MiB via `http.MaxBytesReader` to bound the memory the redirect-follow buffer can hold.
+Use `httputil.ReverseProxy` with `FlushInterval: -1` (immediate flush) to support SSE and streaming. The underlying `*http.Transport` sets `ResponseHeaderTimeout: 30s` so a wedged upstream fails fast during header negotiation — stream bodies themselves remain uncapped. The transport follows 307/308 redirects server-side (Python FastAPI/Starlette backends), same-host only, body replayed, max 10 hops. On exhaustion the proxy responds **502 Bad Gateway** with `{"error":"bad_gateway","error_description":"too many upstream redirects"}` rather than echoing the last 307/308 (which would leak a broken upstream `Location:` to the MCP client). Proxied request bodies are capped at 16 MiB via `http.MaxBytesReader` to bound the memory the redirect-follow buffer can hold.
 
 ---
 
@@ -517,9 +522,19 @@ type OAuthError struct {
 | `refresh_reuse_detected` | Refresh token replayed after rotation → family revoked (requires Redis) | `invalid_grant` |
 | `refresh_family_revoked` | Refresh token whose family was previously revoked | `invalid_grant` |
 | `email_not_verified` | id_token `email_verified` is `false` | `access_denied` |
+| `subject_missing` | IdP returned a verified id_token without a `sub` claim (L5) | `access_denied` |
+| `group_invalid` | IdP group name contains `,` `\r` `\n` `\x00` | `access_denied` |
 | `replay_store_unavailable` | Redis unreachable; handler fails closed | `server_error` |
 | `id_token_verification_failed` | go-oidc rejected the IdP id_token | `server_error` |
 | `token_issue_failed` | AES-GCM seal error when minting an access token | `server_error` |
+
+IdP-supplied `error` values on `/callback` are allowlisted against the
+RFC 6749 §4.1.2.1 set (`invalid_request`, `invalid_client`,
+`unauthorized_client`, `access_denied`, `unsupported_response_type`,
+`invalid_scope`, `server_error`, `temporarily_unavailable`); anything
+outside that set is rewritten to `server_error` before being echoed to
+the MCP client. `error_description` is truncated at 200 bytes and
+stripped of non-ASCII-printable bytes to defeat log / header injection.
 
 ---
 
@@ -579,8 +594,8 @@ ENTRYPOINT ["/usr/local/bin/mcp-auth-proxy"]
 - **PKCE**: `S256` only (if provided). Strict by default (`PKCE_REQUIRED=true`). Set `false` for clients that omit PKCE (Cursor, MCP Inspector, ChatGPT). `code_verifier` must be 43-128 chars when present
 - **Audience binding**: every sealed payload (client_id, session, code, refresh, access token) carries `PROXY_BASE_URL` as `audience` and is rejected if a sibling instance with a different baseURL receives it. Defends against accidental cross-deployment secret reuse
 - **Refresh-token bulk revocation**: `REVOKE_BEFORE` applies to refresh tokens too — a leaked refresh cannot mint fresh access tokens past the cutoff. Refresh tokens carry their own `iat` for this check
-- **redirect_uri**: exact match, HTTPS required except loopback (`localhost`, `127.0.0.1`, `::1`)
-- **Structured logs**: zap, JSON format, include `request_id` in each log. Inbound `X-Request-Id` is stripped before chi mints one, to prevent log-forgery via client-controlled IDs
+- **redirect_uri**: exact match; `http://` allowed only to a loopback host (full 127/8 range, `::1`, `::ffff:127.0.0.1`, `::0.0.0.1`, `localhost`, `localhost.`); non-http(s) schemes rejected even on loopback; fragments and userinfo rejected; length capped at 512 chars; at most 5 entries per client registration
+- **Structured logs**: zap, JSON format, include `request_id` in each log. Inbound `X-Request-Id` is stripped before chi mints one, to prevent log-forgery via client-controlled IDs. Authenticated requests additionally carry `sub` and `email` from the bearer token. JSON-RPC requests to the upstream MCP server also carry `rpc_method` (e.g. `tools/call`), `rpc_tool` (the `params.name` field), and `rpc_id`. `rpc_method` and `rpc_tool` are capped at 128 characters, `rpc_id` at 64; all three pass through a narrow allowlist (ASCII alphanumerics plus `._:/-+`), so arbitrary attacker-supplied strings cannot bloat or smuggle into log lines. Set `MCP_LOG_BODY_MAX=0` to suppress the `rpc_*` fields entirely
 - **Business metrics**: alongside the Prometheus Go runtime counters, the `metrics` package emits `mcp_auth_tokens_issued_total{grant_type}`, `mcp_auth_access_denied_total{reason}`, `mcp_auth_replay_detected_total{kind}`, `mcp_auth_rate_limited_total{endpoint}`, and `mcp_auth_clients_registered_total` so security-relevant events are alertable
 - **Graceful shutdown**: context with SIGINT/SIGTERM signals, deadline configurable via `SHUTDOWN_TIMEOUT` (default 120s) — calibrate to the expected SSE stream duration to avoid cutting ongoing MCP sessions during a rolling deploy. The K8s `terminationGracePeriodSeconds` must be ≥ `SHUTDOWN_TIMEOUT`
 - **Timeouts**: `ReadTimeout: 30s`, `WriteTimeout: 0` (SSE), `IdleTimeout: 120s`
@@ -647,6 +662,26 @@ spec:
 
 Ship a `PodDisruptionBudget` with `minAvailable: 1` (or 2 for ≥3 replicas) so node drains do not take out the whole auth plane at once.
 
+The `manifests/` folder ships a turn-key demo: a Docker Compose stack (Keycloak + Redis + fake MCP upstream + proxy) for local exploration and a Kubernetes reference set (`Deployment`, `Service`, `Ingress`, `PodDisruptionBudget`, plus `scripts/generate-signing-secret.sh`).
+
 ### Bulk revocation rollout caveat
 
 `REVOKE_BEFORE` is read at startup. Updating it requires a rolling restart, and during the rollout window some pods enforce the new cutoff while others still use the old one. Wait for `kubectl rollout status` to converge before assuming the cutoff is fleet-wide enforced.
+
+---
+
+## Startup validation
+
+`config.Load()` fails closed on the following config mistakes (fatal at startup):
+
+- `TOKEN_SIGNING_SECRET` shorter than 32 bytes.
+- `SHUTDOWN_TIMEOUT` non-positive or greater than 15 minutes (L2).
+- `REDIS_KEY_PREFIX` containing `{`, `}`, `\r`, `\n`, or any byte outside the 0x20..0x7E ASCII-printable range (L3).
+- `PROXY_BASE_URL` with a scheme other than `https://` (or `http://` to a loopback host), a non-empty userinfo, a fragment, or a path beyond `/` (L8).
+- `MCP_LOG_BODY_MAX` / `MCP_PER_SUBJECT_CONCURRENCY` not parseable as non-negative integers.
+- `SHUTDOWN_TIMEOUT` / `REVOKE_BEFORE` unparseable as duration / RFC3339.
+
+Non-fatal startup warnings:
+
+- `token_signing_secret_weak` fires when the 32-byte secret has fewer than 16 distinct byte values — signals a human-typed / patterned secret whose effective entropy is well below its length (L1).
+- `token_seal_rotation_threshold` fires once after 2^28 successful seals per Manager, suggesting `TOKEN_SIGNING_SECRET` rotation before AES-GCM nonce-collision bounds matter (L6).

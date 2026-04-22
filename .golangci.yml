@@ -18,6 +18,16 @@ linters:
       rules:
         - name: exported
           disabled: true
+  exclusions:
+    rules:
+      # noctx flags httptest.NewRequest in _test.go files, but httptest
+      # requests are fed directly to a handler — no outbound network call,
+      # so a context adds no cancellation/timeout value. Use
+      # NewRequestWithContext only where the test actually wants to assert
+      # ctx propagation.
+      - path: _test\.go
+        linters:
+          - noctx
 
 run:
   timeout: 5m

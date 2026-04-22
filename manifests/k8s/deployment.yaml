@@ -1,0 +1,93 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-auth-proxy
+  namespace: mcp-auth-proxy
+  labels:
+    app.kubernetes.io/name: mcp-auth-proxy
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mcp-auth-proxy
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Never go below full capacity during a rolling deploy.
+      # This protects against cutting in-flight MCP/SSE sessions.
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: mcp-auth-proxy
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Match or exceed SHUTDOWN_TIMEOUT so rolling deploys drain SSE streams
+      # before the pod is killed.
+      terminationGracePeriodSeconds: 120
+
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: mcp-auth-proxy
+          # TODO: replace with your published image (e.g. ghcr.io/babs/mcp-auth-proxy:v1.0.0)
+          image: ghcr.io/babs/mcp-auth-proxy:latest
+          imagePullPolicy: Always
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+
+          envFrom:
+            - secretRef:
+                name: mcp-auth-proxy-secret
+            - configMapRef:
+                name: mcp-auth-proxy-config
+
+          # Readiness: drops the pod from the Service endpoint list while
+          # the proxy cannot reach Redis (when REDIS_URL set). /readyz is
+          # bound to the metrics listener only — exposing it on the public
+          # port would turn every anonymous probe into a Redis-DoS
+          # amplifier (see main.go readyzHandler doc comment).
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+
+          # Liveness: restarts the pod if the process hangs.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 3
+
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "128Mi"
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]

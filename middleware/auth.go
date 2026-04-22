@@ -15,9 +15,12 @@ import (
 type contextKey string
 
 const (
-	ContextSubject contextKey = "sub"
-	ContextEmail   contextKey = "email"
-	ContextGroups  contextKey = "groups"
+	ContextSubject   contextKey = "sub"
+	ContextEmail     contextKey = "email"
+	ContextGroups    contextKey = "groups"
+	ContextRPCMethod contextKey = "rpc_method" // JSON-RPC method from request body
+	ContextRPCTool   contextKey = "rpc_tool"   // params.name for tools/call
+	ContextRPCID     contextKey = "rpc_id"     // request id (number|string, raw JSON)
 )
 
 // Auth validates Bearer tokens on proxied MCP routes.
@@ -91,5 +94,5 @@ func (a *Auth) writeAuthError(w http.ResponseWriter, desc string) {
 	))
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusUnauthorized)
-	json.NewEncoder(w).Encode(map[string]string{"error": desc})
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": desc})
 }

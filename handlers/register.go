@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/babs/mcp-auth-proxy/metrics"
@@ -12,7 +13,15 @@ import (
 	"go.uber.org/zap"
 )
 
-const clientTTL = 24 * time.Hour
+const (
+	clientTTL = 24 * time.Hour
+	// Cap DCR amplification: a client
+	// registration bloats the sealed client_id (and any logs/metrics
+	// referencing it) in proportion to the submitted redirect_uris. Five
+	// URIs of 512 chars each is well above any legitimate need.
+	maxRedirectURIs      = 5
+	maxRedirectURILength = 512
+)
 
 type registerRequest struct {
 	RedirectURIs            []string `json:"redirect_uris"`
@@ -45,15 +54,52 @@ func Register(tm *token.Manager, logger *zap.Logger, audience string) http.Handl
 			return
 		}
 
-		// OAuth 2.1 §2.3.1: non-loopback redirect URIs must use HTTPS
+		// M5: hard cap the number of redirect_uris. Without this, an
+		// unauthenticated caller can register thousands of URIs and bloat
+		// the sealed client_id / logs / metrics indefinitely.
+		if len(req.RedirectURIs) > maxRedirectURIs {
+			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "redirect_uris exceeds maximum count")
+			return
+		}
+
+		// OAuth 2.1 §2.3.1: non-loopback redirect URIs must use HTTPS.
+		// M5/M6: also reject oversize, fragment-bearing, and userinfo-bearing
+		// URIs. Fragment is forbidden by OAuth 2.1 §7.5; userinfo amplifies
+		// phishing (https://attacker:pass@legit.example/cb visually legit).
 		for _, raw := range req.RedirectURIs {
+			if len(raw) > maxRedirectURILength {
+				writeOAuthError(w, http.StatusBadRequest, "invalid_request", "redirect_uri exceeds maximum length")
+				return
+			}
 			u, err := url.Parse(raw)
 			if err != nil {
 				writeOAuthError(w, http.StatusBadRequest, "invalid_request", "malformed redirect_uri")
 				return
 			}
-			if u.Scheme != "https" && !isLoopback(u) {
-				writeOAuthError(w, http.StatusBadRequest, "invalid_request", "redirect_uri must use HTTPS for non-loopback addresses")
+			// Also trip on a trailing bare "#" (url.Parse leaves Fragment
+			// empty for "https://x/cb#" even though the marker is present).
+			if u.Fragment != "" || strings.Contains(raw, "#") {
+				writeOAuthError(w, http.StatusBadRequest, "invalid_request", "redirect_uri must not contain a fragment")
+				return
+			}
+			if u.User != nil {
+				writeOAuthError(w, http.StatusBadRequest, "invalid_request", "redirect_uri must not contain userinfo")
+				return
+			}
+			// Only http(s) schemes are meaningful for a browser-driven
+			// OAuth callback. Anything else (custom app schemes, ftp, ldap,
+			// etc.) is almost certainly a mistake; rejecting them early
+			// avoids a confusing failure mode downstream.
+			switch u.Scheme {
+			case "https":
+				// always allowed
+			case "http":
+				if !isLoopback(u) {
+					writeOAuthError(w, http.StatusBadRequest, "invalid_request", "redirect_uri must use HTTPS for non-loopback addresses")
+					return
+				}
+			default:
+				writeOAuthError(w, http.StatusBadRequest, "invalid_request", "redirect_uri scheme must be http (loopback only) or https")
 				return
 			}
 		}
@@ -68,11 +114,12 @@ func Register(tm *token.Manager, logger *zap.Logger, audience string) http.Handl
 			ID:           uuid.New().String(),
 			RedirectURIs: req.RedirectURIs,
 			ClientName:   req.ClientName,
+			Typ:          token.PurposeClient,
 			Audience:     audience,
 			ExpiresAt:    now.Add(clientTTL),
 		}
 
-		clientID, err := tm.SealJSON(sc)
+		clientID, err := tm.SealJSON(sc, token.PurposeClient)
 		if err != nil {
 			logger.Error("client_seal_failed", zap.Error(err))
 			writeOAuthError(w, http.StatusInternalServerError, "server_error", "failed to register client")

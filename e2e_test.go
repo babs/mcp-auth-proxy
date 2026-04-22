@@ -32,6 +32,10 @@ type mockOIDCProvider struct {
 	PrivateKey    *rsa.PrivateKey
 	ClientID      string
 	EmailVerified *bool // when non-nil, included in issued id_tokens
+	// Nonce is echoed into the id_token's "nonce" claim at /token, mimicking a
+	// real OIDC provider that received a nonce on the authorization request.
+	// Tests set this from the upstream Location header before driving /callback.
+	Nonce string
 }
 
 func newMockOIDCProvider(t *testing.T) *mockOIDCProvider {
@@ -75,7 +79,7 @@ func newMockOIDCProvider(t *testing.T) *mockOIDCProvider {
 	})
 
 	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
-		idToken := m.signIDToken(t, "test-subject-123", "user@example.com", "Test User", []string{"mcp-users", "dev"}, m.EmailVerified)
+		idToken := m.signIDToken(t, "test-subject-123", "user@example.com", "Test User", []string{"mcp-users", "dev"}, m.EmailVerified, m.Nonce)
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
@@ -90,7 +94,7 @@ func newMockOIDCProvider(t *testing.T) *mockOIDCProvider {
 	return m
 }
 
-func (m *mockOIDCProvider) signIDToken(t *testing.T, sub, email, name string, groups []string, emailVerified *bool) string {
+func (m *mockOIDCProvider) signIDToken(t *testing.T, sub, email, name string, groups []string, emailVerified *bool, nonce string) string {
 	t.Helper()
 
 	signer, err := jose.NewSigner(
@@ -116,6 +120,9 @@ func (m *mockOIDCProvider) signIDToken(t *testing.T, sub, email, name string, gr
 	}
 	if emailVerified != nil {
 		claims["email_verified"] = *emailVerified
+	}
+	if nonce != "" {
+		claims["nonce"] = nonce
 	}
 
 	raw, err := josejwt.Signed(signer).Claims(claims).Serialize()
@@ -357,6 +364,12 @@ func TestE2E_FullOAuthMCPFlow(t *testing.T) {
 		if callbackState == "" {
 			t.Fatal("state param missing from IdP redirect")
 		}
+		// Capture the upstream OIDC nonce so the mock IdP can echo it back
+		// in the id_token at /token (H3 — upstream code-injection defense).
+		oidcMock.Nonce = u.Query().Get("nonce")
+		if oidcMock.Nonce == "" {
+			t.Fatal("nonce param missing from IdP redirect")
+		}
 	})
 
 	// 8. Callback — simulate IdP redirecting back with a code
@@ -536,7 +549,7 @@ func TestE2E_FullOAuthMCPFlow(t *testing.T) {
 // against the given proxy and returns the /callback response. It is shared by
 // the email_verified tests which only differ in the id_token the mock IdP
 // emits.
-func driveAuthToCallback(t *testing.T, client *http.Client, proxyURL string) *http.Response {
+func driveAuthToCallback(t *testing.T, client *http.Client, proxyURL string, oidcMock *mockOIDCProvider) *http.Response {
 	t.Helper()
 
 	redirectURI := "https://claude.ai/api/mcp/auth_callback"
@@ -587,6 +600,8 @@ func driveAuthToCallback(t *testing.T, client *http.Client, proxyURL string) *ht
 		t.Fatalf("close /authorize body: %v", err)
 	}
 	state := idpURL.Query().Get("state")
+	// Capture upstream nonce so the mock IdP echoes it in the id_token.
+	oidcMock.Nonce = idpURL.Query().Get("nonce")
 
 	cbReq, err := http.NewRequestWithContext(t.Context(), http.MethodGet, proxyURL+"/callback?code=fake&state="+url.QueryEscape(state), nil)
 	if err != nil {
@@ -622,7 +637,7 @@ func TestE2E_RejectsUnverifiedEmail(t *testing.T) {
 		},
 	}
 
-	cbResp := driveAuthToCallback(t, client, proxyServer.URL)
+	cbResp := driveAuthToCallback(t, client, proxyServer.URL, oidcMock)
 	defer func() {
 		if err := cbResp.Body.Close(); err != nil {
 			t.Errorf("close /callback body: %v", err)
@@ -667,7 +682,7 @@ func TestE2E_AcceptsVerifiedEmail(t *testing.T) {
 		},
 	}
 
-	cbResp := driveAuthToCallback(t, client, proxyServer.URL)
+	cbResp := driveAuthToCallback(t, client, proxyServer.URL, oidcMock)
 	defer func() {
 		if err := cbResp.Body.Close(); err != nil {
 			t.Errorf("close /callback body: %v", err)

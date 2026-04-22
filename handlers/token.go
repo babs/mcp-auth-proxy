@@ -68,7 +68,12 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 	}
 
 	var code sealedCode
-	if err := tm.OpenJSON(codeStr, &code); err != nil {
+	if err := tm.OpenJSON(codeStr, &code, token.PurposeCode); err != nil {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "invalid or expired authorization code")
+		return
+	}
+
+	if code.Typ != token.PurposeCode {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "invalid or expired authorization code")
 		return
 	}
@@ -84,7 +89,12 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 	}
 
 	var client sealedClient
-	if err := tm.OpenJSON(clientIDStr, &client); err != nil {
+	if err := tm.OpenJSON(clientIDStr, &client, token.PurposeClient); err != nil {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "invalid client_id")
+		return
+	}
+
+	if client.Typ != token.PurposeClient {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "invalid client_id")
 		return
 	}
@@ -109,13 +119,25 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 		return
 	}
 
-	// PKCE verification: required if code_challenge was set during /authorize
+	// PKCE verification: required if code_challenge was set during /authorize.
+	//
+	// H6: when the proxy minted the downstream PKCE pair itself
+	// (code.ServerPKCE) because PKCE_REQUIRED=false and the client omitted
+	// code_challenge, the client is not expected to send a code_verifier
+	// either. In that case we substitute the server-side verifier stored on
+	// the code — the check is a plumbing invariant, not a client-anchored
+	// proof, but pairing it with single-use code enforcement (replay store,
+	// C3) still blocks an intercepted code from being redeemed twice.
 	if code.CodeChallenge != "" {
-		if codeVerifier == "" {
+		effectiveVerifier := codeVerifier
+		if code.ServerPKCE && codeVerifier == "" {
+			effectiveVerifier = code.SvrVerifier
+		}
+		if effectiveVerifier == "" {
 			writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "code_verifier is required")
 			return
 		}
-		if !VerifyPKCE(codeVerifier, code.CodeChallenge) {
+		if !VerifyPKCE(effectiveVerifier, code.CodeChallenge) {
 			writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "PKCE verification failed")
 			return
 		}
@@ -165,11 +187,12 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 		Email:     code.Email,
 		Groups:    code.Groups,
 		ClientID:  client.ID,
+		Typ:       token.PurposeRefresh,
 		Audience:  audience,
 		IssuedAt:  now,
 		ExpiresAt: now.Add(refreshTokenTTL),
 	}
-	refreshToken, err := tm.SealJSON(refresh)
+	refreshToken, err := tm.SealJSON(refresh, token.PurposeRefresh)
 	if err != nil {
 		logger.Error("refresh_token_seal_failed", zap.Error(err))
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "internal error")
@@ -199,8 +222,23 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 	}
 
 	var refresh sealedRefresh
-	if err := tm.OpenJSON(refreshTokenStr, &refresh); err != nil {
+	if err := tm.OpenJSON(refreshTokenStr, &refresh, token.PurposeRefresh); err != nil {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "invalid or expired refresh token")
+		return
+	}
+
+	if refresh.Typ != token.PurposeRefresh {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "invalid or expired refresh token")
+		return
+	}
+
+	// C2: every refresh must carry both a FamilyID (lineage for reuse
+	// detection) and a TokenID (single-use key within the lineage). Empty
+	// either side makes the replay guard at line below a silent no-op, so
+	// we reject upfront — belt-and-braces against any future code path
+	// that forgets to populate both fields at seal time.
+	if refresh.FamilyID == "" || refresh.TokenID == "" {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh token missing family or id")
 		return
 	}
 
@@ -227,7 +265,12 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 	}
 
 	var client sealedClient
-	if err := tm.OpenJSON(clientIDStr, &client); err != nil {
+	if err := tm.OpenJSON(clientIDStr, &client, token.PurposeClient); err != nil {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "invalid client_id")
+		return
+	}
+
+	if client.Typ != token.PurposeClient {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "invalid client_id")
 		return
 	}
@@ -251,14 +294,22 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 	// Only active when a replay store is wired — the stateless fallback keeps
 	// the original behavior (rotation without reuse detection).
 	//
-	// Two invariants enforced here:
+	// Invariants enforced atomically by ClaimOrCheckFamily (M4 — collapsing
+	// the prior Exists+ClaimOnce pair into one round trip closes a TOCTOU
+	// window where a Redis read routed to a lagging replica allowed one extra
+	// rotation against a freshly-revoked family):
 	//   1. Family revoked → every sibling of a reused refresh is rejected.
-	//   2. TokenID single-use → a refresh that has already been rotated once
-	//      (legitimately) cannot be rotated again. A second claim on the same
-	//      TokenID is the signal that the token was leaked.
-	if replayStore != nil && refresh.FamilyID != "" && refresh.TokenID != "" {
+	//   2. TokenID single-use → a refresh already rotated once (legitimately)
+	//      cannot be rotated again. A second claim on the same TokenID is the
+	//      signal that the token was leaked.
+	if replayStore != nil {
 		familyKey := replay.NamespacedKey("refresh_family_revoked", refresh.FamilyID)
-		revoked, err := replayStore.Exists(r.Context(), familyKey)
+		claimKey := replay.NamespacedKey("refresh", refresh.TokenID)
+		claimTTL := time.Until(refresh.ExpiresAt)
+		if claimTTL < time.Second {
+			claimTTL = time.Second
+		}
+		revoked, alreadyClaimed, err := replayStore.ClaimOrCheckFamily(r.Context(), familyKey, claimKey, claimTTL)
 		if err != nil {
 			logger.Error("replay_store_error", zap.Error(err))
 			writeOAuthError(w, http.StatusServiceUnavailable, "server_error", "replay store unavailable", "replay_store_unavailable")
@@ -274,33 +325,22 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 			writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh token revoked", "refresh_family_revoked")
 			return
 		}
-
-		claimKey := replay.NamespacedKey("refresh", refresh.TokenID)
-		claimTTL := time.Until(refresh.ExpiresAt)
-		if claimTTL < time.Second {
-			claimTTL = time.Second
-		}
-		if err := replayStore.ClaimOnce(r.Context(), claimKey, claimTTL); err != nil {
-			if errors.Is(err, replay.ErrAlreadyClaimed) {
-				// Reuse of a rotated token. Revoke the whole family so every
-				// sibling (including the most recently issued legitimate one)
-				// is invalidated. 7-day TTL covers the longest-lived refresh
-				// in the family.
-				if markErr := replayStore.Mark(r.Context(), familyKey, refreshTokenTTL); markErr != nil {
-					logger.Error("refresh_family_revoke_failed", zap.Error(markErr))
-				}
-				metrics.ReplayDetected.WithLabelValues("refresh").Inc()
-				logger.Warn("refresh_token_reuse_detected",
-					zap.String("token_id", refresh.TokenID),
-					zap.String("family_id", refresh.FamilyID),
-					zap.String("subject", refresh.Subject),
-					zap.String("client_id", client.ID),
-				)
-				writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh token reuse detected — family revoked", "refresh_reuse_detected")
-				return
+		if alreadyClaimed {
+			// Reuse of a rotated token. Revoke the whole family so every
+			// sibling (including the most recently issued legitimate one) is
+			// invalidated. 7-day TTL covers the longest-lived refresh in the
+			// family.
+			if markErr := replayStore.Mark(r.Context(), familyKey, refreshTokenTTL); markErr != nil {
+				logger.Error("refresh_family_revoke_failed", zap.Error(markErr))
 			}
-			logger.Error("replay_store_error", zap.Error(err))
-			writeOAuthError(w, http.StatusServiceUnavailable, "server_error", "replay store unavailable", "replay_store_unavailable")
+			metrics.ReplayDetected.WithLabelValues("refresh").Inc()
+			logger.Warn("refresh_token_reuse_detected",
+				zap.String("token_id", refresh.TokenID),
+				zap.String("family_id", refresh.FamilyID),
+				zap.String("subject", refresh.Subject),
+				zap.String("client_id", client.ID),
+			)
+			writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh token reuse detected — family revoked", "refresh_reuse_detected")
 			return
 		}
 	}
@@ -313,28 +353,22 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 	}
 
 	// The rotated refresh inherits the FamilyID so reuse detection spans the
-	// entire lineage; a fresh TokenID makes it single-use on its own.
-	familyID := refresh.FamilyID
-	if familyID == "" {
-		// Backward compat: refresh minted before FamilyID existed. Start a
-		// new family on first rotation. Reuse of the original pre-family
-		// token can't be detected but any future rotation will be covered.
-		familyID = uuid.New().String()
-	}
-
+	// entire lineage; a fresh TokenID makes it single-use on its own. Empty
+	// FamilyID was rejected upfront (C2), so the field is always set here.
 	now := time.Now()
 	newRefresh := sealedRefresh{
 		TokenID:   uuid.New().String(),
-		FamilyID:  familyID,
+		FamilyID:  refresh.FamilyID,
 		Subject:   refresh.Subject,
 		Email:     refresh.Email,
 		Groups:    refresh.Groups,
 		ClientID:  client.ID,
+		Typ:       token.PurposeRefresh,
 		Audience:  audience,
 		IssuedAt:  now,
 		ExpiresAt: now.Add(refreshTokenTTL),
 	}
-	newRefreshToken, err := tm.SealJSON(newRefresh)
+	newRefreshToken, err := tm.SealJSON(newRefresh, token.PurposeRefresh)
 	if err != nil {
 		logger.Error("refresh_token_reseal_failed", zap.Error(err))
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "internal error")
