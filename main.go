@@ -20,12 +20,12 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/oauth2"
-	"golang.org/x/sync/semaphore"
-	"golang.org/x/sync/singleflight"
 	"golang.org/x/term"
 
 	"github.com/babs/mcp-auth-proxy/config"
 	"github.com/babs/mcp-auth-proxy/handlers"
+	"github.com/babs/mcp-auth-proxy/internal/health"
+	"github.com/babs/mcp-auth-proxy/internal/subjectlimiter"
 	"github.com/babs/mcp-auth-proxy/metrics"
 	"github.com/babs/mcp-auth-proxy/middleware"
 	"github.com/babs/mcp-auth-proxy/proxy"
@@ -224,7 +224,7 @@ func main() {
 	// so idle-subject entries are reclaimed over time (M1).
 	var perSubjectLimiter = passthrough
 	if cfg.PerSubjectConcurrency > 0 {
-		sl := newSubjectLimiter(ctx, cfg.PerSubjectConcurrency, logger)
+		sl := subjectlimiter.New(ctx, cfg.PerSubjectConcurrency, logger)
 		perSubjectLimiter = sl.Middleware
 		logger.Info("per_subject_concurrency_enabled", zap.Int64("cap", cfg.PerSubjectConcurrency))
 	}
@@ -288,7 +288,7 @@ func main() {
 	// Redis client so /readyz short-circuits to 503 and stops calling
 	// into a soon-to-be-closed pool.
 	var shuttingDown atomic.Bool
-	metricsMux.Handle("/readyz", readyzHandler(replayStore, logger, &shuttingDown))
+	metricsMux.Handle("/readyz", health.Readyz(replayStore, logger, &shuttingDown))
 	metricsSrv := &http.Server{
 		Addr:         cfg.MetricsAddr,
 		Handler:      metricsMux,
@@ -379,113 +379,6 @@ func main() {
 	}
 }
 
-// readyzHandler reflects hard runtime dependencies on the metrics port.
-// Redis is probed with a short-timeout EXISTS on a sentinel key (cheap,
-// no side effects). The result is cached so a probe flood cannot amplify
-// into a Redis DoS (H4) — but we cache OK for a shorter window than fail
-// (M3): a Redis crash right after a successful probe is noticed quickly
-// (250ms staleness), while a healthy flood is still absorbed (1s cache on
-// the failure path gives K8s time to drop the pod from the Service before
-// we slam Redis with fresh probes). Without Redis configured, always ready.
-func readyzHandler(replayStore replay.Store, logger *zap.Logger, shuttingDown *atomic.Bool) http.HandlerFunc {
-	const (
-		cacheTTLOK   = 250 * time.Millisecond
-		cacheTTLFail = 1 * time.Second
-	)
-	var (
-		mu       sync.Mutex
-		lastAt   time.Time
-		lastOK   bool
-		lastBody string
-		sf       singleflight.Group
-	)
-	return func(w http.ResponseWriter, r *http.Request) {
-		// During shutdown the Redis client has been (or will be)
-		// closed by the main drain sequence; short-circuit to 503 so
-		// the probe doesn't race rs.Close() and log a spurious
-		// readyz_redis_probe_failed on every in-flight scrape. 503 is
-		// also the right signal to the orchestrator: pull this pod
-		// out of rotation immediately.
-		if shuttingDown != nil && shuttingDown.Load() {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = io.WriteString(w, `{"status":"shutting_down"}`)
-			return
-		}
-		if replayStore == nil {
-			w.WriteHeader(http.StatusOK)
-			_, _ = io.WriteString(w, `{"status":"ok"}`)
-			return
-		}
-		mu.Lock()
-		ttl := cacheTTLFail
-		if lastOK {
-			ttl = cacheTTLOK
-		}
-		if !lastAt.IsZero() && time.Since(lastAt) < ttl {
-			ok, body := lastOK, lastBody
-			mu.Unlock()
-			if ok {
-				w.WriteHeader(http.StatusOK)
-			} else {
-				w.WriteHeader(http.StatusServiceUnavailable)
-			}
-			_, _ = io.WriteString(w, body)
-			return
-		}
-		// Capture the cache snapshot under the lock so a concurrent
-		// singleflight winner's refresh can be detected inside Do.
-		staleAt := lastAt
-		mu.Unlock()
-
-		// singleflight coalesces concurrent cache misses (cold start,
-		// TTL expiry under probe bursts) so a kubelet readyz storm
-		// amplifies into at most one Redis Exists per TTL window
-		// instead of one per probe. After Do returns, every caller
-		// reads the fresh cached value.
-		_, _, _ = sf.Do("probe", func() (any, error) {
-			mu.Lock()
-			// Skip the probe if another Do winner refreshed the cache
-			// between our outer read and entry into this critical
-			// section. `lastAt` strictly advances, so inequality with
-			// the captured snapshot is the atomic freshness signal.
-			if lastAt != staleAt {
-				mu.Unlock()
-				return nil, nil
-			}
-			mu.Unlock()
-
-			ctx, cancel := context.WithTimeout(r.Context(), 1*time.Second)
-			defer cancel()
-			_, err := replayStore.Exists(ctx, "__readyz_probe__")
-
-			mu.Lock()
-			lastAt = time.Now()
-			if err != nil {
-				lastOK = false
-				lastBody = `{"status":"redis_unavailable"}`
-			} else {
-				lastOK = true
-				lastBody = `{"status":"ok"}`
-			}
-			mu.Unlock()
-			if err != nil {
-				logger.Warn("readyz_redis_probe_failed", zap.Error(err))
-			}
-			return nil, nil
-		})
-
-		mu.Lock()
-		ok, body := lastOK, lastBody
-		mu.Unlock()
-		if ok {
-			w.WriteHeader(http.StatusOK)
-		} else {
-			w.WriteHeader(http.StatusServiceUnavailable)
-		}
-		_, _ = io.WriteString(w, body)
-	}
-}
-
 func mustLogger(level string) *zap.Logger {
 	lvl, err := zapcore.ParseLevel(level)
 	if err != nil {
@@ -529,115 +422,6 @@ func rateLimiter(limit int, window time.Duration, endpoint string, keyFuncs ...h
 			_, _ = io.WriteString(w, `{"error":"temporarily_unavailable","error_description":"rate limit exceeded"}`)
 		}),
 	)
-}
-
-// subjectLimiter caps in-flight requests per authenticated subject.
-// Memory-safe: entries are reclaimed by a pruner goroutine when a subject
-// has been idle (no in-flight work) for subjectIdleEvictAfter, so the
-// map size stays proportional to ACTIVE principals, not the lifetime set
-// of ever-seen subjects (M1). sync.Map keeps the hot path lock-free
-// except on first-seen subjects (m1).
-type subjectLimiter struct {
-	cap    int64
-	sems   sync.Map // map[string]*subjectSem
-	logger *zap.Logger
-}
-
-type subjectSem struct {
-	sem      *semaphore.Weighted
-	inFlight atomic.Int64
-	lastUsed atomic.Int64 // unix nano
-}
-
-const (
-	subjectIdleEvictAfter = 5 * time.Minute
-	subjectPruneInterval  = 2 * time.Minute
-)
-
-// newSubjectLimiter wires the pruner goroutine to ctx so it exits on
-// process shutdown. Callers use the Middleware method as an http mw.
-func newSubjectLimiter(ctx context.Context, cap int64, logger *zap.Logger) *subjectLimiter {
-	l := &subjectLimiter{cap: cap, logger: logger}
-	go l.pruneLoop(ctx)
-	return l
-}
-
-func (l *subjectLimiter) pruneLoop(ctx context.Context) {
-	t := time.NewTicker(subjectPruneInterval)
-	defer t.Stop()
-	for {
-		select {
-		case now := <-t.C:
-			l.pruneOnce(now, subjectIdleEvictAfter)
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-// pruneOnce performs a single prune pass. Exposed for tests; the
-// production pruneLoop drives it on a ticker.
-func (l *subjectLimiter) pruneOnce(now time.Time, idleAfter time.Duration) {
-	cutoff := now.Add(-idleAfter).UnixNano()
-	l.sems.Range(func(k, v any) bool {
-		se := v.(*subjectSem)
-		// In-flight or recently used → keep. The atomic counter means we
-		// never touch the semaphore here, so there is no window where a
-		// concurrent Acquire observes a spurious "full" state (contrast
-		// with TryAcquire(cap)+Release).
-		if se.inFlight.Load() > 0 || se.lastUsed.Load() > cutoff {
-			return true
-		}
-		l.sems.Delete(k)
-		return true
-	})
-}
-
-func (l *subjectLimiter) get(sub string) *subjectSem {
-	if v, ok := l.sems.Load(sub); ok {
-		return v.(*subjectSem)
-	}
-	// Stamp lastUsed at construction so the pruner cannot evict a
-	// brand-new entry in the window between LoadOrStore and the
-	// caller's first Add(1) on the middleware hot path. Without this
-	// stamp, fresh entries observe lastUsed=0 (Unix epoch), always
-	// below cutoff, so a prune tick landing in that window deletes the
-	// entry; a concurrent request from the same subject would then
-	// LoadOrStore a second semaphore and effectively double the cap.
-	fresh := &subjectSem{sem: semaphore.NewWeighted(l.cap)}
-	fresh.lastUsed.Store(time.Now().UnixNano())
-	v, _ := l.sems.LoadOrStore(sub, fresh)
-	return v.(*subjectSem)
-}
-
-func (l *subjectLimiter) Middleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sub, _ := r.Context().Value(middleware.ContextSubject).(string)
-		if sub == "" {
-			// No subject → Validate would have rejected already. Belt &
-			// braces: pass through so middleware order changes don't
-			// silently DoS unauthenticated paths.
-			next.ServeHTTP(w, r)
-			return
-		}
-		se := l.get(sub)
-		if !se.sem.TryAcquire(1) {
-			metrics.AccessDenied.WithLabelValues("subject_concurrency_exceeded").Inc()
-			l.logger.Warn("subject_concurrency_exceeded", zap.String("sub", sub), zap.Int64("cap", l.cap))
-			w.Header().Set("Content-Type", "application/json")
-			w.Header().Set("Retry-After", "1")
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = io.WriteString(w, `{"error":"temporarily_unavailable","error_description":"per-subject concurrency limit reached"}`)
-			return
-		}
-		se.inFlight.Add(1)
-		se.lastUsed.Store(time.Now().UnixNano())
-		defer func() {
-			se.inFlight.Add(-1)
-			se.sem.Release(1)
-		}()
-		next.ServeHTTP(w, r)
-	})
 }
 
 // discoverOIDC runs OIDC auto-discovery with bounded retry. A transient IdP

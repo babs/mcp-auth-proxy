@@ -31,9 +31,24 @@ type RequestLogRecord struct {
 
 const contextLogRecord contextKey = "log_record"
 
-// InjectLogRecord adds a fresh *RequestLogRecord to ctx. Returns the enriched
-// context and the pointer. Called by zapMiddleware; the pointer is read back
-// after ServeHTTP to emit the structured access-log line.
+// InjectLogRecord adds a fresh *RequestLogRecord to ctx and returns both the
+// enriched context and the pointer.
+//
+// Why a pointer-through-context, not a direct field on the handler:
+// zapMiddleware wraps the whole chain — it computes status/duration and
+// emits the access log AFTER next.ServeHTTP returns. The fields we want
+// on that log line (sub, email, rpc_method, rpc_tool, rpc_id) are
+// populated by LATER middlewares — auth fills sub/email, RPCPeek
+// parses the JSON-RPC envelope. Those middlewares run in their own
+// handlers with their own request copies (r.WithContext hops create
+// fresh *http.Request values), so a direct field write would be lost
+// when ServeHTTP returns. A pointer stored in the root context
+// survives every WithContext hop; both the enricher and the emitter
+// look it up by key and see the same struct. Alternatives considered
+// and rejected: (1) wrapping http.ResponseWriter — conflicts with
+// chi's own WrapResponseWriter and needs care for Hijack/Flush;
+// (2) sync.Map keyed by request id — extra allocation per request
+// and exposes a GC lifecycle we'd have to manage explicitly.
 func InjectLogRecord(ctx context.Context) (context.Context, *RequestLogRecord) {
 	rec := &RequestLogRecord{}
 	return context.WithValue(ctx, contextLogRecord, rec), rec

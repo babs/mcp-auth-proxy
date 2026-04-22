@@ -102,24 +102,8 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 		return
 	}
 
-	var client sealedClient
-	if err := tm.OpenJSON(clientIDStr, &client, token.PurposeClient); err != nil {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "invalid client_id")
-		return
-	}
-
-	if client.Typ != token.PurposeClient {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "invalid client_id")
-		return
-	}
-
-	if client.Audience != audience {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_client", "client registered for a different audience")
-		return
-	}
-
-	if time.Now().After(client.ExpiresAt) {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_client", "client registration expired")
+	client := openAndValidateClient(w, tm, clientIDStr, audience)
+	if client == nil {
 		return
 	}
 
@@ -288,24 +272,8 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 		return
 	}
 
-	var client sealedClient
-	if err := tm.OpenJSON(clientIDStr, &client, token.PurposeClient); err != nil {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "invalid client_id")
-		return
-	}
-
-	if client.Typ != token.PurposeClient {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "invalid client_id")
-		return
-	}
-
-	if client.Audience != audience {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_client", "client registered for a different audience")
-		return
-	}
-
-	if time.Now().After(client.ExpiresAt) {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_client", "client registration expired")
+	client := openAndValidateClient(w, tm, clientIDStr, audience)
+	if client == nil {
 		return
 	}
 

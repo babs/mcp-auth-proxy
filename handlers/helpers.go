@@ -7,6 +7,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/babs/mcp-auth-proxy/token"
 )
 
 // OAuthError represents an RFC 6749 error response.
@@ -140,6 +142,35 @@ func hasOverlap(userGroups, allowed []string) bool {
 		}
 	}
 	return false
+}
+
+// openAndValidateClient decodes a client_id sealed payload and runs
+// the four invariants both /token grant handlers need: AAD purpose
+// match, belt-and-braces typ discriminator, audience binding, and TTL.
+// On any failure it writes the RFC 6749 §5.2 response directly and
+// returns nil; callers use the nil return as a short-circuit signal.
+// Factoring this out removes the near-identical 20-line block from
+// each grant handler; error shapes are preserved verbatim so the
+// existing test matrix against both paths keeps exercising them.
+func openAndValidateClient(w http.ResponseWriter, tm *token.Manager, clientIDStr, audience string) *sealedClient {
+	var client sealedClient
+	if err := tm.OpenJSON(clientIDStr, &client, token.PurposeClient); err != nil {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "invalid client_id")
+		return nil
+	}
+	if client.Typ != token.PurposeClient {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "invalid client_id")
+		return nil
+	}
+	if client.Audience != audience {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_client", "client registered for a different audience")
+		return nil
+	}
+	if time.Now().After(client.ExpiresAt) {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_client", "client registration expired")
+		return nil
+	}
+	return &client
 }
 
 // matchResource reports whether a client-supplied RFC 8707 `resource`
