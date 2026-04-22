@@ -93,26 +93,42 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 
-		// RFC 6749 §4.1.2.1: IdP may redirect with error instead of code.
-		// L4: allowlist the error code so an attacker who controls the
-		// IdP response path (or a redirect-chain bounce) cannot smuggle
-		// an arbitrary OAuth error string into our JSON response — some
-		// MCP clients route on `error` verbatim. Anything outside the
-		// RFC set is collapsed to server_error. error_description is
-		// truncated at 200 chars and stripped of non-ASCII-printable
-		// bytes (CR/LF/control → log-injection / header-smuggling).
-		if idpError := q.Get("error"); idpError != "" {
+		// RFC 6749 §4.1.2.1: the IdP may redirect with error instead of
+		// code. When the session is still decodable, we forward the
+		// error back to the client's registered redirect_uri (plus
+		// OriginalState) so the MCP client sees a spec-compliant error
+		// response and can correlate against the state it sent. Only
+		// when the session is unreachable (tampered/expired state) do
+		// we fall through to a proxy-hosted JSON body.
+		//
+		// The IdP-supplied `error` is allowlisted against RFC 6749
+		// §4.1.2.1 (anything else collapses to server_error) and
+		// `error_description` is truncated at 200 chars with
+		// non-printable bytes stripped, so neither can smuggle a
+		// header-breaking or log-injection payload through the redirect.
+		idpError := q.Get("error")
+		internalState := q.Get("state")
+
+		if idpError != "" {
 			safeError := normalizeIdPError(idpError)
 			desc := sanitizeErrorDescription(q.Get("error_description"))
 			if desc == "" {
 				desc = "authorization denied by identity provider"
+			}
+			var idpSession sealedSession
+			if internalState != "" &&
+				tm.OpenJSON(internalState, &idpSession, token.PurposeSession) == nil &&
+				idpSession.Typ == token.PurposeSession &&
+				idpSession.Audience == audience &&
+				time.Now().Before(idpSession.ExpiresAt) {
+				redirectIdPError(w, r, idpSession.RedirectURI, idpSession.OriginalState, safeError, desc)
+				return
 			}
 			writeOAuthError(w, http.StatusBadRequest, safeError, desc)
 			return
 		}
 
 		upstreamCode := q.Get("code")
-		internalState := q.Get("state")
 
 		if upstreamCode == "" || internalState == "" {
 			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "missing code or state")
@@ -231,12 +247,21 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 		// object) is treated as "no groups" — ignoring the unmarshal
 		// error lets the group allowlist make the final call instead of
 		// failing the login on a shape mismatch we can't reason about.
+		// A debug log fires so an operator tracing an unexpected
+		// ALLOWED_GROUPS denial can see the IdP shape mismatch without
+		// enabling raw id_token logging.
 		var groups []string
 		if cbCfg.GroupsClaim != "" {
 			var raw map[string]json.RawMessage
 			if err := idToken.Claims(&raw); err == nil {
 				if v, ok := raw[cbCfg.GroupsClaim]; ok {
-					_ = json.Unmarshal(v, &groups)
+					if err := json.Unmarshal(v, &groups); err != nil {
+						logger.Debug("groups_claim_shape_mismatch",
+							zap.String("claim", cbCfg.GroupsClaim),
+							zap.String("subject", claims.Sub),
+							zap.Error(err),
+						)
+					}
 				}
 			}
 		}
@@ -309,9 +334,43 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 			q2.Set("state", session.OriginalState)
 		}
 		redirectParsed.RawQuery = q2.Encode()
+		// Fragment scrub: DCR already rejects fragment-bearing URIs at
+		// registration time, but clear here too so a future regression
+		// in that check cannot sneak code/state into the fragment (the
+		// browser would retain them in history without sending them
+		// over the wire to the RP).
+		redirectParsed.Fragment = ""
+		redirectParsed.RawFragment = ""
 		redirectURL := redirectParsed.String()
 
 		logger.Info("callback_success", zap.String("subject", claims.Sub))
 		http.Redirect(w, r, redirectURL, http.StatusFound)
 	}
+}
+
+// redirectIdPError forwards an RFC 6749 §4.1.2.1 error back to the
+// client's registered redirect_uri, carrying OriginalState so the
+// client can correlate, and stripping any fragment (defense-in-depth;
+// DCR already rejects fragment-bearing URIs). On a parse failure we
+// fall back to a proxy-hosted JSON body — the registered URI went
+// through exact-match validation at /authorize, so a parse error here
+// is an invariant violation rather than attacker-controlled input.
+func redirectIdPError(w http.ResponseWriter, r *http.Request, redirectURI, state, errCode, errDesc string) {
+	u, err := url.Parse(redirectURI)
+	if err != nil {
+		writeOAuthError(w, http.StatusBadRequest, errCode, errDesc)
+		return
+	}
+	q := u.Query()
+	q.Set("error", errCode)
+	if errDesc != "" {
+		q.Set("error_description", errDesc)
+	}
+	if state != "" {
+		q.Set("state", state)
+	}
+	u.RawQuery = q.Encode()
+	u.Fragment = ""
+	u.RawFragment = ""
+	http.Redirect(w, r, u.String(), http.StatusFound)
 }

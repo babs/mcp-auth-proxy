@@ -23,10 +23,35 @@ type RedisStore struct {
 // to every key written or read — pass an empty string to opt out of
 // namespacing entirely. A misconfigured URL or a failed startup PING returns
 // an error so replay protection is never silently disabled.
+//
+// Pool sizing + per-op timeouts are set explicitly so a /token flood
+// cannot starve /readyz (or vice versa) and so a wedged Redis instance
+// surfaces as a fast-failing ClaimOnce rather than a pool-exhaustion
+// stall. Values are chosen conservatively: ClaimOnce/EXISTS are single
+// O(1) commands and should complete in low single-digit milliseconds on
+// a healthy Redis, so 500ms read/write is already ~100x the expected
+// latency. Operator overrides via REDIS_URL query params (go-redis
+// ParseURL honors `?pool_size=...&read_timeout=...`) take precedence
+// when set — the defaults below only fill in what the URL didn't.
 func NewRedisStore(url, keyPrefix string) (*RedisStore, error) {
 	opt, err := redis.ParseURL(url)
 	if err != nil {
 		return nil, fmt.Errorf("parse REDIS_URL: %w", err)
+	}
+	if opt.PoolSize == 0 {
+		opt.PoolSize = 20
+	}
+	if opt.ReadTimeout == 0 {
+		opt.ReadTimeout = 500 * time.Millisecond
+	}
+	if opt.WriteTimeout == 0 {
+		opt.WriteTimeout = 500 * time.Millisecond
+	}
+	if opt.DialTimeout == 0 {
+		opt.DialTimeout = 2 * time.Second
+	}
+	if opt.MaxRetries == 0 {
+		opt.MaxRetries = 1
 	}
 	client := redis.NewClient(opt)
 

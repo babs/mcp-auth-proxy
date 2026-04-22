@@ -11,7 +11,8 @@ kubectl apply -f deployment.yaml
 kubectl apply -f service.yaml
 kubectl apply -f pdb.yaml
 # Optional:
-kubectl apply -f ingress.example.yaml  # fill in hostname + TLS secret
+kubectl apply -f ingress.example.yaml         # fill in hostname + TLS secret
+kubectl apply -f networkpolicy.example.yaml   # fill in scraper / ingress labels
 ```
 
 > **Tip:** `secret.example.yaml` is a template. Copy it to `secret.yaml`, fill
@@ -47,3 +48,12 @@ kubectl apply -f ingress.example.yaml  # fill in hostname + TLS secret
   a time.
 - `sessionAffinity: None` is intentional — the stateless design means any pod
   can serve any request.
+- **Metrics + `/readyz` on port 9090 are unauthenticated by design** (standard
+  Kubernetes practice for in-cluster scrape endpoints). Neither leaks tokens,
+  subjects, or other OAuth material — only aggregate counters with bounded
+  static labels plus Go runtime metrics. The enforcement boundary is the
+  network, not app-level auth: apply `networkpolicy.example.yaml` (or an
+  equivalent for your CNI) so only the Prometheus scraper namespace can
+  reach `:9090`, and only the ingress controller can reach `:8080`. Without
+  a NetworkPolicy, any pod in the cluster can scrape `/metrics` — that
+  usually isn't a compromise but it is fingerprinting.

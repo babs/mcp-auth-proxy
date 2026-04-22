@@ -142,6 +142,62 @@ func hasOverlap(userGroups, allowed []string) bool {
 	return false
 }
 
+// matchResource reports whether a client-supplied RFC 8707 `resource`
+// parameter identifies this proxy's base URL. Comparison is
+// case-insensitive on scheme and host (per RFC 3986 §3.1, §3.2.2),
+// default-port-insensitive (`:443` on https and `:80` on http are
+// equivalent to a bare host), and trailing-slash-insensitive on the
+// path, so clients may send either the raw PROXY_BASE_URL or the
+// trailing-slash form advertised by
+// /.well-known/oauth-protected-resource (Claude.ai compatibility).
+// Empty resource returns false so callers can distinguish "absent"
+// from "present but mismatched".
+func matchResource(resource, baseURL string) bool {
+	if resource == "" {
+		return false
+	}
+	ru, err := url.Parse(resource)
+	if err != nil {
+		return false
+	}
+	bu, err := url.Parse(baseURL)
+	if err != nil {
+		return false
+	}
+	if !strings.EqualFold(ru.Scheme, bu.Scheme) {
+		return false
+	}
+	if !equalHostPort(ru, bu) {
+		return false
+	}
+	return strings.TrimRight(ru.Path, "/") == strings.TrimRight(bu.Path, "/")
+}
+
+// equalHostPort compares host+port with default-port normalization
+// (https→443, http→80) so a client that explicitly appends the default
+// port still matches a bare-host baseURL. Hostname compare is
+// case-insensitive per RFC 3986 §3.2.2.
+func equalHostPort(a, b *url.URL) bool {
+	if !strings.EqualFold(a.Hostname(), b.Hostname()) {
+		return false
+	}
+	return normalizePort(a) == normalizePort(b)
+}
+
+func normalizePort(u *url.URL) string {
+	p := u.Port()
+	if p != "" {
+		return p
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		return "443"
+	case "http":
+		return "80"
+	}
+	return ""
+}
+
 // isLoopback returns true if the URL targets a loopback address, which
 // is exempt from the HTTPS requirement per OAuth 2.1 §2.3.1.
 //

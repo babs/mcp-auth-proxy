@@ -37,6 +37,20 @@ func Token(tm *token.Manager, logger *zap.Logger, audience string, revokeBefore 
 			return
 		}
 
+		// RFC 8707 §2.2: `resource` MAY appear on a /token request; if
+		// present it MUST be validated. We are both AS and RS, so the
+		// only valid value is our own baseURL. Checked once here before
+		// grant-type dispatch so both authorization_code and
+		// refresh_token paths enforce it uniformly.
+		if resources, ok := r.Form["resource"]; ok {
+			for _, res := range resources {
+				if !matchResource(res, audience) {
+					writeOAuthError(w, http.StatusBadRequest, "invalid_target", "resource does not identify this authorization server")
+					return
+				}
+			}
+		}
+
 		grantType := r.FormValue("grant_type")
 
 		switch grantType {
@@ -119,6 +133,15 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 		return
 	}
 
+	// Every code must carry a TokenID (single-use key for the replay store).
+	// Mirrors the refresh-side invariant (C2): reject upfront so the replay
+	// guard below cannot silently no-op if a future code path forgets to
+	// populate the field at seal time.
+	if code.TokenID == "" {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "authorization code missing token id")
+		return
+	}
+
 	// PKCE verification: required if code_challenge was set during /authorize.
 	//
 	// H6: when the proxy minted the downstream PKCE pair itself
@@ -146,8 +169,9 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 	// Enforce single-use (RFC 6749 §4.1.2). The claim happens AFTER all other
 	// validations so that a malformed retry by the legitimate client does not
 	// burn the code. Claim TTL matches the remaining code lifetime so the
-	// record expires naturally once replay is no longer possible.
-	if replayStore != nil && code.TokenID != "" {
+	// record expires naturally once replay is no longer possible. TokenID is
+	// guaranteed non-empty by the upfront check above.
+	if replayStore != nil {
 		remaining := time.Until(code.ExpiresAt)
 		if remaining < time.Second {
 			remaining = time.Second

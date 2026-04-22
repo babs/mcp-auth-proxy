@@ -26,9 +26,13 @@ spec:
         prometheus.io/port: "9090"
         prometheus.io/path: "/metrics"
     spec:
-      # Match or exceed SHUTDOWN_TIMEOUT so rolling deploys drain SSE streams
-      # before the pod is killed.
-      terminationGracePeriodSeconds: 120
+      # Must EXCEED SHUTDOWN_TIMEOUT so the proxy's shutdown envelope
+      # (srv.Shutdown up to SHUTDOWN_TIMEOUT, +5s inFlight grace, +Redis
+      # close) completes before kubelet sends SIGKILL. With
+      # SHUTDOWN_TIMEOUT=120s the envelope is ~125s; 150s leaves a safe
+      # 25s margin for Redis close + logger flush. Setting this to 120s
+      # would kill the pod exactly when shutdown starts its grace phase.
+      terminationGracePeriodSeconds: 150
 
       securityContext:
         runAsNonRoot: true

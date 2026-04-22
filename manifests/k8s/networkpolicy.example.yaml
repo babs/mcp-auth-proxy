@@ -1,0 +1,164 @@
+# NetworkPolicy — mcp-auth-proxy
+#
+# Opinionated baseline that restricts BOTH ingress and egress for the
+# proxy pod. Two policies are shipped:
+#
+#   1. mcp-auth-proxy — the proxy itself (ingress + egress).
+#   2. mcp-auth-proxy-redis — the demo Redis pod (ingress only from
+#      the proxy; no egress needed).
+#
+# This file is a TEMPLATE. Fields marked `# TODO:` need to be filled
+# in for the target cluster. Apply with:
+#
+#   kubectl apply -f networkpolicy.example.yaml
+#
+# Why this matters
+# ----------------
+# Port 9090 exposes /metrics (Prometheus counters, no secrets) and
+# /readyz (liveness of Redis probe). Neither is authenticated; both
+# are expected to be reachable ONLY by an in-cluster scraper. Binding
+# the metrics server to :9090 on the pod IP (as configmap.yaml does)
+# is the right posture in-cluster because NetworkPolicy — NOT the
+# bind address — is the enforcement boundary.
+#
+# Port 8080 carries the OAuth flow + MCP proxy. It should be reachable
+# only from the ingress controller that terminates TLS.
+#
+# Egress restrictions prevent a compromised proxy (e.g. a future
+# upstream-MCP SSRF, or an attacker-controlled OIDC response) from
+# pivoting to arbitrary internal services. Required egress targets:
+#   - kube-dns (UDP 53, TCP 53)
+#   - Redis (in-namespace, TCP 6379)
+#   - Upstream MCP server (TCP, whatever UPSTREAM_MCP_URL points at)
+#   - OIDC IdP (TCP 443 outbound; external network)
+#
+# If your cluster's CNI does not enforce NetworkPolicy (check with
+# `kubectl get pods -A -l k8s-app=cilium` or equivalent), these
+# manifests are advisory only.
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mcp-auth-proxy
+  namespace: mcp-auth-proxy
+  labels:
+    app.kubernetes.io/name: mcp-auth-proxy
+spec:
+  podSelector:
+    matchLabels:
+      app: mcp-auth-proxy
+  policyTypes:
+    - Ingress
+    - Egress
+
+  ingress:
+    # OAuth / MCP traffic on 8080 from the ingress controller.
+    # Replace the namespaceSelector / podSelector with the labels your
+    # ingress controller actually carries (ingress-nginx default shown).
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              # TODO: match your ingress controller's namespace label.
+              kubernetes.io/metadata.name: ingress-nginx
+          podSelector:
+            matchLabels:
+              # TODO: match your ingress controller's pod label.
+              app.kubernetes.io/name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8080
+
+    # Metrics + /readyz on 9090 from the Prometheus scraper.
+    # Replace with your monitoring stack's actual labels.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              # TODO: match your monitoring namespace label.
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              # TODO: match your Prometheus pod label.
+              app.kubernetes.io/name: prometheus
+      ports:
+        - protocol: TCP
+          port: 9090
+
+  egress:
+    # DNS resolution (both UDP and TCP, some resolvers use TCP for
+    # large responses or DNSSEC).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+    # Redis — in-namespace demo deployment. Adjust the podSelector when
+    # using a managed service or a different in-cluster topology.
+    - to:
+        - podSelector:
+            matchLabels:
+              app: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+
+    # Upstream MCP server. TODO: replace with the pod/namespace
+    # selector of your upstream. Below assumes same namespace.
+    - to:
+        - podSelector:
+            matchLabels:
+              # TODO: replace with upstream MCP pod label.
+              app: mcp-server
+      ports:
+        - protocol: TCP
+          # TODO: replace with upstream MCP port.
+          port: 8080
+
+    # OIDC IdP (external). Port 443 out to any non-cluster IP. The
+    # negated CIDRs cover RFC1918 + common k8s pod/service ranges —
+    # adjust `except:` to match your actual pod/service CIDR block.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8      # TODO: narrow to your pod CIDR
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16  # link-local, block cloud metadata APIs
+      ports:
+        - protocol: TCP
+          port: 443
+
+---
+# Restrict Redis to only accept connections from the proxy pod. Useful
+# even with Redis-inside-the-same-namespace: prevents a compromised
+# sidecar or a misconfigured neighbor from reading replay state.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mcp-auth-proxy-redis
+  namespace: mcp-auth-proxy
+  labels:
+    app.kubernetes.io/name: mcp-auth-proxy
+spec:
+  podSelector:
+    matchLabels:
+      app: redis
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: mcp-auth-proxy
+      ports:
+        - protocol: TCP
+          port: 6379

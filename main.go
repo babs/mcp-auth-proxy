@@ -21,6 +21,7 @@ import (
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/oauth2"
 	"golang.org/x/sync/semaphore"
+	"golang.org/x/sync/singleflight"
 	"golang.org/x/term"
 
 	"github.com/babs/mcp-auth-proxy/config"
@@ -150,6 +151,17 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Pre-arm the hard-exit channel BEFORE blocking on ctx.Done() so a
+	// second SIGTERM arriving during the narrow setup window (between
+	// first-signal delivery and the downstream signal.Notify call) is
+	// still captured. Go's signal package fans out each delivery to
+	// every registered channel, so `hard` also receives the first
+	// signal; we drain it after ctx.Done() and only arm the exit
+	// goroutine on the NEXT signal.
+	hard := make(chan os.Signal, 1)
+	signal.Notify(hard, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(hard)
+
 	r := chi.NewRouter()
 	// inFlight tracks requests hitting the main router so shutdown can
 	// drain them before rs.Close() pulls Redis out from under them (H5).
@@ -256,9 +268,15 @@ func main() {
 	})
 
 	srv := &http.Server{
-		Addr:        cfg.ListenAddr,
-		Handler:     r,
-		ReadTimeout: 30 * time.Second,
+		Addr:    cfg.ListenAddr,
+		Handler: r,
+		// ReadHeaderTimeout caps the headers phase independently of the
+		// full-body read so a slowloris on the request line cannot occupy
+		// a connection indefinitely. ReadTimeout covers the whole read
+		// (headers + body); SSE clients that hold POST bodies open would
+		// otherwise exceed it, but MCP POSTs are small JSON-RPC payloads.
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
 		// WriteTimeout left at 0 — required for SSE/streaming connections
 		IdleTimeout: 120 * time.Second,
 	}
@@ -292,12 +310,15 @@ func main() {
 	<-ctx.Done()
 	logger.Info("shutting_down", zap.Duration("timeout", cfg.ShutdownTimeout))
 
-	// Second signal during graceful drain → hard exit. Without this, a stuck
-	// SSE stream during shutdown blocks the operator's ^C and the pod lingers
-	// until the scheduler SIGKILLs it.
+	// Drain the first signal the pre-armed `hard` channel received
+	// along with ctx (Go fans out every signal to all registered
+	// targets). After this, any delivery is by definition a SECOND
+	// signal and the goroutine below escalates to os.Exit(2).
+	select {
+	case <-hard:
+	default:
+	}
 	go func() {
-		hard := make(chan os.Signal, 1)
-		signal.Notify(hard, os.Interrupt, syscall.SIGTERM)
 		<-hard
 		logger.Warn("shutdown_forced_second_signal")
 		os.Exit(2)
@@ -368,6 +389,7 @@ func readyzHandler(replayStore replay.Store, logger *zap.Logger) http.HandlerFun
 		lastAt   time.Time
 		lastOK   bool
 		lastBody string
+		sf       singleflight.Group
 	)
 	return func(w http.ResponseWriter, r *http.Request) {
 		if replayStore == nil {
@@ -391,28 +413,54 @@ func readyzHandler(replayStore replay.Store, logger *zap.Logger) http.HandlerFun
 			_, _ = io.WriteString(w, body)
 			return
 		}
+		// Capture the cache snapshot under the lock so a concurrent
+		// singleflight winner's refresh can be detected inside Do.
+		staleAt := lastAt
 		mu.Unlock()
 
-		ctx, cancel := context.WithTimeout(r.Context(), 1*time.Second)
-		defer cancel()
-		_, err := replayStore.Exists(ctx, "__readyz_probe__")
+		// singleflight coalesces concurrent cache misses (cold start,
+		// TTL expiry under probe bursts) so a kubelet readyz storm
+		// amplifies into at most one Redis Exists per TTL window
+		// instead of one per probe. After Do returns, every caller
+		// reads the fresh cached value.
+		_, _, _ = sf.Do("probe", func() (any, error) {
+			mu.Lock()
+			// Skip the probe if another Do winner refreshed the cache
+			// between our outer read and entry into this critical
+			// section. `lastAt` strictly advances, so inequality with
+			// the captured snapshot is the atomic freshness signal.
+			if lastAt != staleAt {
+				mu.Unlock()
+				return nil, nil
+			}
+			mu.Unlock()
+
+			ctx, cancel := context.WithTimeout(r.Context(), 1*time.Second)
+			defer cancel()
+			_, err := replayStore.Exists(ctx, "__readyz_probe__")
+
+			mu.Lock()
+			lastAt = time.Now()
+			if err != nil {
+				lastOK = false
+				lastBody = `{"status":"redis_unavailable"}`
+			} else {
+				lastOK = true
+				lastBody = `{"status":"ok"}`
+			}
+			mu.Unlock()
+			if err != nil {
+				logger.Warn("readyz_redis_probe_failed", zap.Error(err))
+			}
+			return nil, nil
+		})
 
 		mu.Lock()
-		lastAt = time.Now()
-		if err != nil {
-			lastOK = false
-			lastBody = `{"status":"redis_unavailable"}`
-		} else {
-			lastOK = true
-			lastBody = `{"status":"ok"}`
-		}
 		ok, body := lastOK, lastBody
 		mu.Unlock()
-
 		if ok {
 			w.WriteHeader(http.StatusOK)
 		} else {
-			logger.Warn("readyz_redis_probe_failed", zap.Error(err))
 			w.WriteHeader(http.StatusServiceUnavailable)
 		}
 		_, _ = io.WriteString(w, body)
@@ -530,7 +578,15 @@ func (l *subjectLimiter) get(sub string) *subjectSem {
 	if v, ok := l.sems.Load(sub); ok {
 		return v.(*subjectSem)
 	}
+	// Stamp lastUsed at construction so the pruner cannot evict a
+	// brand-new entry in the window between LoadOrStore and the
+	// caller's first Add(1) on the middleware hot path. Without this
+	// stamp, fresh entries observe lastUsed=0 (Unix epoch), always
+	// below cutoff, so a prune tick landing in that window deletes the
+	// entry; a concurrent request from the same subject would then
+	// LoadOrStore a second semaphore and effectively double the cap.
 	fresh := &subjectSem{sem: semaphore.NewWeighted(l.cap)}
+	fresh.lastUsed.Store(time.Now().UnixNano())
 	v, _ := l.sems.LoadOrStore(sub, fresh)
 	return v.(*subjectSem)
 }

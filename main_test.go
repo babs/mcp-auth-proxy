@@ -187,3 +187,50 @@ func TestSubjectLimiter_KeepsInFlight(t *testing.T) {
 		t.Fatal("entry with in-flight work was evicted")
 	}
 }
+
+// TestSubjectLimiter_FreshEntryNotEvicted: a freshly-minted subjectSem
+// must survive an immediate prune pass. Without the lastUsed stamp at
+// get() time, a fresh entry has lastUsed=0 (Unix epoch) which is always
+// < cutoff, so a prune tick landing between LoadOrStore and the
+// caller's first Add(1) would evict it — the next concurrent request
+// for the same subject would create a second semaphore and the
+// per-subject cap would effectively double.
+func TestSubjectLimiter_FreshEntryNotEvicted(t *testing.T) {
+	l := &subjectLimiter{cap: 4, logger: zap.NewNop()}
+	_ = l.get("alice")
+	// Run prune immediately; fresh entry has inFlight=0 and (post-fix)
+	// lastUsed=now. A 5-minute idle cutoff must keep it.
+	l.pruneOnce(time.Now(), 5*time.Minute)
+	if _, ok := l.sems.Load("alice"); !ok {
+		t.Fatal("fresh entry evicted before first Acquire (prune-race regression)")
+	}
+}
+
+// TestReadyz_Singleflight_CoalescesConcurrentMisses: under a burst of
+// concurrent probes that all miss the cache (cold start), singleflight
+// must collapse them into a single Exists call. Without coalescing a
+// kubelet readyz storm amplifies into N Redis round trips per window.
+func TestReadyz_Singleflight_CoalescesConcurrentMisses(t *testing.T) {
+	var fs fakeStore
+	h := readyzHandler(&fs, zap.NewNop())
+
+	const n = 50
+	done := make(chan struct{}, n)
+	for range n {
+		go func() {
+			rr := httptest.NewRecorder()
+			h(rr, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/readyz", nil))
+			done <- struct{}{}
+		}()
+	}
+	for range n {
+		<-done
+	}
+	// singleflight may allow a small number of in-flight probes if one
+	// completes while others are queued at the outer cache check; the
+	// coalescing is "at most a handful" rather than "exactly one", but
+	// must stay an order of magnitude below N.
+	if got := fs.existsCalls.Load(); got > 5 {
+		t.Errorf("singleflight did not coalesce: %d Exists calls for %d concurrent probes", got, n)
+	}
+}

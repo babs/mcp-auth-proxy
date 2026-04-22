@@ -31,11 +31,21 @@ data:
   REDIS_KEY_PREFIX: "mcp-auth-proxy:"
 
   LISTEN_ADDR: ":8080"
+  # Bind metrics + /readyz on all interfaces inside the pod so an
+  # in-cluster Prometheus scraper on a different pod IP can poll the
+  # `/metrics` endpoint (prometheus.io/scrape annotation on the pod
+  # already advertises it). /readyz is unauthenticated on this port;
+  # gate access with a NetworkPolicy that allows only the scraper's
+  # namespace/pod selector. The code default is loopback
+  # (127.0.0.1:9090) for bare-metal / hostNetwork; this override is
+  # correct for standard in-cluster deployment.
   METRICS_ADDR: ":9090"
   LOG_LEVEL: "info"
   PKCE_REQUIRED: "true"
   RATE_LIMIT_ENABLED: "true"
-  # Graceful shutdown — must be ≤ terminationGracePeriodSeconds in Deployment.
+  # Graceful shutdown — must be STRICTLY LESS than
+  # terminationGracePeriodSeconds in the Deployment (we add ~5s inFlight
+  # grace + Redis-close envelope on top).
   SHUTDOWN_TIMEOUT: "120s"
   GROUPS_CLAIM: "groups"
   # ALLOWED_GROUPS: "admin,mcp-users"   # uncomment to restrict access

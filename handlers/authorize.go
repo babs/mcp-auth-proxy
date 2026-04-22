@@ -37,8 +37,20 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 		codeChallenge := q.Get("code_challenge")
 		codeChallengeMethod := q.Get("code_challenge_method")
 		state := q.Get("state")
-		// RFC 8707: accepted but not enforced — we are both AS and RS
-		_ = q.Get("resource")
+		// RFC 8707 §2/§4: if `resource` is present it must identify a
+		// resource this AS serves. We are both AS and RS, so the only
+		// valid value is our own baseURL (trailing-slash-insensitive).
+		// Multiple `resource` values are permitted per RFC 8707 §2;
+		// every one must match. A mismatch returns `invalid_target`.
+		// Absent `resource` is accepted — not every MCP client sends it.
+		if resources, ok := q["resource"]; ok {
+			for _, res := range resources {
+				if !matchResource(res, baseURL) {
+					writeOAuthError(w, http.StatusBadRequest, "invalid_target", "resource does not identify this authorization server")
+					return
+				}
+			}
+		}
 
 		if responseType != "code" {
 			writeOAuthError(w, http.StatusBadRequest, "unsupported_response_type", "response_type must be 'code'")
