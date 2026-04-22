@@ -2,6 +2,7 @@ package replay
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 )
@@ -12,12 +13,34 @@ import (
 // is only held briefly and rarely.
 const defaultMemoryGCInterval = 30 * time.Second
 
-// memoryGCThreshold is the map-size watermark below which the inline
-// gcLocked pass short-circuits — entries are still evicted lazily on
-// read and by the background ticker, so lowering it from the original
-// 1024 reduces the map's steady-state footprint without pushing the
-// full-scan cost onto the hot ClaimOnce/Mark paths.
-const memoryGCThreshold = 256
+// MemoryStore eviction policy
+//
+// Earlier versions ran a full-map sweep on every write past a small
+// watermark, which degraded the ClaimOnce/Mark hot path to O(n²) under
+// sustained churn (the attack M5 in the audit report). Eviction now
+// rests on three mechanisms that keep the hot path amortized O(1):
+//
+//  1. Lazy expiry: Exists / ClaimOnce test the per-key expiry before
+//     honoring a hit.
+//  2. Background ticker (gcLoop): scheduled sweep every 30s.
+//  3. Size cap (memoryMaxEntries): when the cap is reached we sweep
+//     once at write time to free headroom, then fail closed with
+//     ErrStoreFull if none was freed.
+
+// memoryMaxEntries caps the MemoryStore map so sustained attacker-driven
+// /authorize or /register churn (which each land one ClaimOnce or Mark
+// entry) cannot grow the map without bound. At the cap a single sweep
+// runs to free headroom from expired entries; if none was freed, new
+// writes return ErrStoreFull so the handler fails closed (503). This
+// bounds resident memory and keeps ClaimOnce/Mark amortized O(1) on
+// the hot path. Ballpark: 100k entries × ~80 B per entry (key +
+// time.Time) ≈ 8 MiB resident.
+const memoryMaxEntries = 100_000
+
+// ErrStoreFull indicates the MemoryStore has reached its size cap and
+// cannot accept new claims / markers until expired entries age out.
+// Callers treat it like a backend failure and fail closed.
+var ErrStoreFull = errors.New("replay memory store at capacity")
 
 // MemoryStore is a single-process Store. Entries expire lazily on read
 // and are also swept by a background ticker. It is intended for tests
@@ -83,8 +106,10 @@ func (s *MemoryStore) ClaimOnce(_ context.Context, key string, ttl time.Duration
 	if exp, ok := s.entries[key]; ok && now.Before(exp) {
 		return ErrAlreadyClaimed
 	}
+	if _, exists := s.entries[key]; !exists && !s.hasRoomLocked(now) {
+		return ErrStoreFull
+	}
 	s.entries[key] = now.Add(ttl)
-	s.gcLocked(now)
 	return nil
 }
 
@@ -92,8 +117,10 @@ func (s *MemoryStore) Mark(_ context.Context, key string, ttl time.Duration) err
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
+	if _, exists := s.entries[key]; !exists && !s.hasRoomLocked(now) {
+		return ErrStoreFull
+	}
 	s.entries[key] = now.Add(ttl)
-	s.gcLocked(now)
 	return nil
 }
 
@@ -119,8 +146,10 @@ func (s *MemoryStore) ClaimOrCheckFamily(_ context.Context, familyKey, claimKey 
 	if exp, ok := s.entries[claimKey]; ok && now.Before(exp) {
 		return false, true, nil
 	}
+	if _, exists := s.entries[claimKey]; !exists && !s.hasRoomLocked(now) {
+		return false, false, ErrStoreFull
+	}
 	s.entries[claimKey] = now.Add(claimTTL)
-	s.gcLocked(now)
 	return false, false, nil
 }
 
@@ -129,14 +158,16 @@ func (s *MemoryStore) Close() error {
 	return nil
 }
 
-// gcLocked opportunistically sweeps expired entries when the map grows
-// past the watermark. Caller must hold s.mu. Evictions below the
-// watermark are handled by the background ticker (sweepExpired).
-func (s *MemoryStore) gcLocked(now time.Time) {
-	if len(s.entries) <= memoryGCThreshold {
-		return
+// hasRoomLocked returns true if the map has room for a new key under the
+// size cap. When at the cap it first attempts an expired-entry sweep;
+// if headroom is freed it returns true, otherwise false (caller returns
+// ErrStoreFull to the handler). Caller must hold s.mu.
+func (s *MemoryStore) hasRoomLocked(now time.Time) bool {
+	if len(s.entries) < memoryMaxEntries {
+		return true
 	}
 	s.sweepExpired(now)
+	return len(s.entries) < memoryMaxEntries
 }
 
 // sweepExpired removes every entry whose expiry is in the past. Caller

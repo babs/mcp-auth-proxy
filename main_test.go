@@ -37,7 +37,7 @@ func (f *fakeStore) Close() error { return nil }
 // TestReadyz_NoStore_AlwaysOK: without a replay store, readyz must always
 // return 200 without consulting anything.
 func TestReadyz_NoStore_AlwaysOK(t *testing.T) {
-	h := readyzHandler(nil, zap.NewNop())
+	h := readyzHandler(nil, zap.NewNop(), nil)
 	rr := httptest.NewRecorder()
 	h(rr, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/readyz", nil))
 
@@ -49,7 +49,7 @@ func TestReadyz_NoStore_AlwaysOK(t *testing.T) {
 // TestReadyz_RedisOK_Caches: two probes back-to-back hit Redis once.
 func TestReadyz_RedisOK_Caches(t *testing.T) {
 	var fs fakeStore
-	h := readyzHandler(&fs, zap.NewNop())
+	h := readyzHandler(&fs, zap.NewNop(), nil)
 
 	for i := range 3 {
 		rr := httptest.NewRecorder()
@@ -68,7 +68,7 @@ func TestReadyz_RedisOK_Caches(t *testing.T) {
 // error, readyz flips to 503 so the orchestrator can pull the pod.
 func TestReadyz_RedisDown_Reports503(t *testing.T) {
 	fs := &fakeStore{existsErr: errors.New("dial: refused")}
-	h := readyzHandler(fs, zap.NewNop())
+	h := readyzHandler(fs, zap.NewNop(), nil)
 
 	rr := httptest.NewRecorder()
 	h(rr, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/readyz", nil))
@@ -124,7 +124,7 @@ func TestSubjectLimiter_EvictsIdle(t *testing.T) {
 // holds for the shorter window.
 func TestReadyz_CacheTTLSplit(t *testing.T) {
 	var fs fakeStore
-	h := readyzHandler(&fs, zap.NewNop())
+	h := readyzHandler(&fs, zap.NewNop(), nil)
 
 	// Prime the cache with one OK probe.
 	rr := httptest.NewRecorder()
@@ -206,13 +206,33 @@ func TestSubjectLimiter_FreshEntryNotEvicted(t *testing.T) {
 	}
 }
 
+// TestReadyz_ShuttingDown_Returns503: after the drain sequence flips
+// the shuttingDown flag, /readyz must return 503 immediately without
+// calling into the (about-to-close) Redis client.
+func TestReadyz_ShuttingDown_Returns503(t *testing.T) {
+	var fs fakeStore
+	var sd atomic.Bool
+	sd.Store(true)
+	h := readyzHandler(&fs, zap.NewNop(), &sd)
+
+	rr := httptest.NewRecorder()
+	h(rr, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/readyz", nil))
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("want 503 during shutdown, got %d", rr.Code)
+	}
+	if got := fs.existsCalls.Load(); got != 0 {
+		t.Errorf("expected 0 Exists calls during shutdown, got %d", got)
+	}
+}
+
 // TestReadyz_Singleflight_CoalescesConcurrentMisses: under a burst of
 // concurrent probes that all miss the cache (cold start), singleflight
 // must collapse them into a single Exists call. Without coalescing a
 // kubelet readyz storm amplifies into N Redis round trips per window.
 func TestReadyz_Singleflight_CoalescesConcurrentMisses(t *testing.T) {
 	var fs fakeStore
-	h := readyzHandler(&fs, zap.NewNop())
+	h := readyzHandler(&fs, zap.NewNop(), nil)
 
 	const n = 50
 	done := make(chan struct{}, n)

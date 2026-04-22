@@ -247,16 +247,23 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 		// object) is treated as "no groups" — ignoring the unmarshal
 		// error lets the group allowlist make the final call instead of
 		// failing the login on a shape mismatch we can't reason about.
-		// A debug log fires so an operator tracing an unexpected
-		// ALLOWED_GROUPS denial can see the IdP shape mismatch without
-		// enabling raw id_token logging.
+		//
+		// When the shape is wrong AND ALLOWED_GROUPS is enforced, every
+		// login will be denied — an IdP-format change (a new scope
+		// layout, a schema migration) would silently mass-lockout users
+		// with only a single `group` denial counter to go on. We emit
+		// at Warn with a dedicated reason so the denial is visible
+		// without enabling id_token debug logging, and increment a
+		// dedicated counter so operators can alert on the transition
+		// instead of having to spot a spike in `group` denials.
 		var groups []string
 		if cbCfg.GroupsClaim != "" {
 			var raw map[string]json.RawMessage
 			if err := idToken.Claims(&raw); err == nil {
 				if v, ok := raw[cbCfg.GroupsClaim]; ok {
 					if err := json.Unmarshal(v, &groups); err != nil {
-						logger.Debug("groups_claim_shape_mismatch",
+						metrics.AccessDenied.WithLabelValues("group_shape").Inc()
+						logger.Warn("groups_claim_shape_mismatch",
 							zap.String("claim", cbCfg.GroupsClaim),
 							zap.String("subject", claims.Sub),
 							zap.Error(err),

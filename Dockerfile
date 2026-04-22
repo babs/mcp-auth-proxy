@@ -17,7 +17,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
       -X 'main.BuildTimestamp=${BUILD_TIMESTAMP}' \
       -X 'main.Builder=${BUILDER}' \
       -X 'main.ProjectURL=${PROJECT_URL}'" \
-    -o mcp-auth-proxy ./main.go
+    -o mcp-auth-proxy ./
 
 # distroless/static-debian13:nonroot ships ca-certificates and runs as UID
 # 65532 by default — no shell, no apt, minimal attack surface. The static

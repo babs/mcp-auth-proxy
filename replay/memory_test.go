@@ -147,3 +147,35 @@ func TestMemoryStore_ClaimOrCheckFamily(t *testing.T) {
 		t.Error("revoked family must NOT claim the tid")
 	}
 }
+
+// TestMemoryStore_SizeCap_FailsClosed: a new ClaimOnce against a full
+// map (no expired entries to sweep) must return ErrStoreFull so the
+// handler can 503 fail-closed rather than silently degrading to O(n²)
+// or dropping replay guarantees. Exercises the cap explicitly by
+// driving entries to memoryMaxEntries with a long TTL.
+func TestMemoryStore_SizeCap_FailsClosed(t *testing.T) {
+	s := NewMemoryStore()
+	defer func() { _ = s.Close() }()
+	ctx := context.Background()
+
+	// Fill to cap with TTLs that cannot expire during the test.
+	for i := 0; i < memoryMaxEntries; i++ {
+		if err := s.ClaimOnce(ctx, fmt.Sprintf("k%d", i), time.Hour); err != nil {
+			t.Fatalf("fill %d: %v", i, err)
+		}
+	}
+	// Next write must fail closed.
+	err := s.ClaimOnce(ctx, "overflow", time.Hour)
+	if !errors.Is(err, ErrStoreFull) {
+		t.Fatalf("want ErrStoreFull past cap, got %v", err)
+	}
+	// Mark must also refuse at cap.
+	err = s.Mark(ctx, "family-marker", time.Hour)
+	if !errors.Is(err, ErrStoreFull) {
+		t.Fatalf("Mark past cap: want ErrStoreFull, got %v", err)
+	}
+	// Overwriting an existing key is still OK (no growth).
+	if err := s.Mark(ctx, "k0", time.Hour); err != nil {
+		t.Errorf("Mark overwrite at cap should succeed, got %v", err)
+	}
+}

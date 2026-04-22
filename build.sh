@@ -29,7 +29,7 @@ echo "   Builder=${BUILDER}"
 echo "   ProjectURL=${PROJECT_URL}"
 
 [ "${1:-}" != "docker" ] && echo "[*] Building local binary" && \
-    CGO_ENABLED=0 go build -ldflags="${LDFLAGS[*]}" -o "${BINBASE}" ./main.go
+    CGO_ENABLED=0 go build -ldflags="${LDFLAGS[*]}" -o "${BINBASE}" ./
 
 [ "${1:-}" != "local" ] && echo "[*] Building docker image" && \
     docker build \

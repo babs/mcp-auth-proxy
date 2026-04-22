@@ -284,7 +284,11 @@ func main() {
 	// Metrics on a separate port so it's not exposed through the public listener
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("/metrics", promhttp.Handler())
-	metricsMux.Handle("/readyz", readyzHandler(replayStore, logger))
+	// shuttingDown is flipped by the drain sequence before closing the
+	// Redis client so /readyz short-circuits to 503 and stops calling
+	// into a soon-to-be-closed pool.
+	var shuttingDown atomic.Bool
+	metricsMux.Handle("/readyz", readyzHandler(replayStore, logger, &shuttingDown))
 	metricsSrv := &http.Server{
 		Addr:         cfg.MetricsAddr,
 		Handler:      metricsMux,
@@ -354,6 +358,9 @@ func main() {
 	// so long-lived SSE handlers that need Redis mid-flight don't get
 	// yanked. 5s grace is plenty for a handler that already passed
 	// Shutdown's ListenerClose; anything still running is a bug.
+	//
+	// Flip shuttingDown before rs.Close() so /readyz short-circuits
+	// instead of probing a pool that's about to close under it.
 	if rs != nil {
 		drained := make(chan struct{})
 		go func() {
@@ -365,6 +372,7 @@ func main() {
 		case <-time.After(5 * time.Second):
 			logger.Warn("shutdown_inflight_grace_expired")
 		}
+		shuttingDown.Store(true)
 		if err := rs.Close(); err != nil {
 			logger.Warn("replay_store_close_failed", zap.Error(err))
 		}
@@ -379,7 +387,7 @@ func main() {
 // (250ms staleness), while a healthy flood is still absorbed (1s cache on
 // the failure path gives K8s time to drop the pod from the Service before
 // we slam Redis with fresh probes). Without Redis configured, always ready.
-func readyzHandler(replayStore replay.Store, logger *zap.Logger) http.HandlerFunc {
+func readyzHandler(replayStore replay.Store, logger *zap.Logger, shuttingDown *atomic.Bool) http.HandlerFunc {
 	const (
 		cacheTTLOK   = 250 * time.Millisecond
 		cacheTTLFail = 1 * time.Second
@@ -392,6 +400,17 @@ func readyzHandler(replayStore replay.Store, logger *zap.Logger) http.HandlerFun
 		sf       singleflight.Group
 	)
 	return func(w http.ResponseWriter, r *http.Request) {
+		// During shutdown the Redis client has been (or will be)
+		// closed by the main drain sequence; short-circuit to 503 so
+		// the probe doesn't race rs.Close() and log a spurious
+		// readyz_redis_probe_failed on every in-flight scrape. 503 is
+		// also the right signal to the orchestrator: pull this pod
+		// out of rotation immediately.
+		if shuttingDown != nil && shuttingDown.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, `{"status":"shutting_down"}`)
+			return
+		}
 		if replayStore == nil {
 			w.WriteHeader(http.StatusOK)
 			_, _ = io.WriteString(w, `{"status":"ok"}`)

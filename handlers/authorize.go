@@ -37,20 +37,6 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 		codeChallenge := q.Get("code_challenge")
 		codeChallengeMethod := q.Get("code_challenge_method")
 		state := q.Get("state")
-		// RFC 8707 §2/§4: if `resource` is present it must identify a
-		// resource this AS serves. We are both AS and RS, so the only
-		// valid value is our own baseURL (trailing-slash-insensitive).
-		// Multiple `resource` values are permitted per RFC 8707 §2;
-		// every one must match. A mismatch returns `invalid_target`.
-		// Absent `resource` is accepted — not every MCP client sends it.
-		if resources, ok := q["resource"]; ok {
-			for _, res := range resources {
-				if !matchResource(res, baseURL) {
-					writeOAuthError(w, http.StatusBadRequest, "invalid_target", "resource does not identify this authorization server")
-					return
-				}
-			}
-		}
 
 		if responseType != "code" {
 			writeOAuthError(w, http.StatusBadRequest, "unsupported_response_type", "response_type must be 'code'")
@@ -99,6 +85,26 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 		if !validRedirect {
 			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "redirect_uri does not match registered URIs")
 			return
+		}
+
+		// RFC 8707 §2/§4: if `resource` is present it must identify a
+		// resource this AS serves. We are both AS and RS, so the only
+		// valid value is our own baseURL (trailing-slash + default-port
+		// insensitive via matchResource). Multiple `resource` values
+		// are permitted per RFC 8707 §2; every one must match. Absent
+		// `resource` is accepted — not every MCP client sends it.
+		//
+		// Checked AFTER client_id + redirect_uri so that RFC 6749
+		// §4.1.2.1 "redirect errors where the client is known" holds:
+		// probing `?resource=…` cannot reveal anything a client doesn't
+		// already learn from /.well-known/oauth-authorization-server.
+		if resources, ok := q["resource"]; ok {
+			for _, res := range resources {
+				if !matchResource(res, baseURL) {
+					writeOAuthError(w, http.StatusBadRequest, "invalid_target", "resource does not identify this authorization server")
+					return
+				}
+			}
 		}
 
 		if authzCfg.PKCERequired {
