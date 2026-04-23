@@ -214,27 +214,6 @@ func TestProxy_StripsSpoofedIdentityHeaders(t *testing.T) {
 	}
 }
 
-func TestSingleJoiningSlash(t *testing.T) {
-	tests := []struct {
-		a, b, want string
-	}{
-		{"/api", "/mcp", "/api/mcp"},
-		{"/api/", "/mcp", "/api/mcp"},
-		{"/api", "mcp", "/api/mcp"},
-		{"/api/", "mcp", "/api/mcp"},
-		{"", "/mcp", "/mcp"},
-		{"", "mcp", "/mcp"},
-		{"/api", "/", "/api/"},
-		{"/api/", "/", "/api/"},
-	}
-	for _, tc := range tests {
-		got := singleJoiningSlash(tc.a, tc.b)
-		if got != tc.want {
-			t.Errorf("singleJoiningSlash(%q, %q) = %q, want %q", tc.a, tc.b, got, tc.want)
-		}
-	}
-}
-
 func TestProxy_Follows307Redirect(t *testing.T) {
 	// Simulate a Python backend that redirects /mcp → /mcp/ with 307
 	var finalPath string

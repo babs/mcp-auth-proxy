@@ -36,6 +36,13 @@ spec:
 
       securityContext:
         runAsNonRoot: true
+        # distroless/static-debian13:nonroot declares USER as the *name*
+        # `nonroot`, not a UID. kubelet's runAsNonRoot check rejects named
+        # users with: "image has non-numeric user (nonroot), cannot
+        # verify user is non-root". Pin the numeric UID/GID (65532 is
+        # the distroless nonroot) so the check passes.
+        runAsUser: 65532
+        runAsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
 

@@ -143,6 +143,7 @@ type mockMCPServer struct {
 	LastRequestEmail  string
 	LastRequestGroups string
 	LastAuthHeader    string
+	LastRequestPath   string
 	RequestCount      int
 }
 
@@ -155,6 +156,7 @@ func newMockMCPServer(t *testing.T) *mockMCPServer {
 		m.LastRequestEmail = r.Header.Get("X-User-Email")
 		m.LastRequestGroups = r.Header.Get("X-User-Groups")
 		m.LastAuthHeader = r.Header.Get("Authorization")
+		m.LastRequestPath = r.URL.Path
 		m.RequestCount++
 
 		w.Header().Set("Content-Type", "application/json")
@@ -202,8 +204,7 @@ func buildTestProxy(t *testing.T, oidcProvider *mockOIDCProvider, mcpServer *moc
 	authMW := middleware.NewAuth(tm, zap.NewNop(), proxyBaseURL, time.Time{})
 
 	r := chi.NewRouter()
-	r.Get("/.well-known/oauth-protected-resource", handlers.ResourceMetadata(proxyBaseURL))
-	r.Get("/.well-known/oauth-authorization-server", handlers.Discovery(proxyBaseURL))
+	registerDiscoveryRoutes(r, proxyBaseURL)
 	r.Post("/register", handlers.Register(tm, zap.NewNop(), proxyBaseURL))
 	r.Get("/authorize", handlers.Authorize(tm, zap.NewNop(), proxyBaseURL, oauth2Cfg, handlers.AuthorizeConfig{
 		PKCERequired: true,
@@ -215,7 +216,8 @@ func buildTestProxy(t *testing.T, oidcProvider *mockOIDCProvider, mcpServer *moc
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
 	r.Group(func(r chi.Router) {
 		r.Use(authMW.Validate)
-		r.Handle("/*", proxyHandler)
+		r.Handle("/mcp", proxyHandler)
+		r.Handle("/mcp/*", proxyHandler)
 	})
 
 	return r
@@ -467,6 +469,14 @@ func TestE2E_FullOAuthMCPFlow(t *testing.T) {
 
 		if mcpMock.RequestCount != 1 {
 			t.Errorf("expected 1 upstream request, got %d", mcpMock.RequestCount)
+		}
+		// UPSTREAM_MCP_URL is origin-only; the proxy forwards the
+		// client request path verbatim to the upstream. /mcp/tools/list
+		// on the proxy must arrive as /mcp/tools/list upstream — a
+		// regression that silently strips or rewrites the path must
+		// fail this assertion.
+		if mcpMock.LastRequestPath != "/mcp/tools/list" {
+			t.Errorf("upstream path = %q, want /mcp/tools/list", mcpMock.LastRequestPath)
 		}
 		if mcpMock.LastRequestSub != "test-subject-123" {
 			t.Errorf("X-User-Sub = %q, want test-subject-123", mcpMock.LastRequestSub)

@@ -50,7 +50,10 @@ func main() {
 	}
 
 	logger := mustLogger(cfg.LogLevel)
-	defer logger.Sync()
+	// logger.Sync() routinely returns an error when stdout/stderr is the
+	// sink (EINVAL on /dev/stdout for non-regular fds). Ignore it — there
+	// is nothing meaningful to recover from at the shutdown point anyway.
+	defer func() { _ = logger.Sync() }()
 
 	logger.Info("starting",
 		zap.String("version", Version),
@@ -260,8 +263,7 @@ func main() {
 		logger.Info("per_subject_concurrency_enabled", zap.Int64("cap", cfg.PerSubjectConcurrency))
 	}
 
-	r.Get("/.well-known/oauth-protected-resource", handlers.ResourceMetadata(cfg.ProxyBaseURL))
-	r.Get("/.well-known/oauth-authorization-server", handlers.Discovery(cfg.ProxyBaseURL))
+	registerDiscoveryRoutes(r, cfg.ProxyBaseURL)
 	r.With(registerLimit).Post("/register", handlers.Register(tm, logger, cfg.ProxyBaseURL))
 	r.With(authorizeLimit).Get("/authorize", handlers.Authorize(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, handlers.AuthorizeConfig{
 		PKCERequired:         cfg.PKCERequired,
@@ -295,7 +297,15 @@ func main() {
 		// so a rejected request still counts towards mcp_auth_rate_limited_total.
 		r.Use(perSubjectLimiter)
 		r.Use(mcpLimit)
-		r.Handle("/*", proxyHandler)
+		// MCP is exposed at /mcp (and sub-paths). UPSTREAM_MCP_URL is
+		// origin-only (enforced by config.validateUpstreamMCPURL), so
+		// the proxy forwards the client request path verbatim to the
+		// upstream origin — client path and upstream path share the
+		// same namespace. No StripPrefix, no path join, no silent
+		// path-rewriting to mis-interpret at 3 AM. Any non-/mcp path
+		// on the proxy is 404 by the router.
+		r.Handle("/mcp", proxyHandler)
+		r.Handle("/mcp/*", proxyHandler)
 	})
 
 	srv := &http.Server{
@@ -536,11 +546,21 @@ func zapMiddleware(logger *zap.Logger) func(http.Handler) http.Handler {
 			ctx, rec := middleware.InjectLogRecord(r.Context())
 			next.ServeHTTP(ww, r.WithContext(ctx))
 
+			// req_bytes: Content-Length of the inbound request. -1 when
+			// the client used chunked encoding or omitted the header — kept
+			// as-is so the field is unambiguous rather than conflated with
+			// a true zero-byte body.
+			// resp_bytes: cumulative bytes the handler wrote through the
+			// chi response wrapper. For SSE / streaming responses this is
+			// the whole stream size (only finalized when the handler
+			// returns), which is the intended signal for volume auditing.
 			fields := []zap.Field{
 				zap.String("method", r.Method),
 				zap.String("path", r.URL.Path),
 				zap.Int("status", ww.Status()),
 				zap.Duration("duration", time.Since(start)),
+				zap.Int64("req_bytes", r.ContentLength),
+				zap.Int("resp_bytes", ww.BytesWritten()),
 				zap.String("request_id", chimw.GetReqID(ctx)),
 			}
 			if rec.Sub != "" {
@@ -561,4 +581,63 @@ func zapMiddleware(logger *zap.Logger) func(http.Handler) http.Handler {
 			logger.Info("request", fields...)
 		})
 	}
+}
+
+// wellKnownNotFound writes a JSON 404 body. The auth middleware and the
+// OAuth error surface both emit JSON, so probes that fall under the
+// discovery carve-outs stay consistent with the rest of the error shape
+// rather than leaking chi/net-http's default "404 page not found\n"
+// text/plain body to clients that only parse JSON errors.
+func wellKnownNotFound(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNotFound)
+	_, _ = w.Write([]byte(`{"error":"not_found"}`))
+}
+
+// registerDiscoveryRoutes wires all /.well-known/* and related
+// discovery routes onto r. Kept separate from main so the routing
+// decisions are testable in isolation (TestRegisterDiscoveryRoutes).
+//
+// baseURL must be origin-only (no trailing slash, no path) — enforced
+// by config.validateProxyBaseURL. Violating that invariant silently
+// produces wrong "resource" fields in the PRM.
+func registerDiscoveryRoutes(r chi.Router, baseURL string) {
+	// OAuth Protected Resource Metadata (RFC 9728).
+	// - Root "/"-suffixed resource: Claude.ai canonicalizes RFC 8707
+	//   resource indicators with a trailing slash, so this document
+	//   must advertise the "/"-terminated form or `resource`
+	//   comparisons fail.
+	// - Per-resource path (/mcp) per RFC 9728 §3.1: a protected
+	//   resource at https://host/mcp publishes PRM at
+	//   /.well-known/oauth-protected-resource/mcp with
+	//   resource=https://host/mcp.
+	r.Get("/.well-known/oauth-protected-resource", handlers.ResourceMetadata(baseURL+"/", baseURL))
+	r.Get("/.well-known/oauth-protected-resource/mcp", handlers.ResourceMetadata(baseURL+"/mcp", baseURL))
+
+	// OAuth 2.0 Authorization Server Metadata (RFC 8414).
+	// Canonical location is the root well-known path (our issuer has
+	// no path component). The "/mcp" suffix is a non-spec compat path
+	// that some MCP clients (Claude.ai web) probe alongside the
+	// canonical URL; serving the same document there avoids a
+	// confusing 401 from the downstream auth-gated /mcp/* catch-all.
+	asMeta := handlers.Discovery(baseURL)
+	r.Get("/.well-known/oauth-authorization-server", asMeta)
+	r.Get("/.well-known/oauth-authorization-server/mcp", asMeta)
+
+	// We are not an OIDC provider and we do not mirror upstream OIDC
+	// discovery. Clients that probe these paths should get 404 so
+	// they fall back to the OAuth metadata above; without explicit
+	// routes the /mcp/* auth-gated catch-all further down 401s them,
+	// which trips smarter clients into "auth misconfigured" heuristics
+	// and they refuse to register tools. r.Handle (all methods) covers
+	// HEAD probes as well as GET.
+	nf := http.HandlerFunc(wellKnownNotFound)
+	r.Handle("/.well-known/openid-configuration", nf)
+	r.Handle("/.well-known/openid-configuration/mcp", nf)
+	// Non-spec probes: some clients look for well-known paths under
+	// the resource URL (e.g. /mcp/.well-known/oauth-authorization-server).
+	// RFC 8414/9728 put these at the origin root. Return 404 so the
+	// client falls back to the canonical locations above instead of
+	// being auth-gated by the /mcp/* catch-all.
+	r.Handle("/mcp/.well-known/*", nf)
 }

@@ -710,17 +710,20 @@ func TestLoad_ProxyBaseURL_RejectsOpaqueOrQuery(t *testing.T) {
 	}
 }
 
-// TestLoad_UpstreamMCPURL_Validation covers the P1b strict validator:
-// same shape rules as PROXY_BASE_URL except a path prefix is allowed
-// (the upstream may live at /api or /mcp).
+// TestLoad_UpstreamMCPURL_Validation covers the strict validator:
+// same shape rules as PROXY_BASE_URL — origin-only (scheme + host +
+// port). A path is rejected because the proxy forwards the client
+// request path verbatim; an upstream path would either be ignored or
+// silently wrong.
 func TestLoad_UpstreamMCPURL_Validation(t *testing.T) {
 	cases := []struct {
 		url string
 		ok  bool
 	}{
 		{"http://mcp-backend:8080", true},
-		{"http://mcp-backend:8080/api", true},
-		{"https://mcp.internal.example/mcp", true},
+		{"http://mcp-backend:8080/", true}, // root slash accepted as origin
+		{"http://mcp-backend:8080/api", false},
+		{"https://mcp.internal.example/mcp", false},
 		{"ftp://mcp-backend", false},
 		{"http:foo", false},             // opaque
 		{"http:///api", false},          // hostless

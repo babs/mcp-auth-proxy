@@ -103,7 +103,7 @@ All configuration is via environment variables.
 | `OIDC_CLIENT_ID` | OIDC client ID registered with the IdP | `xxxxxxxx-...` |
 | `OIDC_CLIENT_SECRET` | OIDC client secret | `...` |
 | `PROXY_BASE_URL` | Public URL of this proxy | `https://mcp-proxy.example.com` |
-| `UPSTREAM_MCP_URL` | URL of the target MCP server (path prefix preserved) | `http://mcp-server:8080` or `http://mcp-server:8080/api` |
+| `UPSTREAM_MCP_URL` | Origin of the upstream MCP server (scheme+host+port, no path). Proxy forwards the client `/mcp` path verbatim. If upstream mounts MCP elsewhere (`/api/v1/mcp`, `/sse`, …), put a rewrite layer in front and point this URL at the rewrite layer. Path, query, fragment, userinfo rejected at startup. | `http://mcp-server:8080` |
 | `LISTEN_ADDR` | Bind address | `:8080` |
 | `METRICS_ADDR` | Prometheus metrics bind address. Default `127.0.0.1:9090` — loopback only so `/metrics` and `/readyz` are never exposed on the public interface. Override to `:9090` or a specific interface when a Prometheus scraper must reach the pod over the network | `127.0.0.1:9090` (default) |
 | `TOKEN_SIGNING_SECRET` | Secret for AES-GCM opaque tokens (min 32 bytes, shared across all instances) | `...` |
@@ -189,18 +189,25 @@ Response 200 JSON:
 
 ```json
 {
-  "resource": "{PROXY_BASE_URL}",
+  "resource": "{PROXY_BASE_URL}/",
   "authorization_servers": ["{PROXY_BASE_URL}"],
   "bearer_methods_supported": ["header"]
 }
 ```
 
 MCP clients use this endpoint to discover which authorization server protects this resource.
-No authentication required.
+No authentication required. The `resource` field is `"/"`-terminated so it matches the RFC 8707 canonicalisation Claude.ai applies to resource indicators.
+
+### GET `/.well-known/oauth-protected-resource/mcp` — per-resource PRM (RFC 9728 §3.1)
+
+Same shape, `resource` = `{PROXY_BASE_URL}/mcp`. MCP clients that scope discovery to the `/mcp` resource path (per RFC 9728 §3.1) fetch this variant instead of the root one.
 
 ---
 
-### GET `/.well-known/oauth-authorization-server`
+### GET `/.well-known/oauth-authorization-server` — Authorization Server Metadata (RFC 8414)
+
+Also served at `/.well-known/oauth-authorization-server/mcp` (non-spec compat for MCP clients that probe the per-resource suffix). Both paths return the same document.
+
 
 Response 200 JSON:
 
@@ -368,7 +375,7 @@ grant_type=refresh_token
 }
 ```
 
-Header `Cache-Control: no-store` required (RFC 6749 §5.1).
+Headers `Cache-Control: no-store` and `Pragma: no-cache` required (RFC 6749 §5.1).
 
 **Standard OAuth2 errors:**
 ```json
@@ -429,7 +436,10 @@ All MCP routes (`/*` except OAuth endpoints):
 3. Verify `claims.Audience == PROXY_BASE_URL` — rejects tokens minted by a sibling instance sharing the same secret but with a different baseURL
 4. If `REVOKE_BEFORE` is configured, reject if `iat` < cutoff (bulk revocation)
 5. Inject into context: `sub`, `email`, `groups`
-6. If invalid: `401 { "error": "invalid_token" }` with header `WWW-Authenticate: Bearer resource_metadata="{PROXY_BASE_URL}/.well-known/oauth-protected-resource"` (RFC 9728 §5.1)
+6. On failure, return `401` per RFC 6750 §3.1:
+   - Missing or malformed `Authorization` header → `{ "error": "invalid_request" }`
+   - Token decrypt/expiry/audience/iat failures → `{ "error": "invalid_token" }`
+   Both responses include `WWW-Authenticate: Bearer error="<code>", resource_metadata="{PROXY_BASE_URL}/.well-known/oauth-protected-resource"` (RFC 9728 §5.1).
 
 ---
 
@@ -439,7 +449,7 @@ After auth middleware passes:
 
 ```go
 // Forward to upstream MCP server
-// Path prefix from UPSTREAM_MCP_URL is preserved (e.g. /api)
+// Client request path forwarded verbatim; UPSTREAM_MCP_URL is origin-only
 // Added headers:
 r.Header.Set("X-User-Sub", claims.Subject)
 r.Header.Set("X-User-Email", claims.Email)
@@ -451,6 +461,24 @@ r.Header.Del("Authorization")  // do not leak the internal token
 ```
 
 Use `httputil.ReverseProxy` with `FlushInterval: -1` (immediate flush) to support SSE and streaming. The underlying `*http.Transport` sets `ResponseHeaderTimeout: 30s` so a wedged upstream fails fast during header negotiation — stream bodies themselves remain uncapped. The transport follows 307/308 redirects server-side (Python FastAPI/Starlette backends), same-host only, body replayed, max 10 hops. On exhaustion the proxy responds **502 Bad Gateway** with `{"error":"bad_gateway","error_description":"too many upstream redirects"}` rather than echoing the last 307/308 (which would leak a broken upstream `Location:` to the MCP client). Proxied request bodies are capped at 16 MiB via `http.MaxBytesReader` to bound the memory the redirect-follow buffer can hold.
+
+### Upstream path handling
+
+`UPSTREAM_MCP_URL` is origin-only (scheme + host + port). The client request path is forwarded verbatim — no join, no strip, no rewrite. The proxy exposes `/mcp` on the client side, so the upstream receives `/mcp` on the same origin.
+
+Real-world MCP endpoints use many paths:
+
+| Product | Path |
+|---|---|
+| FastMCP (Python) default | `/mcp` |
+| GitHub Copilot (`api.githubcopilot.com`) | `/mcp` |
+| Cloudflare (`mcp.cloudflare.com`) | `/mcp` |
+| Atlassian Rovo | `/v1/mcp` |
+| GitLab | `/api/v4/mcp` |
+
+When the upstream mounts MCP anywhere other than `/mcp`, put a rewrite layer between this proxy and the upstream (Ingress rule, k8s Service middleware, nginx/envoy sidecar) and point `UPSTREAM_MCP_URL` at that layer. This proxy does not rewrite paths.
+
+Path, query, fragment, and userinfo on `UPSTREAM_MCP_URL` are rejected at startup.
 
 ---
 
@@ -470,8 +498,7 @@ r.Use(chimw.Recoverer)
 // so the router composition stays identical in both modes. replayStore is
 // optional (nil when REDIS_URL is unset); when non-nil, /token enforces
 // single-use authorization codes and refresh rotation with reuse detection.
-r.Get("/.well-known/oauth-protected-resource", handlers.ResourceMetadata(cfg.ProxyBaseURL))
-r.Get("/.well-known/oauth-authorization-server", handlers.Discovery(cfg.ProxyBaseURL))
+registerDiscoveryRoutes(r, cfg.ProxyBaseURL) // PRM + AS metadata (root & /mcp) + 404 carve-outs
 r.With(registerLimit).Post("/register", handlers.Register(tm, logger, cfg.ProxyBaseURL))
 r.With(authorizeLimit).Get("/authorize", handlers.Authorize(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, handlers.AuthorizeConfig{
     PKCERequired: cfg.PKCERequired,
@@ -491,10 +518,15 @@ r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 // degraded pod drops out of a K8s Service until Redis recovers.
 r.Get("/readyz", readyzHandler(replayStore, logger))
 
-// MCP proxy (auth required)
+// MCP proxy (auth required). Mounted at /mcp only — any non-/mcp
+// path on the proxy is 404 by the router. UPSTREAM_MCP_URL is
+// origin-only (scheme+host+port); the proxy forwards the client
+// request path verbatim so upstream and client share the same
+// namespace. Upstream must serve MCP at /mcp.
 r.Group(func(r chi.Router) {
     r.Use(authMW.Validate)
-    r.Handle("/*", proxyHandler)
+    r.Handle("/mcp", proxyHandler)
+    r.Handle("/mcp/*", proxyHandler)
 })
 ```
 

@@ -117,7 +117,7 @@ All configuration via **environment variables**. Bold = required.
 | **`OIDC_CLIENT_ID`** | — | Client registered on the IdP |
 | **`OIDC_CLIENT_SECRET`** | — | IdP client secret |
 | **`PROXY_BASE_URL`** | — | Public URL of this proxy (audience-bound into every sealed token) |
-| **`UPSTREAM_MCP_URL`** | — | Target MCP server (path prefix preserved) |
+| **`UPSTREAM_MCP_URL`** | — | Origin of the upstream MCP server (scheme+host+port, no path), e.g. `http://mcp:8000`. Proxy forwards the client request path (`/mcp`) verbatim; if the upstream serves MCP elsewhere (e.g. `/api/v1/mcp`), add a rewrite layer in front of it and point this URL at the rewrite layer. Path, query, fragment, userinfo rejected at startup. |
 | **`TOKEN_SIGNING_SECRET`** | — | ≥ 32 bytes, AES-GCM key; must be byte-identical across replicas |
 | `LISTEN_ADDR` | `:8080` | Public bind address |
 | `METRICS_ADDR` | `127.0.0.1:9090` | Prometheus bind address (separate listener). Loopback-only by default so `/metrics` and `/readyz` are never exposed on the public interface; override to `:9090` or an explicit interface when a scraper must reach the pod |
@@ -176,15 +176,17 @@ rollout notes, and K8s deployment shape.
 
 | Path | Purpose |
 |---|---|
-| `GET /.well-known/oauth-protected-resource` | RFC 9728 resource metadata |
+| `GET /.well-known/oauth-protected-resource` | RFC 9728 resource metadata (`resource` is `/`-terminated for RFC 8707 / Claude.ai compat) |
+| `GET /.well-known/oauth-protected-resource/mcp` | RFC 9728 §3.1 per-resource variant (`resource` = `{PROXY_BASE_URL}/mcp`) |
 | `GET /.well-known/oauth-authorization-server` | RFC 8414 AS metadata |
+| `GET /.well-known/oauth-authorization-server/mcp` | Same document as above — non-spec compat for MCP clients that probe the per-resource suffix |
 | `POST /register` | RFC 7591 dynamic client registration |
 | `GET  /authorize` | PKCE authorization endpoint |
 | `GET  /callback` | OIDC callback from the IdP |
 | `POST /token` | `authorization_code` + `refresh_token` grants |
 | `GET  /healthz` | Liveness probe (always 200 while the process is up) |
 | `GET  /readyz` | Readiness probe (503 when Redis is configured but unreachable) |
-| `*` (any other path) | Reverse-proxied to `UPSTREAM_MCP_URL` after Bearer check |
+| `/mcp` and sub-paths | Reverse-proxied to `UPSTREAM_MCP_URL` after Bearer check. The client request path is forwarded verbatim (no strip, no rewrite). Any path outside `/mcp` returns 404. |
 | `GET /metrics` (port 9090) | Prometheus metrics |
 
 ---

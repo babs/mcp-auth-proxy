@@ -20,7 +20,12 @@ data:
   # Must match the hostname in your Ingress TLS cert.
   PROXY_BASE_URL: ""
 
-  # TODO: fill in — in-cluster URL of the upstream MCP server.
+  # TODO: fill in — origin of the upstream MCP server (scheme + host
+  # + port, no path; e.g. http://mcp-server:8000). Proxy forwards the
+  # client /mcp path verbatim. If the upstream mounts MCP elsewhere
+  # (/api/v1/mcp, /sse, …) add a rewrite layer (Ingress, sidecar) in
+  # front and point this URL at the rewrite layer.
+  # Path, query, fragment, userinfo rejected at startup.
   UPSTREAM_MCP_URL: ""
 
   # Redis replay store.

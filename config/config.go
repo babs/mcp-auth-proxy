@@ -144,11 +144,12 @@ func Load() (*Config, error) {
 	}
 
 	secret := os.Getenv("TOKEN_SIGNING_SECRET")
-	if secret == "" {
+	switch {
+	case secret == "":
 		missing = append(missing, "TOKEN_SIGNING_SECRET")
-	} else if len(secret) < 32 {
+	case len(secret) < 32:
 		return nil, fmt.Errorf("TOKEN_SIGNING_SECRET must be at least 32 bytes")
-	} else {
+	default:
 		c.TokenSigningSecret = []byte(secret)
 		// L1: count distinct bytes in the secret. A 32-byte string with <16
 		// unique byte values signals a human-picked or repeating pattern
@@ -390,12 +391,12 @@ func validateOIDCIssuerURL(raw string) error {
 	}
 }
 
-// validateUpstreamMCPURL enforces the same shape rules as
-// validateProxyBaseURL for the upstream MCP target — absolute URL
-// with a real authority, http(s) scheme, no userinfo/fragment/query,
-// no opaque form. Unlike PROXY_BASE_URL this one may carry a path
-// prefix (the upstream can live at /api etc.), so the path check is
-// permissive.
+// validateUpstreamMCPURL enforces the origin-only shape that the
+// reverse-proxy rewrite relies on: absolute URL with a real authority,
+// http(s) scheme, no userinfo/fragment/query, no opaque form, no path.
+// The proxy forwards the client request path verbatim, so an upstream
+// path would either be ignored or silently wrong — fail loud at
+// startup instead.
 func validateUpstreamMCPURL(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -418,6 +419,9 @@ func validateUpstreamMCPURL(raw string) error {
 	}
 	if u.RawQuery != "" || u.ForceQuery {
 		return fmt.Errorf("UPSTREAM_MCP_URL must not contain a query string")
+	}
+	if u.Path != "" && u.Path != "/" {
+		return fmt.Errorf("UPSTREAM_MCP_URL must be origin-only (no path), got %q", u.Path)
 	}
 	return nil
 }

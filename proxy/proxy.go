@@ -15,20 +15,6 @@ import (
 	"go.uber.org/zap"
 )
 
-// singleJoiningSlash joins two URL path segments with exactly one slash.
-// Mirrors the helper from net/http/httputil.
-func singleJoiningSlash(a, b string) string {
-	aSlash := strings.HasSuffix(a, "/")
-	bSlash := strings.HasPrefix(b, "/")
-	switch {
-	case aSlash && bSlash:
-		return a + b[1:]
-	case !aSlash && !bSlash:
-		return a + "/" + b
-	}
-	return a + b
-}
-
 const (
 	maxRedirects = 10
 	// Cap proxied request bodies to 16 MiB. Anything larger is almost
@@ -215,7 +201,7 @@ func (t *redirectFollowingTransport) RoundTrip(req *http.Request) (*http.Respons
 			bodyBytes = buf.Bytes()
 		}
 
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		req = req.Clone(req.Context())
 		req.URL = nextURL
 		// Re-sanitize and re-inject on every hop so a compromised upstream
@@ -302,8 +288,13 @@ func Handler(upstreamURL string, logger *zap.Logger, cfg Config) (http.Handler, 
 			pr.Out.URL.Scheme = target.Scheme
 			pr.Out.URL.Host = target.Host
 			pr.Out.Host = target.Host
-			// Preserve path prefix from UPSTREAM_MCP_URL (e.g. /api)
-			pr.Out.URL.Path = singleJoiningSlash(target.Path, pr.Out.URL.Path)
+			// The client-side request path is forwarded verbatim to the
+			// upstream origin — UPSTREAM_MCP_URL is origin-only
+			// (enforced by config.validateUpstreamMCPURL). No path
+			// join, no strip: client and upstream share the same
+			// path space. Operators that need path rewriting put an
+			// Ingress/sidecar in front of the upstream.
+			// pr.Out.URL.Path is left unchanged.
 
 			// Strip forwarding and caller-supplied identity headers before
 			// injecting the proxy-owned values from the validated auth context.

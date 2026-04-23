@@ -260,6 +260,53 @@ func TestRegister_Success(t *testing.T) {
 	}
 }
 
+func TestRegister_UnsupportedAuthMethod(t *testing.T) {
+	tm := newTestTokenManager(t)
+	// Client requests client_secret_post, but discovery only advertises "none"
+	// and /token never authenticates secrets. Must be rejected per RFC 7591 §3.2.2
+	// so the client doesn't believe it registered an authentication method.
+	body := `{"redirect_uris":["https://app.example.com/callback"],"token_endpoint_auth_method":"client_secret_post"}`
+
+	req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+
+	Register(tm, zap.NewNop(), testBaseURL)(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var oauthErr OAuthError
+	if err := json.NewDecoder(rr.Body).Decode(&oauthErr); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if oauthErr.Error != "invalid_client_metadata" {
+		t.Errorf("expected invalid_client_metadata, got %q", oauthErr.Error)
+	}
+}
+
+func TestRegister_ExplicitNoneAuthMethod(t *testing.T) {
+	tm := newTestTokenManager(t)
+	body := `{"redirect_uris":["https://app.example.com/callback"],"token_endpoint_auth_method":"none"}`
+
+	req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+
+	Register(tm, zap.NewNop(), testBaseURL)(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp registerResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.TokenEndpointAuthMethod != "none" {
+		t.Errorf("expected \"none\", got %q", resp.TokenEndpointAuthMethod)
+	}
+}
+
 func TestRegister_MissingRedirectURIs(t *testing.T) {
 	tm := newTestTokenManager(t)
 	body := `{"client_name":"my-app"}`
@@ -586,9 +633,12 @@ func TestTokenAuthCodeFlow(t *testing.T) {
 		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
 	}
 
-	// RFC 6749 §5.1: Cache-Control must be no-store
+	// RFC 6749 §5.1: Cache-Control must be no-store, Pragma must be no-cache
 	if cc := rr.Header().Get("Cache-Control"); cc != "no-store" {
 		t.Errorf("expected Cache-Control: no-store, got %q", cc)
+	}
+	if pr := rr.Header().Get("Pragma"); pr != "no-cache" {
+		t.Errorf("expected Pragma: no-cache, got %q", pr)
 	}
 
 	var resp map[string]any
@@ -942,35 +992,56 @@ func TestTokenRefresh_ClientMismatch(t *testing.T) {
 
 func TestResourceMetadata(t *testing.T) {
 	baseURL := "https://mcp-proxy.example.com"
-	handler := ResourceMetadata(baseURL)
 
-	req := httptest.NewRequest(http.MethodGet, "/.well-known/oauth-protected-resource", nil)
-	rr := httptest.NewRecorder()
-	handler(rr, req)
+	// Root variant: "/"-suffixed resource for Claude.ai / RFC 8707.
+	t.Run("root_slash_resource", func(t *testing.T) {
+		handler := ResourceMetadata(baseURL+"/", baseURL)
+		req := httptest.NewRequest(http.MethodGet, "/.well-known/oauth-protected-resource", nil)
+		rr := httptest.NewRecorder()
+		handler(rr, req)
 
-	if rr.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rr.Code)
-	}
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", rr.Code)
+		}
+		var meta map[string]any
+		if err := json.NewDecoder(rr.Body).Decode(&meta); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if meta["resource"] != baseURL+"/" {
+			t.Errorf("expected resource=%q, got %v", baseURL+"/", meta["resource"])
+		}
+		servers, ok := meta["authorization_servers"].([]any)
+		if !ok || len(servers) != 1 || servers[0] != baseURL {
+			t.Errorf("expected authorization_servers=[%q], got %v", baseURL, meta["authorization_servers"])
+		}
+		methods, ok := meta["bearer_methods_supported"].([]any)
+		if !ok || len(methods) != 1 || methods[0] != "header" {
+			t.Errorf("expected bearer_methods_supported=[\"header\"], got %v", meta["bearer_methods_supported"])
+		}
+	})
 
-	var meta map[string]any
-	if err := json.NewDecoder(rr.Body).Decode(&meta); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	// Per-resource variant per RFC 9728 §3.1: /mcp-scoped document.
+	t.Run("mcp_scoped_resource", func(t *testing.T) {
+		handler := ResourceMetadata(baseURL+"/mcp", baseURL)
+		req := httptest.NewRequest(http.MethodGet, "/.well-known/oauth-protected-resource/mcp", nil)
+		rr := httptest.NewRecorder()
+		handler(rr, req)
 
-	// Resource URI has trailing slash for Claude.ai compatibility (RFC 8707)
-	if meta["resource"] != baseURL+"/" {
-		t.Errorf("expected resource=%q, got %v", baseURL+"/", meta["resource"])
-	}
-
-	servers, ok := meta["authorization_servers"].([]any)
-	if !ok || len(servers) != 1 || servers[0] != baseURL {
-		t.Errorf("expected authorization_servers=[%q], got %v", baseURL, meta["authorization_servers"])
-	}
-
-	methods, ok := meta["bearer_methods_supported"].([]any)
-	if !ok || len(methods) != 1 || methods[0] != "header" {
-		t.Errorf("expected bearer_methods_supported=[\"header\"], got %v", meta["bearer_methods_supported"])
-	}
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", rr.Code)
+		}
+		var meta map[string]any
+		if err := json.NewDecoder(rr.Body).Decode(&meta); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if meta["resource"] != baseURL+"/mcp" {
+			t.Errorf("expected resource=%q, got %v", baseURL+"/mcp", meta["resource"])
+		}
+		servers, ok := meta["authorization_servers"].([]any)
+		if !ok || len(servers) != 1 || servers[0] != baseURL {
+			t.Errorf("expected authorization_servers=[%q], got %v", baseURL, meta["authorization_servers"])
+		}
+	})
 }
 
 // --- Authorize with resource param (RFC 8707) ---
