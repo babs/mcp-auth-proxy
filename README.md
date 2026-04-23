@@ -296,6 +296,13 @@ replicas:
 A ready-to-adapt manifest shape sits at the bottom of
 [`specs.md`](./specs.md#multi-instance-deployment-k8s).
 
+Production posture guides:
+
+- [`docs/redis-production.md`](./docs/redis-production.md) — what
+  "production Redis" means for this proxy (auth, TLS, HA, sizing).
+- [`docs/runbooks/`](./docs/runbooks/) — key rotation, bulk
+  revocation via `REVOKE_BEFORE`, Redis outage, IdP outage.
+
 ---
 
 ## Testing
