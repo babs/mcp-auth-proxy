@@ -4,15 +4,15 @@ go 1.26.1
 
 require (
 	github.com/alicebob/miniredis/v2 v2.37.0
-	github.com/coreos/go-oidc/v3 v3.10.0
+	github.com/coreos/go-oidc/v3 v3.18.0
 	github.com/go-chi/chi/v5 v5.1.0
 	github.com/go-chi/httprate v0.15.0
-	github.com/go-jose/go-jose/v4 v4.0.1
+	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/google/uuid v1.6.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/redis/go-redis/v9 v9.18.0
 	go.uber.org/zap v1.27.0
-	golang.org/x/oauth2 v0.30.0
+	golang.org/x/oauth2 v0.36.0
 	golang.org/x/sync v0.13.0
 	golang.org/x/term v0.41.0
 )
@@ -31,7 +31,6 @@ require (
 	go.uber.org/atomic v1.11.0 // indirect
 	go.uber.org/multierr v1.10.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
-	golang.org/x/crypto v0.19.0 // indirect
 	golang.org/x/sys v0.42.0 // indirect
 	google.golang.org/protobuf v1.36.8 // indirect
 )

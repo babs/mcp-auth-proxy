@@ -223,8 +223,10 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 	metrics.TokensIssued.WithLabelValues("authorization_code").Inc()
 	logger.Info("token_issued", zap.String("subject", code.Subject), zap.String("client_id", client.ID))
 
-	// RFC 6749 §5.1: token responses must not be cached
+	// RFC 6749 §5.1: token responses must not be cached. Pragma is HTTP/1.0
+	// legacy but still explicitly required by the spec.
 	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
 	writeJSON(w, http.StatusOK, map[string]any{
 		"access_token":  accessToken,
 		"token_type":    "Bearer",
@@ -382,8 +384,10 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 	metrics.TokensIssued.WithLabelValues("refresh_token").Inc()
 	logger.Info("token_refreshed", zap.String("subject", refresh.Subject), zap.String("client_id", client.ID))
 
-	// RFC 6749 §5.1: token responses must not be cached
+	// RFC 6749 §5.1: token responses must not be cached. Pragma is HTTP/1.0
+	// legacy but still explicitly required by the spec.
 	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
 	writeJSON(w, http.StatusOK, map[string]any{
 		"access_token":  accessToken,
 		"token_type":    "Bearer",

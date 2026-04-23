@@ -82,8 +82,10 @@ func TestValidate_MissingHeader(t *testing.T) {
 	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
 		t.Fatalf("decode body: %v", err)
 	}
-	if body["error"] == "" {
-		t.Fatal("expected non-empty error field in response")
+	// RFC 6750 §3.1: missing credential → invalid_request (not invalid_token,
+	// which is reserved for a presented token that failed validation).
+	if body["error"] != "invalid_request" {
+		t.Errorf("expected error=invalid_request, got %q", body["error"])
 	}
 }
 
@@ -104,7 +106,7 @@ func TestValidate_WWWAuthenticateHeader(t *testing.T) {
 		t.Fatal("expected WWW-Authenticate header on 401 response")
 	}
 
-	expected := `Bearer resource_metadata="` + testBaseURL + `/.well-known/oauth-protected-resource"`
+	expected := `Bearer error="invalid_request", resource_metadata="` + testBaseURL + `/.well-known/oauth-protected-resource"`
 	if wwwAuth != expected {
 		t.Errorf("WWW-Authenticate header mismatch\ngot:  %q\nwant: %q", wwwAuth, expected)
 	}
@@ -125,6 +127,13 @@ func TestValidate_InvalidToken(t *testing.T) {
 
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", rr.Code)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body["error"] != "invalid_token" {
+		t.Errorf("expected error=invalid_token, got %q", body["error"])
 	}
 }
 

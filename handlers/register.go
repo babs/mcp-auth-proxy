@@ -119,9 +119,17 @@ func Register(tm *token.Manager, logger *zap.Logger, audience string) http.Handl
 			}
 		}
 
+		// Discovery advertises token_endpoint_auth_methods_supported=["none"].
+		// Accept empty or "none" only; reject anything else per RFC 7591 §3.2.2
+		// so a client cannot be "registered" as client_secret_post and then
+		// wrongly assume /token authenticates secrets.
 		authMethod := req.TokenEndpointAuthMethod
-		if authMethod == "" {
+		switch authMethod {
+		case "", "none":
 			authMethod = "none"
+		default:
+			writeOAuthError(w, http.StatusBadRequest, "invalid_client_metadata", "unsupported token_endpoint_auth_method; only \"none\" is supported")
+			return
 		}
 
 		now := time.Now()

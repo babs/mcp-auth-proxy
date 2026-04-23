@@ -121,7 +121,8 @@ const maxBodySize = 1 << 20 // 1 MB
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
+	// Encode errors here mean the client went away mid-write; nothing to do.
+	_ = json.NewEncoder(w).Encode(v)
 }
 
 func writeOAuthError(w http.ResponseWriter, status int, code, desc string, errorCode ...string) {

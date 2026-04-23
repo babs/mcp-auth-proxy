@@ -44,7 +44,10 @@ func (a *Auth) Validate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authHeader := r.Header.Get("Authorization")
 		if len(authHeader) <= len(bearerPrefix) || !strings.EqualFold(authHeader[:len(bearerPrefix)], bearerPrefix) {
-			a.writeAuthError(w, "missing or malformed Authorization header")
+			// RFC 6750 §3.1: no credential / malformed scheme → invalid_request.
+			// invalid_token is specifically for a presented token that failed
+			// validation.
+			a.writeAuthError(w, "invalid_request")
 			return
 		}
 
@@ -86,13 +89,15 @@ func (a *Auth) Validate(next http.Handler) http.Handler {
 	})
 }
 
-// writeAuthError returns 401 with WWW-Authenticate pointing to the protected resource metadata (RFC 9728 §5.1).
-func (a *Auth) writeAuthError(w http.ResponseWriter, desc string) {
+// writeAuthError returns 401 with WWW-Authenticate pointing to the protected
+// resource metadata (RFC 9728 §5.1). errCode must be one of the RFC 6750 §3.1
+// codes: invalid_request, invalid_token, insufficient_scope.
+func (a *Auth) writeAuthError(w http.ResponseWriter, errCode string) {
 	w.Header().Set("WWW-Authenticate", fmt.Sprintf(
-		`Bearer resource_metadata="%s/.well-known/oauth-protected-resource"`,
-		a.baseURL,
+		`Bearer error="%s", resource_metadata="%s/.well-known/oauth-protected-resource"`,
+		errCode, a.baseURL,
 	))
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusUnauthorized)
-	_ = json.NewEncoder(w).Encode(map[string]string{"error": desc})
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": errCode})
 }
