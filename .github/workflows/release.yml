@@ -99,6 +99,11 @@ jobs:
             COMMIT_HASH=${{ env.COMMIT_HASH }}
             PROJECT_URL=${{ github.event.repository.html_url }}
             VERSION=${{ env.VERSION }}
+            BUILDER=github-actions/${{ runner.os }}-${{ runner.arch }}
+          # GHA cache scoped per-platform so amd64 and arm64 don't
+          # evict each other's layers in the shared cache backend.
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
           push: true
           tags: ${{ env.TARGETS }}
           platforms: ${{ matrix.platform }}
