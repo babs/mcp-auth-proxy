@@ -58,6 +58,14 @@ type Config struct {
 	// goroutine / upstream pool at the expense of others. env:
 	// MCP_PER_SUBJECT_CONCURRENCY (0 disables the limit).
 	PerSubjectConcurrency int64
+	// UpstreamAuthorization, when non-empty, is set verbatim as the
+	// Authorization header on every request forwarded to the upstream
+	// MCP backend. Full header value including the scheme, e.g.
+	// "Bearer s3cr3t" or "Basic dXNlcjpwYXNz". Empty = no header
+	// (upstream sees the proxy-injected X-User-* headers only).
+	// env: UPSTREAM_AUTHORIZATION_HEADER. Treat as a secret in
+	// deployment (mount from a Secret, not a ConfigMap).
+	UpstreamAuthorization string
 	// secretWeakWarning is non-empty when TOKEN_SIGNING_SECRET has low
 	// byte-entropy (fewer than 16 distinct bytes). Exposed via
 	// SecretWeaknessWarning() so the caller can emit a structured log
@@ -82,6 +90,8 @@ func Load() (*Config, error) {
 	c.OIDCIssuerURL = strings.TrimRight(os.Getenv("OIDC_ISSUER_URL"), "/")
 	if c.OIDCIssuerURL == "" {
 		missing = append(missing, "OIDC_ISSUER_URL")
+	} else if err := validateOIDCIssuerURL(c.OIDCIssuerURL); err != nil {
+		return nil, err
 	}
 
 	c.OIDCClientID = os.Getenv("OIDC_CLIENT_ID")
@@ -205,6 +215,8 @@ func Load() (*Config, error) {
 	// untrusted frontend lets any client mint its own rate-limit bucket key.
 	c.TrustProxyHeaders = strings.ToLower(os.Getenv("TRUST_PROXY_HEADERS")) == "true"
 
+	c.UpstreamAuthorization = os.Getenv("UPSTREAM_AUTHORIZATION_HEADER")
+
 	c.PerSubjectConcurrency = 16
 	if v := os.Getenv("MCP_PER_SUBJECT_CONCURRENCY"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
@@ -256,6 +268,37 @@ func validateRedisKeyPrefix(p string) error {
 	return nil
 }
 
+// validateOIDCIssuerURL enforces https:// (or http:// to a loopback host
+// for dev, mirroring the PROXY_BASE_URL posture). Without this an
+// operator who sets OIDC_ISSUER_URL=http://idp.example.com sends OIDC
+// discovery, the authorization-code exchange, and the confidential
+// client secret over cleartext HTTP. go-oidc does not enforce TLS
+// itself.
+func validateOIDCIssuerURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("OIDC_ISSUER_URL is not a valid URL: %w", err)
+	}
+	if u.Opaque != "" || u.Host == "" {
+		return fmt.Errorf("OIDC_ISSUER_URL must include a host, got %q", raw)
+	}
+	switch u.Scheme {
+	case "https":
+		return nil
+	case "http":
+		host := strings.TrimSuffix(u.Hostname(), ".")
+		if host == "localhost" {
+			return nil
+		}
+		if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+			return nil
+		}
+		return fmt.Errorf("OIDC_ISSUER_URL uses http:// but host %q is not loopback; https required (cleartext OIDC exposes the client secret)", host)
+	default:
+		return fmt.Errorf("OIDC_ISSUER_URL must use https:// (or http:// to a loopback host), got scheme %q", u.Scheme)
+	}
+}
+
 // validateProxyBaseURL enforces the invariants downstream code relies on:
 // https (or http+loopback for dev), no userinfo, no fragment, empty path
 // (already trim-slashed by the caller). A violation here would surface as
@@ -265,6 +308,15 @@ func validateProxyBaseURL(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return fmt.Errorf("PROXY_BASE_URL is not a valid URL: %w", err)
+	}
+	// Reject opaque (scheme:path without "//") and hostless URLs. Both
+	// pass url.Parse but poison downstream issuer/resource metadata
+	// and the WWW-Authenticate resource_metadata link.
+	if u.Opaque != "" {
+		return fmt.Errorf("PROXY_BASE_URL must be an absolute URL with authority (no opaque form), got %q", raw)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("PROXY_BASE_URL must include a host, got %q", raw)
 	}
 	switch u.Scheme {
 	case "https":
@@ -285,6 +337,9 @@ func validateProxyBaseURL(raw string) error {
 	}
 	if u.Fragment != "" || u.RawFragment != "" {
 		return fmt.Errorf("PROXY_BASE_URL must not contain a fragment")
+	}
+	if u.RawQuery != "" || u.ForceQuery {
+		return fmt.Errorf("PROXY_BASE_URL must not contain a query string")
 	}
 	// TrimRight already stripped one trailing slash; anything left is a path.
 	if u.Path != "" && u.Path != "/" {

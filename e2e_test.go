@@ -194,7 +194,7 @@ func buildTestProxy(t *testing.T, oidcProvider *mockOIDCProvider, mcpServer *moc
 		t.Fatalf("token.NewManager: %v", err)
 	}
 
-	proxyHandler, err := proxy.Handler(mcpServer.Server.URL, zap.NewNop())
+	proxyHandler, err := proxy.Handler(mcpServer.Server.URL, zap.NewNop(), proxy.Config{})
 	if err != nil {
 		t.Fatalf("proxy.Handler: %v", err)
 	}

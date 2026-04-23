@@ -114,8 +114,15 @@ func normalizedHostPort(u *url.URL) string {
 // redirectFollowingTransport follows 307/308 redirects server-side.
 // Python MCP backends (FastAPI/Starlette) redirect /mcp → /mcp/ with 307.
 // MCP clients can't follow 307 on POST per HTTP spec, so the proxy handles it.
+//
+// upstreamAuthorization mirrors Config.UpstreamAuthorization so each
+// redirect hop re-applies the operator-configured Authorization after
+// sanitizeRequestHeaders runs (sanitize does not strip Authorization
+// today, but re-applying keeps the Director and the redirect hop on
+// identical header shapes regardless of future sanitize changes).
 type redirectFollowingTransport struct {
-	base http.RoundTripper
+	base                  http.RoundTripper
+	upstreamAuthorization string
 }
 
 func (t *redirectFollowingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -216,6 +223,15 @@ func (t *redirectFollowingTransport) RoundTrip(req *http.Request) (*http.Respons
 		// transitions via redirect chains (H9).
 		sanitizeRequestHeaders(req)
 		injectIdentityHeaders(req)
+		// Re-apply the operator-configured upstream Authorization on
+		// every hop. The Director's Del("Authorization") + Set pair
+		// runs only on the first hop; without this, a future change
+		// to sanitizeRequestHeaders that starts stripping
+		// Authorization would silently drop the upstream credential
+		// on redirect.
+		if t.upstreamAuthorization != "" {
+			req.Header.Set("Authorization", t.upstreamAuthorization)
+		}
 		if bodyBytes != nil {
 			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 			req.ContentLength = int64(len(bodyBytes))
@@ -247,10 +263,24 @@ func (t *redirectFollowingTransport) RoundTrip(req *http.Request) (*http.Respons
 	return nil, fmt.Errorf("proxy: too many redirects (max %d)", maxRedirects)
 }
 
+// Config holds optional settings for the reverse-proxy Handler.
+type Config struct {
+	// UpstreamAuthorization, when non-empty, is set verbatim as the
+	// Authorization header on every request forwarded to the upstream
+	// MCP backend (and re-applied on every 307/308 redirect hop). The
+	// operator provides the full header value including the scheme,
+	// e.g. "Bearer s3cr3t" or "Basic dXNlcjpwYXNz". When empty, no
+	// Authorization header is sent — the MCP client's own token is
+	// already stripped by the Director, so the upstream sees the
+	// request un-authenticated at the HTTP layer and must rely on the
+	// proxy-injected X-User-* identity headers.
+	UpstreamAuthorization string
+}
+
 // Handler returns a reverse proxy to the upstream MCP server.
 // It strips the Authorization header and injects user identity headers.
 // FlushInterval=-1 ensures SSE and chunked streaming work correctly.
-func Handler(upstreamURL string, logger *zap.Logger) (http.Handler, error) {
+func Handler(upstreamURL string, logger *zap.Logger, cfg Config) (http.Handler, error) {
 	target, err := url.Parse(upstreamURL)
 	if err != nil {
 		return nil, err
@@ -280,11 +310,17 @@ func Handler(upstreamURL string, logger *zap.Logger) (http.Handler, error) {
 			sanitizeRequestHeaders(pr.Out)
 			injectIdentityHeaders(pr.Out)
 
-			// Security: don't leak internal token to upstream
+			// Security: don't leak the MCP client's internal token to
+			// upstream. The Del must happen BEFORE the optional
+			// UPSTREAM_AUTHORIZATION injection below so the operator-
+			// configured value is not accidentally clobbered.
 			pr.Out.Header.Del("Authorization")
+			if cfg.UpstreamAuthorization != "" {
+				pr.Out.Header.Set("Authorization", cfg.UpstreamAuthorization)
+			}
 		},
 		// Python backends redirect /mcp → /mcp/ with 307; follow it server-side
-		Transport:     &redirectFollowingTransport{base: baseTransport},
+		Transport:     &redirectFollowingTransport{base: baseTransport, upstreamAuthorization: cfg.UpstreamAuthorization},
 		FlushInterval: -1, // Immediate flush for SSE/streaming
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			logger.Error("proxy_error", zap.Error(err))

@@ -686,3 +686,87 @@ func TestLoad_ProxyBaseURL_AllowsValid(t *testing.T) {
 		})
 	}
 }
+
+// TestLoad_ProxyBaseURL_RejectsOpaqueOrQuery covers the 3rd-party M3
+// finding: validateProxyBaseURL used to accept "https:foo" (opaque
+// URL) and "https://x?y=1" (query string). Both pollute downstream
+// issuer metadata / WWW-Authenticate headers, so both are now
+// rejected at startup.
+func TestLoad_ProxyBaseURL_RejectsOpaqueOrQuery(t *testing.T) {
+	bad := []string{
+		"https:foo",               // opaque URL, Host=""
+		"https:///callback",       // hostless authority
+		"https://x?y=1",           // query string
+		"https://proxy.example/?", // empty query (still RawQuery != "")
+	}
+	for _, u := range bad {
+		t.Run(u, func(t *testing.T) {
+			setAllRequired(t)
+			t.Setenv("PROXY_BASE_URL", u)
+			if _, err := Load(); err == nil {
+				t.Fatalf("PROXY_BASE_URL=%q should be rejected", u)
+			}
+		})
+	}
+}
+
+// TestLoad_UpstreamAuthorizationHeader covers the
+// UPSTREAM_AUTHORIZATION_HEADER feature: operator supplies the full
+// header value (scheme + credentials); Config captures it verbatim.
+func TestLoad_UpstreamAuthorizationHeader(t *testing.T) {
+	t.Run("unset_empty", func(t *testing.T) {
+		setAllRequired(t)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.UpstreamAuthorization != "" {
+			t.Errorf("want empty, got %q", cfg.UpstreamAuthorization)
+		}
+	})
+	t.Run("full_header_value", func(t *testing.T) {
+		setAllRequired(t)
+		t.Setenv("UPSTREAM_AUTHORIZATION_HEADER", "Bearer upstream-xyz")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.UpstreamAuthorization != "Bearer upstream-xyz" {
+			t.Errorf("want %q, got %q", "Bearer upstream-xyz", cfg.UpstreamAuthorization)
+		}
+	})
+}
+
+// TestLoad_OIDCIssuerURL_RejectsCleartextAndHostless covers the
+// 3rd-party H2 finding: OIDC_ISSUER_URL used to accept any non-empty
+// string. Cleartext http:// to a real IdP exposes the client secret
+// during discovery and the authorization-code exchange.
+func TestLoad_OIDCIssuerURL_RejectsCleartextAndHostless(t *testing.T) {
+	cases := []struct {
+		issuer string
+		ok     bool
+	}{
+		{"https://idp.example.com", true},
+		{"https://idp.example.com/realms/x", true},
+		{"http://localhost:8080", true}, // loopback dev
+		{"http://127.0.0.1/realms/dev", true},
+		{"http://idp.example.com", false}, // cleartext external
+		{"ftp://idp.example.com", false},  // unsupported scheme
+		{"https:idp.example.com", false},  // opaque, Host=""
+		{"https:///realms/x", false},      // hostless
+		{"not a url at all %%%", false},   // parse error
+	}
+	for _, tc := range cases {
+		t.Run(tc.issuer, func(t *testing.T) {
+			setAllRequired(t)
+			t.Setenv("OIDC_ISSUER_URL", tc.issuer)
+			_, err := Load()
+			if tc.ok && err != nil {
+				t.Fatalf("OIDC_ISSUER_URL=%q should be accepted: %v", tc.issuer, err)
+			}
+			if !tc.ok && err == nil {
+				t.Fatalf("OIDC_ISSUER_URL=%q should be rejected", tc.issuer)
+			}
+		})
+	}
+}

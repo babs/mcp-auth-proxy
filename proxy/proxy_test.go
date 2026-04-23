@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -32,7 +33,7 @@ func TestProxy_ForwardsRequest(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	handler, err := Handler(upstream.URL, zap.NewNop())
+	handler, err := Handler(upstream.URL, zap.NewNop(), Config{})
 	if err != nil {
 		t.Fatalf("Handler: %v", err)
 	}
@@ -79,7 +80,7 @@ func TestProxy_SSEStreaming(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	handler, err := Handler(upstream.URL, zap.NewNop())
+	handler, err := Handler(upstream.URL, zap.NewNop(), Config{})
 	if err != nil {
 		t.Fatalf("Handler: %v", err)
 	}
@@ -122,7 +123,7 @@ func TestProxy_ForwardsGroups(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	handler, err := Handler(upstream.URL, zap.NewNop())
+	handler, err := Handler(upstream.URL, zap.NewNop(), Config{})
 	if err != nil {
 		t.Fatalf("Handler: %v", err)
 	}
@@ -152,7 +153,7 @@ func TestProxy_NoGroupsHeader(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	handler, err := Handler(upstream.URL, zap.NewNop())
+	handler, err := Handler(upstream.URL, zap.NewNop(), Config{})
 	if err != nil {
 		t.Fatalf("Handler: %v", err)
 	}
@@ -184,7 +185,7 @@ func TestProxy_StripsSpoofedIdentityHeaders(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	handler, err := Handler(upstream.URL, zap.NewNop())
+	handler, err := Handler(upstream.URL, zap.NewNop(), Config{})
 	if err != nil {
 		t.Fatalf("Handler: %v", err)
 	}
@@ -249,7 +250,7 @@ func TestProxy_Follows307Redirect(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	handler, err := Handler(upstream.URL, zap.NewNop())
+	handler, err := Handler(upstream.URL, zap.NewNop(), Config{})
 	if err != nil {
 		t.Fatalf("Handler: %v", err)
 	}
@@ -284,7 +285,7 @@ func TestDirector_StripsForwardingHeaders(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	handler, err := Handler(upstream.URL, zap.NewNop())
+	handler, err := Handler(upstream.URL, zap.NewNop(), Config{})
 	if err != nil {
 		t.Fatalf("Handler: %v", err)
 	}
@@ -627,5 +628,116 @@ func TestRedirectFollow_SchemeDowngradeRefused(t *testing.T) {
 	// Transport must NOT have followed the redirect — exactly one upstream call.
 	if calls != 1 {
 		t.Errorf("expected 1 upstream call (redirect not followed), got %d", calls)
+	}
+}
+
+// TestProxy_UpstreamAuthorization_Injected verifies that when the
+// operator configures UPSTREAM_AUTHORIZATION, the proxy sends the
+// full header value verbatim to the backend on every request, and
+// overrides (not appends to) the MCP client's own Authorization
+// header which is always stripped by the Director first.
+func TestProxy_UpstreamAuthorization_Injected(t *testing.T) {
+	var gotAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	handler, err := Handler(upstream.URL, zap.NewNop(), Config{
+		UpstreamAuthorization: "Bearer upstream-secret-xyz",
+	})
+	if err != nil {
+		t.Fatalf("Handler: %v", err)
+	}
+
+	ctx := context.WithValue(context.Background(), middleware.ContextSubject, "u")
+	req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/mcp", nil)
+	// The MCP client's own Authorization must not leak through — it's
+	// stripped before the upstream-auth injection.
+	req.Header.Set("Authorization", "Bearer client-internal-token")
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d", rr.Code)
+	}
+	if gotAuth != "Bearer upstream-secret-xyz" {
+		t.Errorf("upstream Authorization: want %q, got %q", "Bearer upstream-secret-xyz", gotAuth)
+	}
+}
+
+// TestProxy_UpstreamAuthorization_EmptyStripsAuth verifies default
+// behavior: when UPSTREAM_AUTHORIZATION is unset, the Authorization
+// header is stripped and the upstream sees no Authorization.
+func TestProxy_UpstreamAuthorization_EmptyStripsAuth(t *testing.T) {
+	var authPresent bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, authPresent = r.Header["Authorization"]
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	handler, err := Handler(upstream.URL, zap.NewNop(), Config{})
+	if err != nil {
+		t.Fatalf("Handler: %v", err)
+	}
+
+	ctx := context.WithValue(context.Background(), middleware.ContextSubject, "u")
+	req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/mcp", nil)
+	req.Header.Set("Authorization", "Bearer client-token")
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if authPresent {
+		t.Error("upstream received Authorization header; expected it stripped")
+	}
+}
+
+// TestProxy_UpstreamAuthorization_SurvivesRedirect verifies the
+// operator-configured Authorization is still present on the second
+// hop after a 307 redirect. Backends that emit 307 /mcp → /mcp/
+// should still see the upstream credential on the followed request.
+func TestProxy_UpstreamAuthorization_SurvivesRedirect(t *testing.T) {
+	var gotAuth []string
+	var hops atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = append(gotAuth, r.Header.Get("Authorization"))
+		n := hops.Add(1)
+		if n == 1 {
+			w.Header().Set("Location", r.URL.Path+"/")
+			w.WriteHeader(http.StatusTemporaryRedirect)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	handler, err := Handler(upstream.URL, zap.NewNop(), Config{
+		UpstreamAuthorization: "Bearer upstream-token",
+	})
+	if err != nil {
+		t.Fatalf("Handler: %v", err)
+	}
+
+	ctx := context.WithValue(context.Background(), middleware.ContextSubject, "u")
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/mcp", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200 after redirect follow, got %d", rr.Code)
+	}
+	if len(gotAuth) != 2 {
+		t.Fatalf("expected 2 upstream hops, got %d", len(gotAuth))
+	}
+	for i, a := range gotAuth {
+		if a != "Bearer upstream-token" {
+			t.Errorf("hop %d Authorization: want %q, got %q", i, "Bearer upstream-token", a)
+		}
 	}
 }

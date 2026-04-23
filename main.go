@@ -126,9 +126,14 @@ func main() {
 		logger.Info("replay_store_disabled")
 	}
 
-	proxyHandler, err := proxy.Handler(cfg.UpstreamMCPURL, logger)
+	proxyHandler, err := proxy.Handler(cfg.UpstreamMCPURL, logger, proxy.Config{
+		UpstreamAuthorization: cfg.UpstreamAuthorization,
+	})
 	if err != nil {
 		logger.Fatal("proxy_handler_init_failed", zap.Error(err))
+	}
+	if cfg.UpstreamAuthorization != "" {
+		logger.Info("upstream_authorization_header_configured")
 	}
 
 	authMW := middleware.NewAuth(tm, logger, cfg.ProxyBaseURL, cfg.RevokeBefore)

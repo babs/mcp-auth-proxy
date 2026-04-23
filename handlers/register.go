@@ -76,6 +76,21 @@ func Register(tm *token.Manager, logger *zap.Logger, audience string) http.Handl
 				writeOAuthError(w, http.StatusBadRequest, "invalid_request", "malformed redirect_uri")
 				return
 			}
+			// Require an absolute URI with a real authority.
+			// url.Parse("https:foo")  → Scheme="https", Opaque="foo", Host=""
+			// url.Parse("https:///x") → Scheme="https", Host=""
+			// Neither is a valid OAuth redirect target per RFC 3986 §3.
+			// Without these checks the scheme switch below lets them
+			// through and the /callback redirect later emits a broken
+			// Location header to the browser.
+			if u.Opaque != "" {
+				writeOAuthError(w, http.StatusBadRequest, "invalid_request", "redirect_uri must be an absolute URI with authority, not opaque")
+				return
+			}
+			if u.Host == "" {
+				writeOAuthError(w, http.StatusBadRequest, "invalid_request", "redirect_uri must include a host")
+				return
+			}
 			// Also trip on a trailing bare "#" (url.Parse leaves Fragment
 			// empty for "https://x/cb#" even though the marker is present).
 			if u.Fragment != "" || strings.Contains(raw, "#") {

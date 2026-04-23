@@ -2832,6 +2832,171 @@ func TestCallback_IdPError_BadState_FallsBackToJSON(t *testing.T) {
 	}
 }
 
+// markSpyStore wraps replay.Store and records the ctx passed to each
+// Mark call. Used by the refresh-family detached-ctx regression test
+// (3rd-party M1) to verify that Mark runs against a ctx that is NOT
+// cancelled when the request ctx is cancelled.
+type markSpyStore struct {
+	inner       replay.Store
+	markCount   int
+	markCtxErrs []error // ctx.Err() snapshot at Mark call-time
+}
+
+func newMarkSpyStore(inner replay.Store) *markSpyStore {
+	return &markSpyStore{inner: inner}
+}
+
+func (s *markSpyStore) ClaimOnce(ctx context.Context, k string, ttl time.Duration) error {
+	return s.inner.ClaimOnce(ctx, k, ttl)
+}
+func (s *markSpyStore) Mark(ctx context.Context, k string, ttl time.Duration) error {
+	// Snapshot ctx.Err() as observed by the store AT CALL TIME. Under
+	// the old (buggy) code with r.Context() this would be
+	// context.Canceled when the request ctx was already dead. Under
+	// the detached-ctx fix, it's nil.
+	s.markCount++
+	s.markCtxErrs = append(s.markCtxErrs, ctx.Err())
+	return s.inner.Mark(ctx, k, ttl)
+}
+func (s *markSpyStore) Exists(ctx context.Context, k string) (bool, error) {
+	return s.inner.Exists(ctx, k)
+}
+func (s *markSpyStore) ClaimOrCheckFamily(ctx context.Context, fk, ck string, ttl time.Duration) (bool, bool, error) {
+	return s.inner.ClaimOrCheckFamily(ctx, fk, ck, ttl)
+}
+func (s *markSpyStore) Close() error { return s.inner.Close() }
+
+// TestToken_FamilyRevokeMark_UsesDetachedContext covers the 3rd-party
+// M1 finding: family revocation on refresh-reuse must survive a
+// client disconnect. If the Mark ran under r.Context(), an adversary
+// racing the reuse could cancel the request and leave the family
+// unrevoked, keeping every sibling refresh token active.
+func TestToken_FamilyRevokeMark_UsesDetachedContext(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+	spy := newMarkSpyStore(replay.NewMemoryStore())
+	defer func() { _ = spy.Close() }()
+
+	encClientID, internalID := registerClient(t, tm, []string{"https://app.example.com/callback"})
+
+	familyID := uuid.New().String()
+	refresh := sealedRefresh{
+		TokenID:   uuid.New().String(),
+		FamilyID:  familyID,
+		Subject:   "sub",
+		Email:     "e@e",
+		ClientID:  internalID,
+		Typ:       token.PurposeRefresh,
+		Audience:  testBaseURL,
+		IssuedAt:  time.Now(),
+		ExpiresAt: time.Now().Add(7 * 24 * time.Hour),
+	}
+	refreshStr, err := tm.SealJSON(refresh, token.PurposeRefresh)
+	if err != nil {
+		t.Fatalf("SealJSON: %v", err)
+	}
+
+	do := func() {
+		form := url.Values{
+			"grant_type":    {"refresh_token"},
+			"refresh_token": {refreshStr},
+			"client_id":     {encClientID},
+		}
+		req := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rr := httptest.NewRecorder()
+		Token(tm, logger, testBaseURL, time.Time{}, spy)(rr, req)
+	}
+
+	// 1st use: legitimate rotation. No Mark yet.
+	do()
+	// 2nd use (same TokenID): reuse detected → Mark the family marker.
+	reqCtx, reqCancel := context.WithCancel(context.Background())
+	// Fire the reuse against a cancellable ctx; cancel it immediately
+	// after dispatch so the handler's r.Context() is dead by the time
+	// Mark runs (if Mark used r.Context(), it would fail).
+	form := url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {refreshStr},
+		"client_id":     {encClientID},
+	}
+	req := httptest.NewRequestWithContext(reqCtx, http.MethodPost, "/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rr := httptest.NewRecorder()
+	reqCancel() // cancel BEFORE the handler runs
+	Token(tm, logger, testBaseURL, time.Time{}, spy)(rr, req)
+
+	if spy.markCount == 0 {
+		t.Fatal("family Mark was never called")
+	}
+	// Mark must have been called against a ctx that was NOT derived
+	// from the already-cancelled request ctx. Under the old (buggy)
+	// code using r.Context(), the snapshot here would be
+	// context.Canceled.
+	lastErr := spy.markCtxErrs[len(spy.markCtxErrs)-1]
+	if lastErr != nil {
+		t.Errorf("Mark received a pre-cancelled ctx (likely inherits r.Context): %v", lastErr)
+	}
+}
+
+// TestRegister_RejectsHostlessOrOpaque covers the 3rd-party H1
+// finding: register.go used to accept `https:foo` (opaque URI, Host
+// empty) and `https:///callback` (hostless authority) because the
+// scheme switch only verified the scheme letter. A redirect_uri
+// without a real authority is not an OAuth callback target — the
+// later /callback Location header would be a broken URL.
+func TestRegister_RejectsHostlessOrOpaque(t *testing.T) {
+	cases := []string{
+		"https:foo",         // opaque
+		"https:///callback", // hostless
+		"https:",            // scheme only
+	}
+	for _, u := range cases {
+		t.Run(u, func(t *testing.T) {
+			tm := newTestTokenManager(t)
+			logger := zap.NewNop()
+
+			body := `{"redirect_uris":["` + u + `"]}`
+			req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			rr := httptest.NewRecorder()
+			Register(tm, logger, testBaseURL)(rr, req)
+
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("redirect_uri=%q: want 400, got %d body=%s", u, rr.Code, rr.Body.String())
+			}
+		})
+	}
+}
+
+// TestToken_RejectsURLQueryParams covers the 3rd-party M2 finding:
+// RFC 6749 §3.2 requires token-endpoint parameters in the body;
+// allowing them via URL query would leak codes / refresh tokens into
+// access logs, browser history, and Referer headers.
+func TestToken_RejectsURLQueryParams(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/token?grant_type=refresh_token&refresh_token=leaky&client_id=c",
+		strings.NewReader(""),
+	)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rr := httptest.NewRecorder()
+
+	Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("want 400 rejection for URL-query params, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var e OAuthError
+	_ = json.Unmarshal(rr.Body.Bytes(), &e)
+	if e.Error != "invalid_request" {
+		t.Errorf("want error=invalid_request, got %q", e.Error)
+	}
+}
+
 func TestToken_ResourceMatchesAudience_Accepted(t *testing.T) {
 	tm := newTestTokenManager(t)
 	logger := zap.NewNop()
