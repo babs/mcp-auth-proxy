@@ -54,11 +54,35 @@ type Claims struct {
 // Manager handles AES-GCM encryption for all stateless tokens and sealed payloads.
 // All instances sharing the same secret can seal/open each other's payloads,
 // enabling horizontal scaling without shared storage.
+//
+// Multi-key rotation (G4.1): Manager supports one primary key (used
+// for every Seal) and zero or more secondary keys (tried in order on
+// Open, after the primary fails). A rolling key rotation looks like:
+//
+//  1. Steady state: primary=A, secondaries=[].
+//  2. Rotation prepared: primary=B, secondaries=[A]. Tokens minted
+//     going forward are sealed with B; tokens minted before the
+//     rotation still decrypt because A remains in the try list.
+//  3. Bleed-in wait: at least one access-token TTL + one refresh-
+//     token TTL pass (1h + 7d ≈ 7d) so every in-flight A-sealed
+//     token either expires or rotates to a B-sealed one.
+//  4. Rotation complete: primary=B, secondaries=[]. A is safe to
+//     destroy.
+//
+// Without this, a key rotation was a flag day — every existing session
+// broke on the cutover.
 type Manager struct {
-	aead cipher.AEAD
+	// primary is the AEAD used for every Seal.
+	primary cipher.AEAD
+	// openKeys is the ordered try-list used by Open: primary first,
+	// then each secondary. Secondary AEADs accept but never produce
+	// new ciphertexts.
+	openKeys []cipher.AEAD
 	// sealCount is incremented on every successful seal. AES-GCM safety
 	// bounds apply per-key; the caller is warned once the count crosses
 	// sealRotationThreshold so the operator has a runway to rotate.
+	// The count is per-primary; a rotation resets it by instantiating
+	// a new Manager with a new primary.
 	sealCount atomic.Uint64
 	// warnedOnce ensures the rotation warning fires only on the first
 	// crossing — the counter will keep climbing, but flooding logs does
@@ -69,12 +93,41 @@ type Manager struct {
 	logger *zap.Logger
 }
 
-// NewManager creates a token manager from a signing secret (min 32 bytes).
+// NewManager creates a token manager from a single signing secret
+// (min 32 bytes). Equivalent to NewManagerWithRotation(secret) — kept
+// for callers that do not need key rotation.
 func NewManager(secret []byte) (*Manager, error) {
+	return NewManagerWithRotation(secret)
+}
+
+// NewManagerWithRotation creates a token manager with one primary
+// signing secret and zero or more secondary secrets. New payloads are
+// always sealed with primary; Open tries primary first, then each
+// secondary in the order given. Every secret must be at least 32
+// bytes. Duplicate secrets are allowed but wasted.
+func NewManagerWithRotation(primary []byte, secondaries ...[]byte) (*Manager, error) {
+	primaryAEAD, err := buildAEAD(primary)
+	if err != nil {
+		return nil, fmt.Errorf("primary secret: %w", err)
+	}
+	openKeys := []cipher.AEAD{primaryAEAD}
+	for i, s := range secondaries {
+		a, err := buildAEAD(s)
+		if err != nil {
+			return nil, fmt.Errorf("secondary secret %d: %w", i, err)
+		}
+		openKeys = append(openKeys, a)
+	}
+	return &Manager{primary: primaryAEAD, openKeys: openKeys}, nil
+}
+
+// buildAEAD derives an AES-256-GCM AEAD from the given secret. Secrets
+// may be longer than 32 bytes; SHA-256 normalizes to the AES-256 key
+// size so operators can paste hex-encoded secrets of any length ≥32.
+func buildAEAD(secret []byte) (cipher.AEAD, error) {
 	if len(secret) < 32 {
 		return nil, fmt.Errorf("secret must be at least 32 bytes")
 	}
-	// Secret may be longer than 32 bytes; SHA-256 normalizes to exact AES-256 key size
 	key := sha256.Sum256(secret)
 	block, err := aes.NewCipher(key[:])
 	if err != nil {
@@ -84,7 +137,7 @@ func NewManager(secret []byte) (*Manager, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cipher.NewGCM: %w", err)
 	}
-	return &Manager{aead: aead}, nil
+	return aead, nil
 }
 
 // SetLogger attaches a zap logger for the one-shot seal-rotation warning.
@@ -100,13 +153,14 @@ func (m *Manager) SealCount() uint64 {
 }
 
 // seal encrypts raw bytes with purpose bound as AEAD additional-data, so a
-// ciphertext minted for one purpose fails to open as any other.
+// ciphertext minted for one purpose fails to open as any other. Always
+// uses the primary key — secondary keys are accept-only.
 func (m *Manager) seal(data []byte, purpose string) (string, error) {
-	nonce := make([]byte, m.aead.NonceSize())
+	nonce := make([]byte, m.primary.NonceSize())
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 		return "", fmt.Errorf("generate nonce: %w", err)
 	}
-	ciphertext := m.aead.Seal(nonce, nonce, data, []byte(purpose))
+	ciphertext := m.primary.Seal(nonce, nonce, data, []byte(purpose))
 
 	// L6: count successful seals per Manager. When the count crosses the
 	// rotation threshold we fire a single warning — AES-GCM with 96-bit
@@ -126,18 +180,33 @@ func (m *Manager) seal(data []byte, purpose string) (string, error) {
 }
 
 // open decrypts a base64url-encoded sealed string; purpose must match the
-// value used at seal time (AAD tag fails otherwise).
+// value used at seal time (AAD tag fails otherwise). Tries the primary
+// key first, then each secondary in the order given to
+// NewManagerWithRotation. Returns the plaintext from the first AEAD
+// that accepts the ciphertext. If none accept, returns the error from
+// the primary (most-useful diagnostic — if the payload is genuinely
+// corrupt or the purpose mismatched, that's what the operator sees).
 func (m *Manager) open(sealed, purpose string) ([]byte, error) {
 	ciphertext, err := base64.RawURLEncoding.DecodeString(sealed)
 	if err != nil {
 		return nil, fmt.Errorf("base64 decode: %w", err)
 	}
-	nonceSize := m.aead.NonceSize()
+	nonceSize := m.primary.NonceSize()
 	if len(ciphertext) < nonceSize {
 		return nil, fmt.Errorf("sealed data too short")
 	}
-	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
-	return m.aead.Open(nil, nonce, ciphertext, []byte(purpose))
+	nonce, ct := ciphertext[:nonceSize], ciphertext[nonceSize:]
+	var primaryErr error
+	for i, aead := range m.openKeys {
+		plaintext, openErr := aead.Open(nil, nonce, ct, []byte(purpose))
+		if openErr == nil {
+			return plaintext, nil
+		}
+		if i == 0 {
+			primaryErr = openErr
+		}
+	}
+	return nil, primaryErr
 }
 
 // SealJSON encrypts a JSON-serializable value with the given purpose AAD.

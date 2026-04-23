@@ -273,3 +273,111 @@ func TestSealJSON_DifferentSecrets(t *testing.T) {
 		t.Fatal("expected error when opening with different secret")
 	}
 }
+
+// TestNewManagerWithRotation_PreviousKeyOpens covers the G4.1 rolling
+// rotation: tokens minted with the OLD key must still open under a
+// manager configured with NEW primary + OLD secondary. Simulates
+// step 2 of the rotation — the bleed-in window where both keys are
+// accepted but new tokens are already minted with NEW.
+func TestNewManagerWithRotation_PreviousKeyOpens(t *testing.T) {
+	oldKey := make([]byte, 32)
+	for i := range oldKey {
+		oldKey[i] = byte(i)
+	}
+	newKey := make([]byte, 32)
+	for i := range newKey {
+		newKey[i] = byte(255 - i)
+	}
+
+	// Pre-rotation: mint a token with OLD as primary.
+	oldMgr, err := NewManagerWithRotation(oldKey)
+	if err != nil {
+		t.Fatalf("old mgr: %v", err)
+	}
+	type payload struct{ X int }
+	sealed, err := oldMgr.SealJSON(payload{X: 42}, PurposeRefresh)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+
+	// Rotation step 2: NEW as primary, OLD as secondary.
+	rotMgr, err := NewManagerWithRotation(newKey, oldKey)
+	if err != nil {
+		t.Fatalf("rot mgr: %v", err)
+	}
+	var v payload
+	if err := rotMgr.OpenJSON(sealed, &v, PurposeRefresh); err != nil {
+		t.Fatalf("rotation manager must still open OLD-sealed payload: %v", err)
+	}
+	if v.X != 42 {
+		t.Errorf("payload corrupted across rotation: got %+v", v)
+	}
+}
+
+// TestNewManagerWithRotation_NewSealCannotOpenOld validates the
+// rotation direction is strict: a token minted AFTER the primary
+// changed cannot be opened by a manager that only knows the old key.
+// Ensures rolling back a deploy does not silently accept post-
+// rotation tokens against the old secret.
+func TestNewManagerWithRotation_NewSealCannotOpenOld(t *testing.T) {
+	oldKey := make([]byte, 32)
+	newKey := make([]byte, 32)
+	for i := range newKey {
+		newKey[i] = 0xFF
+	}
+
+	// Post-rotation mgr with NEW primary only.
+	newMgr, err := NewManagerWithRotation(newKey)
+	if err != nil {
+		t.Fatalf("new mgr: %v", err)
+	}
+	sealed, err := newMgr.SealJSON(struct{ X int }{X: 1}, PurposeAccess)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+
+	// Rollback mgr with OLD primary only.
+	oldMgr, err := NewManagerWithRotation(oldKey)
+	if err != nil {
+		t.Fatalf("old mgr: %v", err)
+	}
+	var v struct{ X int }
+	if err := oldMgr.OpenJSON(sealed, &v, PurposeAccess); err == nil {
+		t.Fatal("old-only manager must not open NEW-sealed payload")
+	}
+}
+
+// TestNewManagerWithRotation_PurposeStillEnforced confirms AAD
+// purpose binding is enforced across rotations — a ciphertext minted
+// with the OLD key for one purpose cannot be opened with the NEW
+// key as another purpose, and vice versa.
+func TestNewManagerWithRotation_PurposeStillEnforced(t *testing.T) {
+	oldKey := make([]byte, 32)
+	newKey := make([]byte, 32)
+	for i := range newKey {
+		newKey[i] = 0x7F
+	}
+
+	oldMgr, _ := NewManagerWithRotation(oldKey)
+	sealed, err := oldMgr.SealJSON(struct{ X int }{X: 1}, PurposeRefresh)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	rotMgr, _ := NewManagerWithRotation(newKey, oldKey)
+	var v struct{ X int }
+	if err := rotMgr.OpenJSON(sealed, &v, PurposeAccess); err == nil {
+		t.Fatal("AAD purpose mismatch must fail even through rotation")
+	}
+}
+
+// TestNewManagerWithRotation_ShortSecretRejected: every key in the
+// rotation set must meet the 32-byte floor; a typo that produces a
+// 31-byte previous key fails startup rather than silently dropping
+// rotation support.
+func TestNewManagerWithRotation_ShortSecretRejected(t *testing.T) {
+	primary := make([]byte, 32)
+	short := make([]byte, 31)
+	if _, err := NewManagerWithRotation(primary, short); err == nil {
+		t.Fatal("31-byte secondary must be rejected")
+	}
+}

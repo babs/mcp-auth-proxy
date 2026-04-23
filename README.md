@@ -131,6 +131,7 @@ All configuration via **environment variables**. Bold = required.
 | `REDIS_REQUIRED` | `true` | Fail startup when `REDIS_URL` is unset. Set `false` only for dev / single-replica; stateless mode leaves codes/refresh replayable within TTL |
 | `REDIS_KEY_PREFIX` | `mcp-auth-proxy:` | Key prefix for shared Redis; set to empty to opt out of namespacing |
 | `RATE_LIMIT_ENABLED` | `true` | Per-IP rate limiting on pre-auth endpoints and on the authenticated MCP route. Disable only behind a WAF that already enforces it |
+| `TOKEN_SIGNING_SECRETS_PREVIOUS` | _(empty)_ | Whitespace-separated retired signing secrets accepted on Open during a rolling rotation. New seals always use `TOKEN_SIGNING_SECRET` (primary); Open tries primary first, then each previous. See [`docs/runbooks/key-rotation.md`](./docs/runbooks/key-rotation.md) |
 | `TRUSTED_PROXY_CIDRS` | _(empty)_ | Comma-separated CIDRs of peers whose `X-Forwarded-For` / `X-Real-IP` / `True-Client-IP` headers are honored for rate-limit keying. Other peers fall back to RemoteAddr. Preferred over the legacy `TRUST_PROXY_HEADERS` bool |
 | `TRUST_PROXY_HEADERS` | `false` | **Legacy.** Blanket trust of every peer's forwarded headers. Superseded by `TRUSTED_PROXY_CIDRS` when both are set; kept for backward compatibility |
 | `PROD_MODE` | `false` | When `true`, fails startup if any unsafe compatibility flag is set (`PKCE_REQUIRED=false`, `COMPAT_ALLOW_STATELESS=true`, `REDIS_REQUIRED=false`, or `REDIS_URL` empty). Turns a dev-config paste-error into a visible crash |

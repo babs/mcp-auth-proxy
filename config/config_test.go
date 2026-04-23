@@ -791,6 +791,54 @@ func TestLoad_ProdMode_PassesWithSafeDefaults(t *testing.T) {
 	}
 }
 
+// TestLoad_TokenSigningSecretsPrevious covers G4.1: env-var parsing
+// for rolling key rotation. Whitespace-separated so operators can
+// paste multi-line blocks from a secret manager; each entry must
+// clear the 32-byte floor.
+func TestLoad_TokenSigningSecretsPrevious(t *testing.T) {
+	longA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaA"
+	longB := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbB"
+	t.Run("single_previous", func(t *testing.T) {
+		setAllRequired(t)
+		t.Setenv("TOKEN_SIGNING_SECRETS_PREVIOUS", longA)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if len(cfg.TokenSigningSecretsPrevious) != 1 {
+			t.Errorf("want 1 previous key, got %d", len(cfg.TokenSigningSecretsPrevious))
+		}
+	})
+	t.Run("multiple_whitespace_separated", func(t *testing.T) {
+		setAllRequired(t)
+		t.Setenv("TOKEN_SIGNING_SECRETS_PREVIOUS", longA+" \t\n"+longB)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if len(cfg.TokenSigningSecretsPrevious) != 2 {
+			t.Errorf("want 2 previous keys, got %d", len(cfg.TokenSigningSecretsPrevious))
+		}
+	})
+	t.Run("short_secret_fails", func(t *testing.T) {
+		setAllRequired(t)
+		t.Setenv("TOKEN_SIGNING_SECRETS_PREVIOUS", "too-short")
+		if _, err := Load(); err == nil {
+			t.Fatal("short previous secret must fail startup")
+		}
+	})
+	t.Run("unset_empty", func(t *testing.T) {
+		setAllRequired(t)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.TokenSigningSecretsPrevious != nil {
+			t.Errorf("unset should yield nil, got %v", cfg.TokenSigningSecretsPrevious)
+		}
+	})
+}
+
 // TestLoad_TrustedProxyCIDRs covers P1c: parse a comma-separated CIDR
 // list, reject typos, take precedence over the legacy bool.
 func TestLoad_TrustedProxyCIDRs(t *testing.T) {

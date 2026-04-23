@@ -87,9 +87,15 @@ func main() {
 
 	idTokenVerifier := oidcProvider.Verifier(&oidc.Config{ClientID: cfg.OIDCClientID})
 
-	tm, err := token.NewManager(cfg.TokenSigningSecret)
+	tm, err := token.NewManagerWithRotation(cfg.TokenSigningSecret, cfg.TokenSigningSecretsPrevious...)
 	if err != nil {
 		logger.Fatal("token_manager_init_failed", zap.Error(err))
+	}
+	if n := len(cfg.TokenSigningSecretsPrevious); n > 0 {
+		logger.Info("token_signing_rotation_in_progress",
+			zap.Int("previous_keys", n),
+			zap.String("hint", "remove TOKEN_SIGNING_SECRETS_PREVIOUS after all previous-key-sealed tokens expire"),
+		)
 	}
 	// Attach a logger so the one-shot seal-rotation threshold warning
 	// fires at 2^28 seals (L6).

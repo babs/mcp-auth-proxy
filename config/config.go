@@ -19,15 +19,23 @@ type Config struct {
 	ListenAddr         string
 	MetricsAddr        string
 	TokenSigningSecret []byte
-	LogLevel           string
-	GroupsClaim        string        // flat claim name in id_token (default "groups")
-	AllowedGroups      []string      // empty = allow all authenticated users
-	RevokeBefore       time.Time     // tokens issued before this time are rejected (zero = disabled)
-	PKCERequired       bool          // require PKCE on /authorize (default true, set false for Cursor/MCP Inspector)
-	ShutdownTimeout    time.Duration // graceful shutdown deadline; raise to drain long-lived SSE streams
-	RedisURL           string        // optional; when set, enables single-use authorization codes (replay protection)
-	RedisKeyPrefix     string        // prefix applied to every Redis key (for shared-Redis deployments); default "mcp-auth-proxy:"
-	RateLimitEnabled   bool          // enable per-IP rate limiting on pre-auth endpoints (default true)
+	// TokenSigningSecretsPrevious carries zero or more retired signing
+	// secrets that must still open existing (not-yet-expired) sealed
+	// payloads during a rolling key rotation. New payloads are always
+	// sealed with TokenSigningSecret (the primary); Open tries primary
+	// first, then each previous secret in order. See
+	// docs/runbooks/key-rotation.md for the rollout procedure. env:
+	// TOKEN_SIGNING_SECRETS_PREVIOUS (whitespace-separated list).
+	TokenSigningSecretsPrevious [][]byte
+	LogLevel                    string
+	GroupsClaim                 string        // flat claim name in id_token (default "groups")
+	AllowedGroups               []string      // empty = allow all authenticated users
+	RevokeBefore                time.Time     // tokens issued before this time are rejected (zero = disabled)
+	PKCERequired                bool          // require PKCE on /authorize (default true, set false for Cursor/MCP Inspector)
+	ShutdownTimeout             time.Duration // graceful shutdown deadline; raise to drain long-lived SSE streams
+	RedisURL                    string        // optional; when set, enables single-use authorization codes (replay protection)
+	RedisKeyPrefix              string        // prefix applied to every Redis key (for shared-Redis deployments); default "mcp-auth-proxy:"
+	RateLimitEnabled            bool          // enable per-IP rate limiting on pre-auth endpoints (default true)
 	// RedisRequired fails startup when REDIS_URL is unset. Default true —
 	// stateless codes/refresh tokens are replayable within TTL (C3/C4); the
 	// safe default is Redis-enforced single-use. Set REDIS_REQUIRED=false
@@ -154,6 +162,22 @@ func Load() (*Config, error) {
 				"TOKEN_SIGNING_SECRET has only %d distinct bytes (<16); effective entropy is much lower than its length suggests",
 				distinct,
 			)
+		}
+	}
+
+	// G4.1: previous signing secrets for rolling rotation. Whitespace-
+	// separated so operators can paste multi-line blocks from a
+	// secret manager. Each entry must be ≥32 bytes, same floor as the
+	// primary. A mid-rotation deploy carries the NEW secret as
+	// TOKEN_SIGNING_SECRET and the OLD one(s) here; after every
+	// cached token expires (1h access / 7d refresh), the operator
+	// redeploys with this var emptied.
+	if raw := os.Getenv("TOKEN_SIGNING_SECRETS_PREVIOUS"); raw != "" {
+		for _, s := range strings.Fields(raw) {
+			if len(s) < 32 {
+				return nil, fmt.Errorf("TOKEN_SIGNING_SECRETS_PREVIOUS: each secret must be at least 32 bytes")
+			}
+			c.TokenSigningSecretsPrevious = append(c.TokenSigningSecretsPrevious, []byte(s))
 		}
 	}
 
