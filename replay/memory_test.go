@@ -118,13 +118,13 @@ func TestMemoryStore_ClaimOrCheckFamily(t *testing.T) {
 	ctx := context.Background()
 
 	// Fresh claim: both flags false.
-	revoked, claimed, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute)
+	revoked, claimed, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute, 7*24*time.Hour)
 	if err != nil || revoked || claimed {
 		t.Fatalf("first call: revoked=%v claimed=%v err=%v", revoked, claimed, err)
 	}
 
 	// Re-use same tid: alreadyClaimed=true.
-	revoked, claimed, err = s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute)
+	revoked, claimed, err = s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute, 7*24*time.Hour)
 	if err != nil || revoked || !claimed {
 		t.Fatalf("second call (reuse): revoked=%v claimed=%v err=%v", revoked, claimed, err)
 	}
@@ -134,7 +134,7 @@ func TestMemoryStore_ClaimOrCheckFamily(t *testing.T) {
 	if err := s.Mark(ctx, "fam:1", time.Minute); err != nil {
 		t.Fatalf("Mark family: %v", err)
 	}
-	revoked, claimed, err = s.ClaimOrCheckFamily(ctx, "fam:1", "tid:B", time.Minute)
+	revoked, claimed, err = s.ClaimOrCheckFamily(ctx, "fam:1", "tid:B", time.Minute, 7*24*time.Hour)
 	if err != nil || !revoked || claimed {
 		t.Fatalf("after revoke: revoked=%v claimed=%v err=%v", revoked, claimed, err)
 	}

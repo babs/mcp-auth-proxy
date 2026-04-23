@@ -104,15 +104,23 @@ func (s *RedisStore) Exists(ctx context.Context, key string) (bool, error) {
 	return n > 0, nil
 }
 
-// claimOrCheckFamilyScript collapses the family-revoked check and the
-// single-use claim into one Redis round trip. Running inside EVAL makes
-// the two ops linearizable on the primary, which closes the TOCTOU
-// window that lets a stale replica read miss a freshly-Mark'd family
-// marker between the Exists and the SetNX.
+// claimOrCheckFamilyScript collapses the family-revoked check, the
+// single-use claim, AND the on-reuse family-revocation into one
+// linearizable EVAL. Running all three inside a single script on the
+// primary closes two different fail-open edges:
+//
+//  1. TOCTOU between EXISTS and SETNX: a stale replica read could
+//     previously miss a freshly-SET family marker.
+//  2. Client disconnect between reuse-detect and the caller's
+//     separate Mark call: previously the handler had to issue a
+//     second round trip to set the family marker after detecting
+//     reuse, and a cancel mid-request could skip it. Now the marker
+//     lands atomically with the detection.
 //
 // KEYS[1] = family_revoked key
 // KEYS[2] = claim key (refresh token id)
 // ARGV[1] = claim TTL in milliseconds
+// ARGV[2] = family-revoke TTL in milliseconds (used only on reuse)
 // Returns {familyRevoked, alreadyClaimed} as integers in {0,1}.
 var claimOrCheckFamilyScript = redis.NewScript(`
 if redis.call("EXISTS", KEYS[1]) == 1 then
@@ -122,19 +130,22 @@ local ok = redis.call("SET", KEYS[2], "1", "NX", "PX", ARGV[1])
 if ok then
   return {0, 0}
 end
+redis.call("SET", KEYS[1], "1", "PX", ARGV[2])
 return {0, 1}
 `)
 
 // ClaimOrCheckFamily implements replay.Store.ClaimOrCheckFamily. See the
-// interface doc for semantics. claimTTL is truncated to millisecond
+// interface doc for semantics. TTLs are truncated to millisecond
 // resolution (Redis PX).
-func (s *RedisStore) ClaimOrCheckFamily(ctx context.Context, familyKey, claimKey string, claimTTL time.Duration) (familyRevoked bool, alreadyClaimed bool, err error) {
-	ttlMs := max(claimTTL.Milliseconds(), 1)
+func (s *RedisStore) ClaimOrCheckFamily(ctx context.Context, familyKey, claimKey string, claimTTL, familyTTL time.Duration) (familyRevoked bool, alreadyClaimed bool, err error) {
+	claimMs := max(claimTTL.Milliseconds(), 1)
+	familyMs := max(familyTTL.Milliseconds(), 1)
 	res, err := claimOrCheckFamilyScript.Run(
 		ctx,
 		s.client,
 		[]string{s.k(familyKey), s.k(claimKey)},
-		ttlMs,
+		claimMs,
+		familyMs,
 	).Result()
 	if err != nil {
 		return false, false, fmt.Errorf("redis eval: %w", err)

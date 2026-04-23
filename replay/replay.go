@@ -31,20 +31,28 @@ type Store interface {
 	// Exists returns true if the key is currently set.
 	Exists(ctx context.Context, key string) (bool, error)
 
-	// ClaimOrCheckFamily atomically tests familyKey for presence AND, when
-	// the family is not revoked, claims claimKey single-use with claimTTL.
-	// Collapses the three-call sequence (Exists → ClaimOnce → Mark-on-reuse)
-	// into one round trip, closing the TOCTOU window that allows one extra
-	// rotation against a revoked family when Redis reads are routed to a
-	// replica lagging behind the primary.
+	// ClaimOrCheckFamily atomically performs three operations as one
+	// linearizable step:
+	//   1. If familyKey is present, return familyRevoked=true.
+	//   2. Else, attempt SET NX on claimKey with claimTTL. On success
+	//      return both false (fresh claim).
+	//   3. Else (claim collision = reuse detected): atomically set
+	//      familyKey with familyTTL, then return alreadyClaimed=true.
+	//
+	// Step 3 closes the fail-open edge where a caller observed
+	// alreadyClaimed and then tried to Mark the family in a second
+	// round trip — a client disconnect or Redis blip between steps
+	// would leave the family unrevoked and every sibling refresh
+	// still usable. Here the revocation is part of the same EVAL, so
+	// the invariant "alreadyClaimed ⇒ family revoked" holds without
+	// handler cooperation.
 	//
 	// Returns:
 	//   familyRevoked=true  → family marker present; caller MUST refuse.
-	//   alreadyClaimed=true → family OK but claimKey already consumed;
-	//                          caller MUST refuse AND revoke the family
-	//                          (reuse detection).
+	//   alreadyClaimed=true → reuse detected; family is NOW revoked
+	//                          atomically. Caller MUST refuse.
 	//   both false          → fresh claim; caller MAY proceed.
-	ClaimOrCheckFamily(ctx context.Context, familyKey, claimKey string, claimTTL time.Duration) (familyRevoked bool, alreadyClaimed bool, err error)
+	ClaimOrCheckFamily(ctx context.Context, familyKey, claimKey string, claimTTL, familyTTL time.Duration) (familyRevoked bool, alreadyClaimed bool, err error)
 
 	// Close releases any underlying resources (connections, goroutines).
 	Close() error

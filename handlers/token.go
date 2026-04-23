@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
@@ -315,7 +314,13 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 		if claimTTL < time.Second {
 			claimTTL = time.Second
 		}
-		revoked, alreadyClaimed, err := replayStore.ClaimOrCheckFamily(r.Context(), familyKey, claimKey, claimTTL)
+		// ClaimOrCheckFamily runs check + claim + on-reuse-revocation
+		// as a single linearizable operation. When alreadyClaimed is
+		// true the family is ALREADY revoked atomically inside the
+		// store; the handler does not need (and must not attempt) a
+		// separate Mark — doing so would reintroduce the fail-open
+		// path a client cancel could cut short.
+		revoked, alreadyClaimed, err := replayStore.ClaimOrCheckFamily(r.Context(), familyKey, claimKey, claimTTL, refreshTokenTTL)
 		if err != nil {
 			logger.Error("replay_store_error", zap.Error(err))
 			writeOAuthError(w, http.StatusServiceUnavailable, "server_error", "replay store unavailable", "replay_store_unavailable")
@@ -332,24 +337,6 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 			return
 		}
 		if alreadyClaimed {
-			// Reuse of a rotated token. Revoke the whole family so every
-			// sibling (including the most recently issued legitimate one) is
-			// invalidated. 7-day TTL covers the longest-lived refresh in the
-			// family.
-			//
-			// Detached context: family revocation is a security-critical
-			// write that the adversary MUST NOT be able to cancel. Under
-			// r.Context() a client disconnect mid-call would leave the
-			// family unrevoked, so every OTHER refresh token in the family
-			// would remain usable — a fail-open edge on the compromise
-			// path. Run against context.Background() with a bounded
-			// timeout so the operation completes independent of the
-			// client's TCP state.
-			markCtx, markCancel := context.WithTimeout(context.Background(), 2*time.Second)
-			if markErr := replayStore.Mark(markCtx, familyKey, refreshTokenTTL); markErr != nil {
-				logger.Error("refresh_family_revoke_failed", zap.Error(markErr))
-			}
-			markCancel()
 			metrics.ReplayDetected.WithLabelValues("refresh").Inc()
 			logger.Warn("refresh_token_reuse_detected",
 				zap.String("token_id", refresh.TokenID),

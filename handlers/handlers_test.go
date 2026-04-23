@@ -2832,110 +2832,85 @@ func TestCallback_IdPError_BadState_FallsBackToJSON(t *testing.T) {
 	}
 }
 
-// markSpyStore wraps replay.Store and records the ctx passed to each
-// Mark call. Used by the refresh-family detached-ctx regression test
-// (3rd-party M1) to verify that Mark runs against a ctx that is NOT
-// cancelled when the request ctx is cancelled.
-type markSpyStore struct {
-	inner       replay.Store
-	markCount   int
-	markCtxErrs []error // ctx.Err() snapshot at Mark call-time
-}
-
-func newMarkSpyStore(inner replay.Store) *markSpyStore {
-	return &markSpyStore{inner: inner}
-}
-
-func (s *markSpyStore) ClaimOnce(ctx context.Context, k string, ttl time.Duration) error {
-	return s.inner.ClaimOnce(ctx, k, ttl)
-}
-func (s *markSpyStore) Mark(ctx context.Context, k string, ttl time.Duration) error {
-	// Snapshot ctx.Err() as observed by the store AT CALL TIME. Under
-	// the old (buggy) code with r.Context() this would be
-	// context.Canceled when the request ctx was already dead. Under
-	// the detached-ctx fix, it's nil.
-	s.markCount++
-	s.markCtxErrs = append(s.markCtxErrs, ctx.Err())
-	return s.inner.Mark(ctx, k, ttl)
-}
-func (s *markSpyStore) Exists(ctx context.Context, k string) (bool, error) {
-	return s.inner.Exists(ctx, k)
-}
-func (s *markSpyStore) ClaimOrCheckFamily(ctx context.Context, fk, ck string, ttl time.Duration) (bool, bool, error) {
-	return s.inner.ClaimOrCheckFamily(ctx, fk, ck, ttl)
-}
-func (s *markSpyStore) Close() error { return s.inner.Close() }
-
-// TestToken_FamilyRevokeMark_UsesDetachedContext covers the 3rd-party
-// M1 finding: family revocation on refresh-reuse must survive a
-// client disconnect. If the Mark ran under r.Context(), an adversary
-// racing the reuse could cancel the request and leave the family
-// unrevoked, keeping every sibling refresh token active.
-func TestToken_FamilyRevokeMark_UsesDetachedContext(t *testing.T) {
+// TestToken_FamilyRevokeAtomic_SurvivesClientCancel covers the
+// 3rd-party M1 finding under the atomic design: when refresh reuse
+// is detected, the family revocation is part of the same Lua EVAL as
+// the reuse detection (see replay/redis.go claimOrCheckFamilyScript).
+// The handler does no separate Mark call, so there is no fail-open
+// edge a client cancel could cut through. Verify by cancelling the
+// request context before the handler runs and confirming a sibling
+// refresh in the same family is still rejected as revoked.
+func TestToken_FamilyRevokeAtomic_SurvivesClientCancel(t *testing.T) {
 	tm := newTestTokenManager(t)
 	logger := zap.NewNop()
-	spy := newMarkSpyStore(replay.NewMemoryStore())
-	defer func() { _ = spy.Close() }()
+	store := replay.NewMemoryStore()
+	defer func() { _ = store.Close() }()
 
 	encClientID, internalID := registerClient(t, tm, []string{"https://app.example.com/callback"})
 
 	familyID := uuid.New().String()
-	refresh := sealedRefresh{
-		TokenID:   uuid.New().String(),
-		FamilyID:  familyID,
-		Subject:   "sub",
-		Email:     "e@e",
-		ClientID:  internalID,
-		Typ:       token.PurposeRefresh,
-		Audience:  testBaseURL,
-		IssuedAt:  time.Now(),
-		ExpiresAt: time.Now().Add(7 * 24 * time.Hour),
-	}
-	refreshStr, err := tm.SealJSON(refresh, token.PurposeRefresh)
-	if err != nil {
-		t.Fatalf("SealJSON: %v", err)
+	mkRefresh := func(tid string) string {
+		r := sealedRefresh{
+			TokenID:   tid,
+			FamilyID:  familyID,
+			Subject:   "sub",
+			Email:     "e@e",
+			ClientID:  internalID,
+			Typ:       token.PurposeRefresh,
+			Audience:  testBaseURL,
+			IssuedAt:  time.Now(),
+			ExpiresAt: time.Now().Add(7 * 24 * time.Hour),
+		}
+		s, err := tm.SealJSON(r, token.PurposeRefresh)
+		if err != nil {
+			t.Fatalf("SealJSON: %v", err)
+		}
+		return s
 	}
 
-	do := func() {
+	tidA := uuid.New().String()
+	tidB := uuid.New().String()
+	refreshA := mkRefresh(tidA)
+	refreshB := mkRefresh(tidB)
+
+	do := func(ctx context.Context, refreshStr string) *httptest.ResponseRecorder {
 		form := url.Values{
 			"grant_type":    {"refresh_token"},
 			"refresh_token": {refreshStr},
 			"client_id":     {encClientID},
 		}
-		req := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(form.Encode()))
+		req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/token", strings.NewReader(form.Encode()))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		rr := httptest.NewRecorder()
-		Token(tm, logger, testBaseURL, time.Time{}, spy)(rr, req)
+		Token(tm, logger, testBaseURL, time.Time{}, store)(rr, req)
+		return rr
 	}
 
-	// 1st use: legitimate rotation. No Mark yet.
-	do()
-	// 2nd use (same TokenID): reuse detected → Mark the family marker.
-	reqCtx, reqCancel := context.WithCancel(context.Background())
-	// Fire the reuse against a cancellable ctx; cancel it immediately
-	// after dispatch so the handler's r.Context() is dead by the time
-	// Mark runs (if Mark used r.Context(), it would fail).
-	form := url.Values{
-		"grant_type":    {"refresh_token"},
-		"refresh_token": {refreshStr},
-		"client_id":     {encClientID},
+	// 1st use of A: legitimate rotation.
+	if rr := do(context.Background(), refreshA); rr.Code != http.StatusOK {
+		t.Fatalf("first rotation of A: want 200, got %d: %s", rr.Code, rr.Body.String())
 	}
-	req := httptest.NewRequestWithContext(reqCtx, http.MethodPost, "/token", strings.NewReader(form.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	rr := httptest.NewRecorder()
-	reqCancel() // cancel BEFORE the handler runs
-	Token(tm, logger, testBaseURL, time.Time{}, spy)(rr, req)
-
-	if spy.markCount == 0 {
-		t.Fatal("family Mark was never called")
+	// 2nd use of A under a pre-cancelled ctx: reuse detected. Under
+	// the pre-atomic design the family Mark could have been skipped
+	// via client cancel; under the atomic design the marker is set
+	// inside the same EVAL so the cancel cannot skip it.
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if rr := do(cancelled, refreshA); rr.Code != http.StatusBadRequest {
+		t.Fatalf("reuse of A: want 400, got %d: %s", rr.Code, rr.Body.String())
 	}
-	// Mark must have been called against a ctx that was NOT derived
-	// from the already-cancelled request ctx. Under the old (buggy)
-	// code using r.Context(), the snapshot here would be
-	// context.Canceled.
-	lastErr := spy.markCtxErrs[len(spy.markCtxErrs)-1]
-	if lastErr != nil {
-		t.Errorf("Mark received a pre-cancelled ctx (likely inherits r.Context): %v", lastErr)
+	// Try a SIBLING refresh (different tid, same family). If family
+	// revocation lived in a separate writable step that the cancel
+	// skipped, B would still be accepted. Under atomic revoke, B is
+	// rejected as family-revoked.
+	rr := do(context.Background(), refreshB)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("sibling B after cancelled-reuse of A: want 400 family revoked, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var e OAuthError
+	_ = json.Unmarshal(rr.Body.Bytes(), &e)
+	if e.ErrorCode != "refresh_family_revoked" {
+		t.Errorf("want error_code=refresh_family_revoked, got %q", e.ErrorCode)
 	}
 }
 

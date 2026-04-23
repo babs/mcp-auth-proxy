@@ -132,10 +132,11 @@ func (s *MemoryStore) Exists(_ context.Context, key string) (bool, error) {
 }
 
 // ClaimOrCheckFamily implements replay.Store.ClaimOrCheckFamily under a
-// single mutex so the family-revoked check and the claim are
-// observationally atomic on this replica — the same invariant the
-// Redis EVAL variant enforces across replicas.
-func (s *MemoryStore) ClaimOrCheckFamily(_ context.Context, familyKey, claimKey string, claimTTL time.Duration) (familyRevoked bool, alreadyClaimed bool, err error) {
+// single mutex so the three-step sequence (family-revoked check,
+// single-use claim, on-reuse family revocation) is observationally
+// atomic on this replica — the same invariant the Redis EVAL variant
+// enforces across replicas.
+func (s *MemoryStore) ClaimOrCheckFamily(_ context.Context, familyKey, claimKey string, claimTTL, familyTTL time.Duration) (familyRevoked bool, alreadyClaimed bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -144,6 +145,13 @@ func (s *MemoryStore) ClaimOrCheckFamily(_ context.Context, familyKey, claimKey 
 		return true, false, nil
 	}
 	if exp, ok := s.entries[claimKey]; ok && now.Before(exp) {
+		// Reuse detected: revoke the family atomically here so the
+		// invariant "alreadyClaimed ⇒ family revoked" holds without
+		// relying on a second handler-driven write.
+		if _, exists := s.entries[familyKey]; !exists && !s.hasRoomLocked(now) {
+			return false, true, ErrStoreFull
+		}
+		s.entries[familyKey] = now.Add(familyTTL)
 		return false, true, nil
 	}
 	if _, exists := s.entries[claimKey]; !exists && !s.hasRoomLocked(now) {

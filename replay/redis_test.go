@@ -166,7 +166,7 @@ func TestRedisStore_ClaimOrCheckFamily_FreshClaim(t *testing.T) {
 	s, mr := newTestRedis(t, "p:")
 	ctx := context.Background()
 
-	revoked, claimed, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute)
+	revoked, claimed, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute, 7*24*time.Hour)
 	if err != nil {
 		t.Fatalf("ClaimOrCheckFamily: %v", err)
 	}
@@ -182,11 +182,11 @@ func TestRedisStore_ClaimOrCheckFamily_AlreadyClaimed(t *testing.T) {
 	s, _ := newTestRedis(t, "")
 	ctx := context.Background()
 
-	if _, _, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute); err != nil {
+	if _, _, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute, 7*24*time.Hour); err != nil {
 		t.Fatalf("first claim: %v", err)
 	}
 
-	revoked, claimed, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute)
+	revoked, claimed, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute, 7*24*time.Hour)
 	if err != nil {
 		t.Fatalf("second claim: %v", err)
 	}
@@ -206,7 +206,7 @@ func TestRedisStore_ClaimOrCheckFamily_FamilyRevoked(t *testing.T) {
 		t.Fatalf("Mark: %v", err)
 	}
 
-	revoked, claimed, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute)
+	revoked, claimed, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute, 7*24*time.Hour)
 	if err != nil {
 		t.Fatalf("ClaimOrCheckFamily: %v", err)
 	}
@@ -228,7 +228,7 @@ func TestRedisStore_ClaimOrCheckFamily_AppliesPrefix(t *testing.T) {
 	s, mr := newTestRedis(t, "proxy-a:")
 	ctx := context.Background()
 
-	if _, _, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute); err != nil {
+	if _, _, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute, 7*24*time.Hour); err != nil {
 		t.Fatalf("ClaimOrCheckFamily: %v", err)
 	}
 	if !mr.Exists("proxy-a:tid:A") {
