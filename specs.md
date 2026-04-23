@@ -82,7 +82,9 @@ Trade-offs:
 - **Authorization codes are replayable** within their 60-second TTL when no replay store is configured. Mitigated by PKCE (the attacker also needs the `code_verifier`) and the short window. Set `REDIS_URL` to make codes strictly single-use across replicas (RFC 6749 §4.1.2).
 - **Bulk revocation** via `REVOKE_BEFORE`: set to the current timestamp and redeploy — all existing access tokens AND refresh tokens with `iat` before the cutoff are rejected. Refresh tokens carry their own `iat` so an attacker holding a leaked refresh cannot keep minting fresh access tokens past the cutoff. Incident response: rotate `REVOKE_BEFORE` and watch a `kubectl rollout status` complete before assuming the cutoff is enforced fleet-wide.
 
-### Replay protection (optional)
+### Replay protection (Redis-backed, required by default)
+
+`REDIS_REQUIRED` defaults to `true`: the proxy fails startup with `Fatal` if `REDIS_URL` is unset. Stateless mode is an explicit opt-out (`REDIS_REQUIRED=false`) for dev or single-replica deployments that accept the trade-off.
 
 Set `REDIS_URL` (e.g. `redis://redis:6379/0`, or `rediss://` for TLS) to enable two layered protections backed by Redis `SET NX` / `EXISTS`. All Redis keys are namespaced with `REDIS_KEY_PREFIX` (default `mcp-auth-proxy:`) so multiple proxy deployments can safely share a single Redis DB without key collisions:
 

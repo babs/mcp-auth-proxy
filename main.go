@@ -59,6 +59,27 @@ func main() {
 		zap.String("version", Version),
 		zap.String("commit", CommitHash),
 		zap.String("built_at", BuildTimestamp),
+		zap.String("builder", Builder),
+		zap.String("project_url", ProjectURL),
+	)
+
+	// Single structured line summarising the security-relevant runtime
+	// posture. Lets oncall grep one log event per pod start to audit
+	// which safety nets are active, without exposing secrets. Booleans
+	// are logged as-is; set-ness of sensitive values is reported as a
+	// bool (never the value itself).
+	logger.Info("startup_config",
+		zap.Bool("prod_mode", cfg.ProdMode),
+		zap.Bool("pkce_required", cfg.PKCERequired),
+		zap.Bool("redis_required", cfg.RedisRequired),
+		zap.Bool("rate_limit_enabled", cfg.RateLimitEnabled),
+		zap.Bool("trust_proxy_headers", cfg.TrustProxyHeaders),
+		zap.Bool("compat_allow_stateless", cfg.CompatAllowStateless),
+		zap.Int64("per_subject_concurrency", cfg.PerSubjectConcurrency),
+		zap.String("groups_claim", cfg.GroupsClaim),
+		zap.Bool("allowed_groups_set", len(cfg.AllowedGroups) > 0),
+		zap.Bool("revoke_before_set", !cfg.RevokeBefore.IsZero()),
+		zap.Bool("upstream_authorization_set", cfg.UpstreamAuthorization != ""),
 	)
 
 	// Surface low-entropy secrets as a startup warning so operators notice
