@@ -710,6 +710,120 @@ func TestLoad_ProxyBaseURL_RejectsOpaqueOrQuery(t *testing.T) {
 	}
 }
 
+// TestLoad_UpstreamMCPURL_Validation covers the P1b strict validator:
+// same shape rules as PROXY_BASE_URL except a path prefix is allowed
+// (the upstream may live at /api or /mcp).
+func TestLoad_UpstreamMCPURL_Validation(t *testing.T) {
+	cases := []struct {
+		url string
+		ok  bool
+	}{
+		{"http://mcp-backend:8080", true},
+		{"http://mcp-backend:8080/api", true},
+		{"https://mcp.internal.example/mcp", true},
+		{"ftp://mcp-backend", false},
+		{"http:foo", false},             // opaque
+		{"http:///api", false},          // hostless
+		{"https://backend?x=1", false},  // query
+		{"https://u:p@backend", false},  // userinfo
+		{"https://backend#frag", false}, // fragment
+	}
+	for _, tc := range cases {
+		t.Run(tc.url, func(t *testing.T) {
+			setAllRequired(t)
+			t.Setenv("UPSTREAM_MCP_URL", tc.url)
+			_, err := Load()
+			if tc.ok && err != nil {
+				t.Fatalf("UPSTREAM_MCP_URL=%q should be accepted: %v", tc.url, err)
+			}
+			if !tc.ok && err == nil {
+				t.Fatalf("UPSTREAM_MCP_URL=%q should be rejected", tc.url)
+			}
+		})
+	}
+}
+
+// TestLoad_ProdMode_BlocksUnsafeFlags covers P1a: PROD_MODE=true must
+// fail startup when any compatibility flag that relaxes a security
+// control is set. Each violation is tested independently so the
+// error message clearly names which one tripped the gate.
+func TestLoad_ProdMode_BlocksUnsafeFlags(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(t *testing.T)
+	}{
+		{"pkce_disabled", func(t *testing.T) { t.Setenv("PKCE_REQUIRED", "false") }},
+		{"compat_stateless", func(t *testing.T) { t.Setenv("COMPAT_ALLOW_STATELESS", "true") }},
+		{"redis_not_required", func(t *testing.T) { t.Setenv("REDIS_REQUIRED", "false") }},
+		{"redis_url_unset", func(t *testing.T) {
+			// REDIS_URL is empty by default; just ensure we don't set it.
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setAllRequired(t)
+			t.Setenv("PROD_MODE", "true")
+			tc.setup(t)
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("PROD_MODE=true with %s should fail startup", tc.name)
+			}
+			if !strings.Contains(err.Error(), "PROD_MODE") {
+				t.Errorf("error should mention PROD_MODE, got %q", err)
+			}
+		})
+	}
+}
+
+// TestLoad_ProdMode_PassesWithSafeDefaults ensures PROD_MODE=true does
+// NOT fail when every safety flag is in its default (secure) state
+// and REDIS_URL is configured.
+func TestLoad_ProdMode_PassesWithSafeDefaults(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("PROD_MODE", "true")
+	t.Setenv("REDIS_URL", "redis://localhost:6379/0")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("PROD_MODE with safe defaults should pass: %v", err)
+	}
+	if !cfg.ProdMode {
+		t.Error("ProdMode should be true after PROD_MODE=true")
+	}
+}
+
+// TestLoad_TrustedProxyCIDRs covers P1c: parse a comma-separated CIDR
+// list, reject typos, take precedence over the legacy bool.
+func TestLoad_TrustedProxyCIDRs(t *testing.T) {
+	t.Run("parses_multiple", func(t *testing.T) {
+		setAllRequired(t)
+		t.Setenv("TRUSTED_PROXY_CIDRS", "10.0.0.0/8, 172.16.0.0/12 ,192.168.0.0/16")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if len(cfg.TrustedProxyCIDRs) != 3 {
+			t.Errorf("want 3 CIDRs, got %d", len(cfg.TrustedProxyCIDRs))
+		}
+	})
+	t.Run("rejects_typo", func(t *testing.T) {
+		setAllRequired(t)
+		t.Setenv("TRUSTED_PROXY_CIDRS", "10.0.0.0/80")
+		if _, err := Load(); err == nil {
+			t.Fatal("invalid CIDR should fail startup")
+		}
+	})
+	t.Run("unset_empty", func(t *testing.T) {
+		setAllRequired(t)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.TrustedProxyCIDRs != nil {
+			t.Errorf("unset should yield nil, got %v", cfg.TrustedProxyCIDRs)
+		}
+	})
+}
+
 // TestLoad_UpstreamAuthorizationHeader covers the
 // UPSTREAM_AUTHORIZATION_HEADER feature: operator supplies the full
 // header value (scheme + credentials); Config captures it verbatim.

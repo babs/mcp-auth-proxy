@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -195,13 +196,32 @@ func main() {
 	r.Use(chimw.Recoverer)
 
 	// Per-IP rate limits. By default the limiter keys on the stripped
-	// r.RemoteAddr (httprate.KeyByIP) so a client behind an untrusted frontend
-	// cannot spoof X-Forwarded-For / X-Real-IP / True-Client-IP to mint its
-	// own bucket. Opt in via TRUST_PROXY_HEADERS=true when the proxy sits
-	// behind a trusted L4/L7 that already sanitizes those headers.
+	// r.RemoteAddr (httprate.KeyByIP) so a client behind an untrusted
+	// frontend cannot spoof XFF/X-Real-IP/True-Client-IP to mint its
+	// own bucket.
+	//
+	// TRUSTED_PROXY_CIDRS (preferred): honor forwarded headers only
+	// when the immediate peer is inside one of the listed networks.
+	// Everything else falls back to RemoteAddr. This is the strict
+	// posture — a client reaching the pod directly (bypassing the
+	// ingress controller) cannot spoof a rate-limit key.
+	// TRUST_PROXY_HEADERS (legacy, insecure): blanket trust of every
+	// peer's forwarded headers. Kept for backward compatibility but
+	// CIDR-scoped trust supersedes it whenever both are set.
 	ipKeyFunc := httprate.KeyByIP
-	if cfg.TrustProxyHeaders {
+	switch {
+	case len(cfg.TrustedProxyCIDRs) > 0:
+		ipKeyFunc = cidrAwareKey(cfg.TrustedProxyCIDRs)
+		if cfg.TrustProxyHeaders {
+			logger.Warn("trust_proxy_headers_superseded_by_cidrs",
+				zap.String("hint", "TRUST_PROXY_HEADERS is ignored when TRUSTED_PROXY_CIDRS is set"),
+			)
+		}
+	case cfg.TrustProxyHeaders:
 		ipKeyFunc = httprate.KeyByRealIP
+		logger.Warn("trust_proxy_headers_deprecated",
+			zap.String("hint", "migrate to TRUSTED_PROXY_CIDRS; TRUST_PROXY_HEADERS trusts every peer"),
+		)
 	}
 	registerLimit := passthrough
 	authorizeLimit := passthrough
@@ -411,6 +431,33 @@ func mustLogger(level string) *zap.Logger {
 // passthrough is a no-op middleware used when rate limiting is disabled,
 // so the router composition is identical in both modes.
 func passthrough(next http.Handler) http.Handler { return next }
+
+// cidrAwareKey returns an httprate.KeyFunc that honors forwarded
+// headers (httprate.KeyByRealIP) only when r.RemoteAddr falls inside
+// one of the configured trusted-proxy networks. Everything else
+// falls back to the raw RemoteAddr, which prevents a direct-to-pod
+// client from spoofing a rate-limit key via X-Forwarded-For.
+//
+// Kept in main.go — not a package concern; parsing of the CIDR list
+// lives in config.Load and the wiring is trivially one place.
+func cidrAwareKey(cidrs []*net.IPNet) httprate.KeyFunc {
+	return func(r *http.Request) (string, error) {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			host = r.RemoteAddr
+		}
+		ip := net.ParseIP(host)
+		if ip == nil {
+			return httprate.KeyByIP(r)
+		}
+		for _, c := range cidrs {
+			if c.Contains(ip) {
+				return httprate.KeyByRealIP(r)
+			}
+		}
+		return httprate.KeyByIP(r)
+	}
+}
 
 // rateLimiter builds an httprate middleware that emits a JSON OAuth error on
 // throttle and increments mcp_auth_rate_limited_total so operators can alert

@@ -44,20 +44,37 @@ type Config struct {
 	// extraction into access logs. 0 disables buffering entirely (no method
 	// logging). Default 65536 (64 KiB).
 	MCPLogBodyMax int64 // env: MCP_LOG_BODY_MAX
-	// TrustProxyHeaders controls whether X-Forwarded-For / X-Real-IP /
-	// True-Client-IP are honored when keying the rate limiter. Default false —
-	// the limiter keys on the stripped r.RemoteAddr so a client behind an
-	// untrusted frontend cannot spoof a header to evade the bucket. Flip to
-	// true only when the proxy runs behind a trusted L4/L7 load balancer that
-	// already sanitizes these headers (otherwise every request trivially picks
-	// its own rate-limit key). env: TRUST_PROXY_HEADERS.
+	// TrustProxyHeaders is the legacy "trust every peer's XFF" switch.
+	// Kept for backward compatibility; prefer TrustedProxyCIDRs in new
+	// deployments. When true AND TrustedProxyCIDRs is empty, every
+	// inbound request is treated as if it came from a trusted proxy —
+	// which is correct only if the pod literally cannot be reached
+	// except through one. env: TRUST_PROXY_HEADERS.
 	TrustProxyHeaders bool
+	// TrustedProxyCIDRs scopes the XFF/X-Real-IP/True-Client-IP trust
+	// to peers whose immediate RemoteAddr falls inside one of the
+	// listed networks. Typical value for a k8s deployment:
+	// "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16" (RFC1918) or the
+	// specific pod-CIDR of the ingress controller. When this is set
+	// it takes precedence over TRUST_PROXY_HEADERS. env:
+	// TRUSTED_PROXY_CIDRS (comma-separated list of CIDRs).
+	TrustedProxyCIDRs []*net.IPNet
 	// PerSubjectConcurrency caps the number of in-flight requests per
 	// authenticated subject on the MCP route group. Default 16. A single
 	// runaway or compromised client identity cannot saturate the proxy's
 	// goroutine / upstream pool at the expense of others. env:
 	// MCP_PER_SUBJECT_CONCURRENCY (0 disables the limit).
 	PerSubjectConcurrency int64
+	// ProdMode, when true, fails startup if any compatibility flag
+	// that weakens a security control is set (PKCE_REQUIRED=false,
+	// COMPAT_ALLOW_STATELESS=true, REDIS_REQUIRED=false, or REDIS_URL
+	// empty). Default false to keep the dev flow — which often sets
+	// one or more of those — working without ceremony. Enable
+	// PROD_MODE=true in production pod manifests so a paste-error
+	// from a dev config turns into a visible crash instead of a
+	// silent security regression.
+	// env: PROD_MODE.
+	ProdMode bool
 	// UpstreamAuthorization, when non-empty, is set verbatim as the
 	// Authorization header on every request forwarded to the upstream
 	// MCP backend. Full header value including the scheme, e.g.
@@ -114,6 +131,8 @@ func Load() (*Config, error) {
 	c.UpstreamMCPURL = os.Getenv("UPSTREAM_MCP_URL")
 	if c.UpstreamMCPURL == "" {
 		missing = append(missing, "UPSTREAM_MCP_URL")
+	} else if err := validateUpstreamMCPURL(c.UpstreamMCPURL); err != nil {
+		return nil, err
 	}
 
 	secret := os.Getenv("TOKEN_SIGNING_SECRET")
@@ -215,6 +234,26 @@ func Load() (*Config, error) {
 	// untrusted frontend lets any client mint its own rate-limit bucket key.
 	c.TrustProxyHeaders = strings.ToLower(os.Getenv("TRUST_PROXY_HEADERS")) == "true"
 
+	// TRUSTED_PROXY_CIDRS: comma-separated CIDR list of peers whose
+	// forwarding headers may be trusted. Takes precedence over the
+	// legacy TRUST_PROXY_HEADERS bool. Parsing failure is fatal so a
+	// typo ("10.0.0.0/80") does not silently disable header-based
+	// keying (which would then fall back to the less-discerning
+	// default).
+	if raw := os.Getenv("TRUSTED_PROXY_CIDRS"); raw != "" {
+		for _, s := range strings.Split(raw, ",") {
+			s = strings.TrimSpace(s)
+			if s == "" {
+				continue
+			}
+			_, n, err := net.ParseCIDR(s)
+			if err != nil {
+				return nil, fmt.Errorf("TRUSTED_PROXY_CIDRS contains invalid CIDR %q: %w", s, err)
+			}
+			c.TrustedProxyCIDRs = append(c.TrustedProxyCIDRs, n)
+		}
+	}
+
 	c.UpstreamAuthorization = os.Getenv("UPSTREAM_AUTHORIZATION_HEADER")
 
 	c.PerSubjectConcurrency = 16
@@ -224,6 +263,34 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("MCP_PER_SUBJECT_CONCURRENCY must be a non-negative integer, got %q", v)
 		}
 		c.PerSubjectConcurrency = n
+	}
+
+	c.ProdMode = strings.ToLower(os.Getenv("PROD_MODE")) == "true"
+
+	// PROD_MODE fails closed on every compatibility flag that relaxes
+	// a security control. None of these flags are exploitable when
+	// used intentionally (dev, legacy clients, stateless dev
+	// replicas), but leaving them set in a production pod is usually
+	// a paste-error from a dev config. Failing startup turns a quiet
+	// misconfiguration into a loud crash — the whole point of a
+	// hardened-mode gate.
+	if c.ProdMode {
+		var violations []string
+		if !c.PKCERequired {
+			violations = append(violations, "PKCE_REQUIRED=false (PKCE downgrade risk)")
+		}
+		if c.CompatAllowStateless {
+			violations = append(violations, "COMPAT_ALLOW_STATELESS=true (hides client-side CSRF bugs)")
+		}
+		if !c.RedisRequired {
+			violations = append(violations, "REDIS_REQUIRED=false (authorization codes + refresh tokens become replayable within TTL)")
+		}
+		if c.RedisURL == "" {
+			violations = append(violations, "REDIS_URL unset (no replay store → no single-use codes, no refresh-rotation reuse detection)")
+		}
+		if len(violations) > 0 {
+			return nil, fmt.Errorf("PROD_MODE=true rejects unsafe settings: %s", strings.Join(violations, "; "))
+		}
 	}
 
 	return c, nil
@@ -297,6 +364,38 @@ func validateOIDCIssuerURL(raw string) error {
 	default:
 		return fmt.Errorf("OIDC_ISSUER_URL must use https:// (or http:// to a loopback host), got scheme %q", u.Scheme)
 	}
+}
+
+// validateUpstreamMCPURL enforces the same shape rules as
+// validateProxyBaseURL for the upstream MCP target — absolute URL
+// with a real authority, http(s) scheme, no userinfo/fragment/query,
+// no opaque form. Unlike PROXY_BASE_URL this one may carry a path
+// prefix (the upstream can live at /api etc.), so the path check is
+// permissive.
+func validateUpstreamMCPURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("UPSTREAM_MCP_URL is not a valid URL: %w", err)
+	}
+	if u.Opaque != "" || u.Host == "" {
+		return fmt.Errorf("UPSTREAM_MCP_URL must be an absolute URL with a host, got %q", raw)
+	}
+	switch u.Scheme {
+	case "http", "https":
+		// both ok — operator picks in-cluster transport
+	default:
+		return fmt.Errorf("UPSTREAM_MCP_URL must use http:// or https://, got scheme %q", u.Scheme)
+	}
+	if u.User != nil {
+		return fmt.Errorf("UPSTREAM_MCP_URL must not contain userinfo")
+	}
+	if u.Fragment != "" || u.RawFragment != "" {
+		return fmt.Errorf("UPSTREAM_MCP_URL must not contain a fragment")
+	}
+	if u.RawQuery != "" || u.ForceQuery {
+		return fmt.Errorf("UPSTREAM_MCP_URL must not contain a query string")
+	}
+	return nil
 }
 
 // validateProxyBaseURL enforces the invariants downstream code relies on:
