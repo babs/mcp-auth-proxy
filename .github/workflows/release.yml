@@ -32,7 +32,7 @@ jobs:
     outputs:
       RAW_IMG_TAGS: ${{ steps.define-targets.outputs.RAW_IMG_TAGS }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Define TARGETS
         id: define-targets
         run: |
@@ -81,17 +81,18 @@ jobs:
           echo "COMMIT_HASH=${COMMIT_HASH}${DIRTY}" | tee -a $GITHUB_OUTPUT >>$GITHUB_ENV
           echo "BUILD_TIMESTAMP=${BUILD_TIMESTAMP}" | tee -a $GITHUB_OUTPUT >>$GITHUB_ENV
 
-      - uses: docker/setup-buildx-action@v3.10.0
+      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3.4.0
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push
-        uses: docker/build-push-action@v6.15.0
+        id: build-and-push
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
           context: .
           build-args: |
@@ -107,8 +108,28 @@ jobs:
           push: true
           tags: ${{ env.TARGETS }}
           platforms: ${{ matrix.platform }}
-          provenance: false
-          sbom: false
+          # Enable supply-chain attestations: SLSA provenance + SBOM
+          # embedded in the OCI image index. Consumers can verify with
+          # `docker buildx imagetools inspect <image> --format '{{json
+          # .Provenance}}'` and `cosign download sbom`.
+          provenance: mode=max
+          sbom: true
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
+
+      - name: Sign published image (keyless, Fulcio+Rekor)
+        env:
+          # All tags in $TARGETS point at the same content digest from
+          # this build step, so one signature per digest covers every
+          # tag. Keyless: Fulcio mints a short-lived cert from the
+          # GitHub Actions OIDC token; Rekor records the signature in
+          # the public transparency log.
+          DIGEST: ${{ steps.build-and-push.outputs.digest }}
+        run: |
+          for REPO in $REPOS; do
+            cosign sign --yes "${REPO}@${DIGEST}"
+          done
 
       - name: Summary
         run: |
@@ -123,14 +144,17 @@ jobs:
     runs-on: ubuntu-latest
     # contents:write is required to create the GitHub Release below.
     # packages:write lets docker manifest push into GHCR.
+    # id-token:write is required for cosign keyless signing of the
+    # merged multi-arch index (Fulcio needs the OIDC token).
     permissions:
       contents: write
       packages: write
+      id-token: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3.4.0
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -152,6 +176,28 @@ jobs:
               docker manifest push $TGT
 
               echo "merged image $TGT" | tee -a $GITHUB_STEP_SUMMARY
+            done
+          done
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
+
+      - name: Sign merged multi-arch index
+        # build-image signs the per-platform digests; this step signs
+        # the multi-arch INDEX digest that consumers pull by tag. Without
+        # this, `cosign verify $REPO:$TAG` fails even though the children
+        # are signed, because cosign looks up signatures on the tag's
+        # manifest digest (the index) first.
+        run: |
+          for IMG_TAG in ${{ needs.build-image.outputs.RAW_IMG_TAGS }}; do
+            for REPO in $REPOS; do
+              TGT=${REPO}:${IMG_TAG}
+              # docker buildx imagetools reads the index digest straight
+              # from the registry; more robust than parsing `docker
+              # manifest push` stdout across CLI versions.
+              DIGEST=$(docker buildx imagetools inspect "$TGT" --format '{{.Manifest.Digest}}')
+              cosign sign --yes "${REPO}@${DIGEST}"
+              echo "signed index $TGT @ $DIGEST" | tee -a $GITHUB_STEP_SUMMARY
             done
           done
 

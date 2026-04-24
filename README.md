@@ -321,6 +321,40 @@ bearer-protected proxy in one go.
 
 ---
 
+## Verifying published images
+
+Tagged releases are built by [`release.yml`](./.github/workflows/release.yml) with:
+
+- **SLSA provenance** (`mode=max`) and **SBOM** attestations embedded in the OCI image index
+- **Keyless cosign signatures** over both the per-platform image digests and the merged multi-arch index digest, using a short-lived Fulcio certificate minted from the GitHub Actions OIDC token and anchored in the Rekor transparency log
+
+To verify a signature before pulling:
+
+```bash
+cosign verify \
+  --certificate-identity-regexp '^https://github\.com/babs/mcp-auth-proxy/\.github/workflows/release\.yml@refs/tags/v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/babs/mcp-auth-proxy:v1.0.0
+```
+
+The regex binds the signature to *this repo's release workflow* on a version tag; both identity and issuer must match or verification fails.
+
+Inspect provenance and SBOM:
+
+```bash
+# SLSA provenance (buildinfo, source revision, builder identity)
+docker buildx imagetools inspect ghcr.io/babs/mcp-auth-proxy:v1.0.0 \
+  --format '{{json .Provenance}}' | jq
+
+# SBOM (Software Bill of Materials, SPDX format)
+docker buildx imagetools inspect ghcr.io/babs/mcp-auth-proxy:v1.0.0 \
+  --format '{{json .SBOM}}' | jq
+```
+
+A policy controller (Kyverno, cosigned, Sigstore policy-controller) can enforce these checks on every pull in a cluster — see each tool's docs for the exact policy syntax.
+
+---
+
 ## License
 
 Apache License 2.0 — see [`LICENSE`](./LICENSE) and [`NOTICE`](./NOTICE).
