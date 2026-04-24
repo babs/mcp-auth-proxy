@@ -161,20 +161,20 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Merge images
+        # docker buildx imagetools (vs the classic docker manifest CLI)
+        # is required because per-platform builds with provenance/sbom
+        # attestations push an OCI index (image + attestations) rather
+        # than a plain image. `docker manifest create` rejects indexes
+        # with "is a manifest list"; imagetools handles them and
+        # preserves the per-platform attestations in the merged index.
         run: |
           for IMG_TAG in ${{ needs.build-image.outputs.RAW_IMG_TAGS }}; do
             for REPO in $REPOS; do
               TGT=${REPO}:${IMG_TAG}
-
-              docker manifest create $TGT \
-                $TGT-linux-amd64 \
-                $TGT-linux-arm64
-
-              docker manifest annotate $TGT $TGT-linux-amd64 --os linux --arch amd64
-              docker manifest annotate $TGT $TGT-linux-arm64 --os linux --arch arm64
-
-              docker manifest push $TGT
-
+              docker buildx imagetools create \
+                -t "$TGT" \
+                "$TGT-linux-amd64" \
+                "$TGT-linux-arm64"
               echo "merged image $TGT" | tee -a $GITHUB_STEP_SUMMARY
             done
           done
