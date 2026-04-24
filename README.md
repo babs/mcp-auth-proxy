@@ -328,13 +328,15 @@ Tagged releases are built by [`release.yml`](./.github/workflows/release.yml) wi
 - **SLSA provenance** (`mode=max`) and **SBOM** attestations embedded in the OCI image index
 - **Keyless cosign signatures** over both the per-platform image digests and the merged multi-arch index digest, using a short-lived Fulcio certificate minted from the GitHub Actions OIDC token and anchored in the Rekor transparency log
 
+Note the image tag convention: published tags strip the `v` prefix (`ghcr.io/babs/mcp-auth-proxy:1.0.0`), while the git tag itself is `v1.0.0`. The identity regex below matches the git tag (`refs/tags/v…`); the image reference uses the stripped form.
+
 To verify a signature before pulling:
 
 ```bash
 cosign verify \
   --certificate-identity-regexp '^https://github\.com/babs/mcp-auth-proxy/\.github/workflows/release\.yml@refs/tags/v' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ghcr.io/babs/mcp-auth-proxy:v1.0.0
+  ghcr.io/babs/mcp-auth-proxy:1.0.0
 ```
 
 The regex binds the signature to *this repo's release workflow* on a version tag; both identity and issuer must match or verification fails.
@@ -343,11 +345,11 @@ Inspect provenance and SBOM:
 
 ```bash
 # SLSA provenance (buildinfo, source revision, builder identity)
-docker buildx imagetools inspect ghcr.io/babs/mcp-auth-proxy:v1.0.0 \
+docker buildx imagetools inspect ghcr.io/babs/mcp-auth-proxy:1.0.0 \
   --format '{{json .Provenance}}' | jq
 
 # SBOM (Software Bill of Materials, SPDX format)
-docker buildx imagetools inspect ghcr.io/babs/mcp-auth-proxy:v1.0.0 \
+docker buildx imagetools inspect ghcr.io/babs/mcp-auth-proxy:1.0.0 \
   --format '{{json .SBOM}}' | jq
 ```
 
