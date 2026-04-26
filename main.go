@@ -238,7 +238,7 @@ func main() {
 		})
 	})
 	r.Use(chimw.RequestID)
-	r.Use(zapMiddleware(logger, cfg.AccessLogSkipRE, buildRPCMetricsObserver(cfg)))
+	r.Use(zapMiddleware(logger, cfg.AccessLogSkipRE, buildRPCMetrics(cfg, logger)))
 	r.Use(chimw.Recoverer)
 
 	// Per-IP rate limits. By default the limiter keys on the stripped
@@ -582,39 +582,76 @@ func accessLogSkipPattern(re *regexp.Regexp) string {
 	return re.String()
 }
 
-// rpcMetricsObserver is the per-request hook that records the four
-// per-tool counters. nil when MCP_TOOL_METRICS is disabled — keeps the
-// hot path branch-only when the operator hasn't opted in.
-type rpcMetricsObserver func(tool string, status int, reqBytes int64, respBytes int)
+// rpcMetrics bundles the per-request hooks that record both the
+// per-tool counter family and the disjoint batch-shape family. nil
+// when MCP_TOOL_METRICS is disabled — keeps the hot path branch-only
+// when the operator hasn't opted in. Bundling the two callbacks lets
+// the test layer intercept both axes through one wiring point.
+type rpcMetrics struct {
+	perTool func(tool string, status int, reqBytes int64, respBytes int)
+	batch   func(status int, reqBytes int64, respBytes int)
+}
 
-// buildRPCMetricsObserver returns the per-tool metrics callback when
-// MCP_TOOL_METRICS=true and nil otherwise. The callback closes over a
-// single ToolCardinality instance so the cap state is shared across
-// every request. Counters are independent CounterVecs keyed on the
-// resolved (capped + sanitized) tool label.
-func buildRPCMetricsObserver(cfg *config.Config) rpcMetricsObserver {
+// buildRPCMetrics returns the rpc-metrics callbacks when
+// MCP_TOOL_METRICS=true and nil otherwise. The per-tool closure
+// closes over a single ToolCardinality instance so the cap state is
+// shared across every request. The batch closure has no cardinality
+// guard — it has no labels.
+func buildRPCMetrics(cfg *config.Config, logger *zap.Logger) *rpcMetrics {
 	if !cfg.ToolMetricsEnabled {
 		return nil
 	}
 	card := &metrics.ToolCardinality{MaxCardinality: cfg.ToolMetricsMaxCardinality}
-	return func(tool string, status int, reqBytes int64, respBytes int) {
-		label := card.ToolLabel(tool)
-		metrics.RPCCalls.WithLabelValues(label).Inc()
-		if status >= 400 {
-			metrics.RPCCallsFailed.WithLabelValues(label).Inc()
+	// Defense in depth: a panic in metrics.WithLabelValues / .Inc /
+	// .Add is not expected (Prometheus stdlib is robust for valid
+	// label-arity calls), but by the time these run the response is
+	// already on the wire — chimw.Recoverer would catch an escaping
+	// panic but cannot rewrite the already-flushed status. Recover
+	// locally and log as Warn so a future metric mis-wiring is
+	// visible in operator logs without taking down in-flight requests.
+	recoverWarn := func(where string, fields ...zap.Field) {
+		if rec := recover(); rec != nil {
+			logger.Warn("rpc_metrics_observer_panicked",
+				append(fields, zap.String("where", where), zap.Any("recovered", rec))...,
+			)
 		}
-		// Content-Length of -1 means chunked / unknown; do not
-		// fabricate a byte count.
-		if reqBytes > 0 {
-			metrics.RPCRequestBytes.WithLabelValues(label).Add(float64(reqBytes))
-		}
-		if respBytes > 0 {
-			metrics.RPCResponseBytes.WithLabelValues(label).Add(float64(respBytes))
-		}
+	}
+	return &rpcMetrics{
+		perTool: func(tool string, status int, reqBytes int64, respBytes int) {
+			defer recoverWarn("perTool", zap.String("tool", tool), zap.Int("status", status))
+			label := card.ToolLabel(tool)
+			metrics.RPCCalls.WithLabelValues(label).Inc()
+			if status >= 400 {
+				metrics.RPCCallsFailed.WithLabelValues(label).Inc()
+			}
+			// Skip both chunked (Content-Length == -1) and explicitly-
+			// empty (== 0) bodies: nothing useful to add to the byte
+			// counter and dashboards would otherwise see a true-zero
+			// contribution mixed with the unknown-size signal.
+			if reqBytes > 0 {
+				metrics.RPCRequestBytes.WithLabelValues(label).Add(float64(reqBytes))
+			}
+			if respBytes > 0 {
+				metrics.RPCResponseBytes.WithLabelValues(label).Add(float64(respBytes))
+			}
+		},
+		batch: func(status int, reqBytes int64, respBytes int) {
+			defer recoverWarn("batch", zap.Int("status", status))
+			metrics.RPCBatches.Inc()
+			if status >= 400 {
+				metrics.RPCBatchesFailed.Inc()
+			}
+			if reqBytes > 0 {
+				metrics.RPCBatchBytes.WithLabelValues("request").Add(float64(reqBytes))
+			}
+			if respBytes > 0 {
+				metrics.RPCBatchBytes.WithLabelValues("response").Add(float64(respBytes))
+			}
+		},
 	}
 }
 
-func zapMiddleware(logger *zap.Logger, skipRE *regexp.Regexp, rpcObs rpcMetricsObserver) func(http.Handler) http.Handler {
+func zapMiddleware(logger *zap.Logger, skipRE *regexp.Regexp, rpcObs *rpcMetrics) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Operator-configured path filter. Skip early to avoid the
@@ -669,15 +706,40 @@ func zapMiddleware(logger *zap.Logger, skipRE *regexp.Regexp, rpcObs rpcMetricsO
 			}
 			logger.Info("request", fields...)
 
-			// Per-tool RPC metrics observed AFTER the log line so a panic
-			// in the observer cannot lose the access-log entry. Only fires
-			// for requests that actually exercised the JSON-RPC peek path —
-			// non-RPC traffic (discovery, OAuth endpoints) is filtered out
-			// by the rec.RPCMethod presence check, since the `_unknown`
-			// bucket is reserved for genuine RPC-shaped requests where the
-			// tool name simply did not parse.
-			if rpcObs != nil && rec.RPCMethod != "" {
-				rpcObs(rec.RPCTool, ww.Status(), r.ContentLength, ww.BytesWritten())
+			// RPC metrics observed AFTER the log line so a panic in the
+			// observer cannot lose the access-log entry. Two axes:
+			//
+			//  - per-tool counters (mcp_auth_rpc_calls_total{tool}, …):
+			//    single-call tools/call fires once with extracted tool
+			//    name + actual bytes; a batch fires PER tools/call entry
+			//    with that entry's tool name and 0/0 bytes (no honest
+			//    per-call attribution inside a batch).
+			//  - batch counters (mcp_auth_rpc_batches_total +
+			//    rpc_batch_bytes_total{direction}, no tool label): one
+			//    increment per batch HTTP request that contained at
+			//    least one tools/call entry, carrying the request's
+			//    actual Content-Length / BytesWritten.
+			//
+			// Protocol-level methods (initialize, notifications/*,
+			// tools/list, prompts/*, …) and batches without any
+			// tools/call entry are skipped entirely so the `_unknown`
+			// bucket reliably means "tools/call with malformed
+			// params.name".
+			if rpcObs != nil {
+				if rec.RPCMethod == "tools/call" {
+					rpcObs.perTool(rec.RPCTool, ww.Status(), r.ContentLength, ww.BytesWritten())
+				} else {
+					var hadToolsCall bool
+					for _, call := range rec.RPCBatch {
+						if call.Method == "tools/call" {
+							rpcObs.perTool(call.Tool, ww.Status(), 0, 0)
+							hadToolsCall = true
+						}
+					}
+					if hadToolsCall {
+						rpcObs.batch(ww.Status(), r.ContentLength, ww.BytesWritten())
+					}
+				}
 			}
 		})
 	}

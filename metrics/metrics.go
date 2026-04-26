@@ -35,6 +35,10 @@ const ToolLabelUnknown = "_unknown"
 // burst contention the counter can briefly overshoot MaxCardinality
 // by the number of concurrent goroutines, which is acceptable —
 // the cap is a soft budget, not a security boundary.
+//
+// Memory: the seen-set never shrinks. Bounded above by MaxCardinality
+// strings, so memory growth is trivial (256 entries × ~32 bytes ≈
+// 8 KiB at the default cap) — operator-tunable budget, never a leak.
 type ToolCardinality struct {
 	MaxCardinality int
 	seen           sync.Map // map[string]struct{}
@@ -133,21 +137,43 @@ var (
 	// clients calling non-existent tools cannot inflate the series count.
 	RPCCalls = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "mcp_auth_rpc_calls_total",
-		Help: "MCP JSON-RPC tool invocations seen by the proxy, by tool name. Disabled by default; enable via MCP_TOOL_METRICS=true.",
+		Help: "MCP tools/call invocations seen by the proxy, by tool name. Protocol-level methods (initialize, notifications/*, tools/list, prompts/*, …) do NOT contribute. Batched JSON-RPC requests fan out: each tools/call entry within a batch increments once with its own tool label. Disabled by default; enable via MCP_TOOL_METRICS=true.",
 	}, []string{"tool"})
 
 	RPCCallsFailed = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "mcp_auth_rpc_calls_failed_total",
-		Help: "MCP JSON-RPC invocations that returned a 4xx/5xx response status, by tool name.",
+		Help: "MCP tools/call invocations that returned a 4xx/5xx response status, by tool name.",
 	}, []string{"tool"})
 
 	RPCRequestBytes = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "mcp_auth_rpc_request_bytes_total",
-		Help: "Cumulative request body bytes for MCP JSON-RPC invocations, by tool name. Sourced from Content-Length; chunked / unknown-length requests do not contribute.",
+		Help: "Cumulative request body bytes for single-call MCP tools/call invocations, by tool name. Sourced from Content-Length; chunked / unknown-length / explicitly-empty requests do not contribute. Batches do NOT contribute either: one HTTP request carries N calls with no honest per-call attribution, so byte panels are scoped to single-call mode while rpc_calls_total fans out over batches.",
 	}, []string{"tool"})
 
 	RPCResponseBytes = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "mcp_auth_rpc_response_bytes_total",
-		Help: "Cumulative response body bytes for MCP JSON-RPC invocations, by tool name. Includes SSE / streaming body bytes finalised when the handler returns.",
+		Help: "Cumulative response body bytes for single-call MCP tools/call invocations, by tool name. Includes SSE / streaming body bytes finalised when the handler returns. Batches do not contribute (same per-call attribution gap as the request-bytes counter). Skipped when the wrapper reported zero (early-fail responses with no body).",
 	}, []string{"tool"})
+
+	// Batch-shape observability — disjoint from the per-tool family
+	// above so the `tool` label stays clean and existing dashboards
+	// keep working unchanged. A "batch" here means one JSON-RPC HTTP
+	// request whose body decoded to a top-level array AND contained
+	// at least one `tools/call` entry. Pure-protocol batches
+	// (initialize + notifications + tools/list) do not contribute,
+	// matching the single-call gating semantics for non-tool traffic.
+	RPCBatches = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "mcp_auth_rpc_batches_total",
+		Help: "JSON-RPC batch HTTP requests with at least one tools/call entry. Pair with rpc_calls_total to derive average batch size.",
+	})
+
+	RPCBatchesFailed = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "mcp_auth_rpc_batches_failed_total",
+		Help: "JSON-RPC batch HTTP requests whose response status was >= 400. HTTP-level failure applies to the whole batch; per-call JSON-RPC errors inside a 200 response are not counted here.",
+	})
+
+	RPCBatchBytes = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "mcp_auth_rpc_batch_bytes_total",
+		Help: "Aggregate bytes carried by JSON-RPC batch requests, split by direction. Cannot be split per-tool (no honest per-call attribution inside a batch). request: from Content-Length, skips chunked / unknown / empty. response: from the response wrapper's BytesWritten, skips zero-byte responses.",
+	}, []string{"direction"})
 )
