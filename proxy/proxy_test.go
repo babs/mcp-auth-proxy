@@ -720,3 +720,50 @@ func TestProxy_UpstreamAuthorization_SurvivesRedirect(t *testing.T) {
 		}
 	}
 }
+
+// TestProxy_ForwardsPathVerbatim verifies the proxy does not mangle
+// the URL path on its way to the upstream. Client path == upstream
+// path, regardless of whether UPSTREAM_MCP_URL carries a path
+// component (the router, not the proxy, is responsible for restricting
+// which paths even reach this handler).
+func TestProxy_ForwardsPathVerbatim(t *testing.T) {
+	cases := []struct {
+		name         string
+		upstreamPath string // appended to the test-server URL
+		inPath       string
+	}{
+		{"origin_only_root_mcp", "", "/mcp"},
+		{"origin_only_sub", "", "/mcp/tools/list"},
+		{"origin_only_custom", "", "/anything/at/all"},
+		{"with_path_root", "/api/v1/mcp", "/api/v1/mcp"},
+		{"with_path_sub", "/api/v1/mcp", "/api/v1/mcp/tools/list"},
+		{"with_path_trailing_slash", "/api/v1/mcp", "/api/v1/mcp/"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotPath string
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer upstream.Close()
+
+			handler, err := Handler(upstream.URL+tc.upstreamPath, zap.NewNop(), Config{})
+			if err != nil {
+				t.Fatalf("Handler: %v", err)
+			}
+			req := httptest.NewRequest(http.MethodGet, tc.inPath, nil)
+			ctx := context.WithValue(req.Context(), middleware.ContextSubject, "u")
+			req = req.WithContext(ctx)
+			rr := httptest.NewRecorder()
+			handler.ServeHTTP(rr, req)
+
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", rr.Code)
+			}
+			if gotPath != tc.inPath {
+				t.Errorf("upstream path = %q, want %q (verbatim)", gotPath, tc.inPath)
+			}
+		})
+	}
+}

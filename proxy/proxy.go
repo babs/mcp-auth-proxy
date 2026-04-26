@@ -288,13 +288,10 @@ func Handler(upstreamURL string, logger *zap.Logger, cfg Config) (http.Handler, 
 			pr.Out.URL.Scheme = target.Scheme
 			pr.Out.URL.Host = target.Host
 			pr.Out.Host = target.Host
-			// The client-side request path is forwarded verbatim to the
-			// upstream origin — UPSTREAM_MCP_URL is origin-only
-			// (enforced by config.validateUpstreamMCPURL). No path
-			// join, no strip: client and upstream share the same
-			// path space. Operators that need path rewriting put an
-			// Ingress/sidecar in front of the upstream.
-			// pr.Out.URL.Path is left unchanged.
+			// Path is forwarded verbatim: the router ensures the inbound
+			// path sits under the UPSTREAM_MCP_URL mount (path on
+			// upstream ≡ path on proxy). The upstream and the client
+			// see the same URL path.
 
 			// Strip forwarding and caller-supplied identity headers before
 			// injecting the proxy-owned values from the validated auth context.

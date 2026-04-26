@@ -290,8 +290,8 @@ func TestRegister_RejectsTooManyRedirectURIs(t *testing.T) {
 	}
 	var oe OAuthError
 	_ = json.NewDecoder(rr.Body).Decode(&oe)
-	if oe.Error != "invalid_request" {
-		t.Errorf("M5 count cap: expected invalid_request, got %q", oe.Error)
+	if oe.Error != "invalid_redirect_uri" {
+		t.Errorf("M5 count cap: expected invalid_redirect_uri, got %q", oe.Error)
 	}
 }
 
@@ -311,8 +311,29 @@ func TestRegister_RejectsOversizeRedirectURI(t *testing.T) {
 	}
 	var oe OAuthError
 	_ = json.NewDecoder(rr.Body).Decode(&oe)
-	if oe.Error != "invalid_request" {
-		t.Errorf("M5 length cap: expected invalid_request, got %q", oe.Error)
+	if oe.Error != "invalid_redirect_uri" {
+		t.Errorf("M5 length cap: expected invalid_redirect_uri, got %q", oe.Error)
+	}
+}
+
+func TestRegister_RejectsOversizeClientName(t *testing.T) {
+	tm := newTestTokenManager(t)
+	body, _ := json.Marshal(map[string]any{
+		"redirect_uris": []string{"https://app.example.com/cb"},
+		"client_name":   strings.Repeat("x", maxClientNameLength+1),
+	})
+	req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	Register(tm, zap.NewNop(), testBaseURL)(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("client_name cap: expected 400, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var oe OAuthError
+	_ = json.NewDecoder(rr.Body).Decode(&oe)
+	if oe.Error != "invalid_client_metadata" {
+		t.Errorf("client_name cap: expected invalid_client_metadata, got %q", oe.Error)
 	}
 }
 
@@ -340,8 +361,8 @@ func TestRegister_RejectsFragmentAndUserinfo(t *testing.T) {
 			}
 			var oe OAuthError
 			_ = json.NewDecoder(rr.Body).Decode(&oe)
-			if oe.Error != "invalid_request" {
-				t.Errorf("M6 %s: expected invalid_request, got %q", tc.name, oe.Error)
+			if oe.Error != "invalid_redirect_uri" {
+				t.Errorf("M6 %s: expected invalid_redirect_uri, got %q", tc.name, oe.Error)
 			}
 		})
 	}

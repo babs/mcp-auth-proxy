@@ -20,12 +20,12 @@ data:
   # Must match the hostname in your Ingress TLS cert.
   PROXY_BASE_URL: ""
 
-  # TODO: fill in — origin of the upstream MCP server (scheme + host
-  # + port, no path; e.g. http://mcp-server:8000). Proxy forwards the
-  # client /mcp path verbatim. If the upstream mounts MCP elsewhere
-  # (/api/v1/mcp, /sse, …) add a rewrite layer (Ingress, sidecar) in
-  # front and point this URL at the rewrite layer.
-  # Path, query, fragment, userinfo rejected at startup.
+  # TODO: fill in — upstream MCP URL. Path is mandatory and is used
+  # verbatim as both the proxy's public mount AND the path forwarded
+  # upstream. Example: http://mcp-server:8000/mcp (proxy exposes /mcp,
+  # upstream serves /mcp), or http://mcp-server:8000/api/v1/mcp.
+  # Query, fragment, userinfo, and origin-only URLs are rejected at
+  # startup.
   UPSTREAM_MCP_URL: ""
 
   # Redis replay store.
@@ -56,3 +56,12 @@ data:
   # ALLOWED_GROUPS: "admin,mcp-users"   # uncomment to restrict access
   # REVOKE_BEFORE: ""                    # RFC3339 bulk-revocation cutoff
   COMPAT_ALLOW_STATELESS: "false"
+  # Access-log path filter (public listener only). Go RE2 regexp matched
+  # against r.URL.Path; matches are dropped from the access log. Handler
+  # response, Prometheus counters, and panic recovery are unaffected.
+  # Invalid pattern fails startup. /readyz and /metrics live on
+  # METRICS_ADDR and do not reach this middleware. ALWAYS anchor with
+  # ^…$ — unanchored "healthz" also matches /mcp/healthz-tool, and
+  # ".*" silences the entire access log. Uncomment to silence
+  # liveness-probe noise on /healthz.
+  # ACCESS_LOG_SKIP_RE: "^/healthz$"

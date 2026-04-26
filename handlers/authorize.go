@@ -17,6 +17,7 @@ const sessionTTL = 10 * time.Minute
 // AuthorizeConfig holds optional relaxation flags for /authorize.
 type AuthorizeConfig struct {
 	PKCERequired bool // false = allow clients that omit code_challenge (Cursor, MCP Inspector)
+	ResourceURIs []string
 	// CompatAllowStateless keeps the legacy behavior of synthesizing a
 	// server-side state when the client omits it. Default false — strict
 	// mode refuses (400 invalid_request) so a client-side CSRF bug cannot
@@ -30,6 +31,16 @@ type AuthorizeConfig struct {
 func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg *oauth2.Config, authzCfg AuthorizeConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
+		if rejectRepeatedParams(w, q,
+			"response_type",
+			"client_id",
+			"redirect_uri",
+			"code_challenge",
+			"code_challenge_method",
+			"state",
+		) {
+			return
+		}
 
 		responseType := q.Get("response_type")
 		clientIDStr := q.Get("client_id")
@@ -74,10 +85,14 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 			return
 		}
 
-		// OAuth 2.1 requires exact match — no prefix/subdomain matching
+		// OAuth 2.1 §2.3.1 requires exact match (no prefix/subdomain).
+		// RFC 8252 §7.3 relaxes this for loopback redirects: the AS MUST
+		// allow any port so native apps using an ephemeral localhost
+		// port can authenticate without re-registering on every run.
+		// redirectURIMatches implements both.
 		validRedirect := false
 		for _, uri := range client.RedirectURIs {
-			if uri == redirectURI {
+			if redirectURIMatches(redirectURI, uri) {
 				validRedirect = true
 				break
 			}
@@ -100,25 +115,24 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 		// already learn from /.well-known/oauth-authorization-server.
 		if resources, ok := q["resource"]; ok {
 			for _, res := range resources {
-				if !matchResource(res, baseURL) {
+				if !matchAnyResource(res, append([]string{baseURL}, authzCfg.ResourceURIs...)) {
 					writeOAuthError(w, http.StatusBadRequest, "invalid_target", "resource does not identify this authorization server")
 					return
 				}
 			}
 		}
 
-		if authzCfg.PKCERequired {
-			if codeChallenge == "" {
-				writeOAuthError(w, http.StatusBadRequest, "invalid_request", "code_challenge is required")
-				return
-			}
+		if codeChallenge != "" {
 			if codeChallengeMethod != "S256" {
 				writeOAuthError(w, http.StatusBadRequest, "invalid_request", "code_challenge_method must be S256")
 				return
 			}
-		} else if codeChallenge != "" && codeChallengeMethod != "" && codeChallengeMethod != "S256" {
-			// PKCE optional, but if provided must be S256
-			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "code_challenge_method must be S256")
+			if !validPKCEValue(codeChallenge) {
+				writeOAuthError(w, http.StatusBadRequest, "invalid_request", "code_challenge must be 43-128 unreserved characters")
+				return
+			}
+		} else if authzCfg.PKCERequired {
+			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "code_challenge is required")
 			return
 		}
 

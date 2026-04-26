@@ -5,17 +5,29 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 )
 
 type Config struct {
-	OIDCIssuerURL      string
-	OIDCClientID       string
-	OIDCClientSecret   string
-	ProxyBaseURL       string
-	UpstreamMCPURL     string
+	OIDCIssuerURL    string
+	OIDCClientID     string
+	OIDCClientSecret string
+	ProxyBaseURL     string
+	UpstreamMCPURL   string
+	// UpstreamMCPMountPath is the path component extracted from
+	// UPSTREAM_MCP_URL. It is always non-empty (the validator rejects
+	// origin-only URLs) and is used as both the public mount on this
+	// proxy and — verbatim — as the path forwarded upstream.
+	UpstreamMCPMountPath string
+	// ResourceName is an optional human-readable name for this
+	// protected resource. When non-empty it's advertised under
+	// "resource_name" in the RFC 9728 PRM (§2 — OPTIONAL field).
+	// Clients use it for UI display (e.g. consent prompts that list
+	// the resource by name). env: MCP_RESOURCE_NAME.
+	ResourceName       string
 	ListenAddr         string
 	MetricsAddr        string
 	TokenSigningSecret []byte
@@ -52,6 +64,15 @@ type Config struct {
 	// extraction into access logs. 0 disables buffering entirely (no method
 	// logging). Default 65536 (64 KiB).
 	MCPLogBodyMax int64 // env: MCP_LOG_BODY_MAX
+	// AccessLogSkipRE, when non-nil, suppresses access-log lines whose
+	// request path matches. Typical use: quiet liveness-probe noise with
+	// "^/healthz$" (probes on every replica, every periodSeconds, bury
+	// real requests otherwise). Metrics, rate-limit counters, and the
+	// handler response are unaffected — only the zap "request" log line
+	// is skipped. Go regexp is RE2 → linear-time, no ReDoS. Invalid
+	// pattern fails startup. Default nil (log everything).
+	// env: ACCESS_LOG_SKIP_RE.
+	AccessLogSkipRE *regexp.Regexp
 	// TrustProxyHeaders is the legacy "trust every peer's XFF" switch.
 	// Kept for backward compatibility; prefer TrustedProxyCIDRs in new
 	// deployments. When true AND TrustedProxyCIDRs is empty, every
@@ -75,12 +96,15 @@ type Config struct {
 	PerSubjectConcurrency int64
 	// ProdMode, when true, fails startup if any compatibility flag
 	// that weakens a security control is set (PKCE_REQUIRED=false,
-	// COMPAT_ALLOW_STATELESS=true, REDIS_REQUIRED=false, or REDIS_URL
-	// empty). Default false to keep the dev flow — which often sets
-	// one or more of those — working without ceremony. Enable
-	// PROD_MODE=true in production pod manifests so a paste-error
-	// from a dev config turns into a visible crash instead of a
-	// silent security regression.
+	// COMPAT_ALLOW_STATELESS=true, REDIS_REQUIRED=false, REDIS_URL
+	// empty, or legacy TRUST_PROXY_HEADERS=true without
+	// TRUSTED_PROXY_CIDRS).
+	//
+	// Default true — the strict OAuth 2.1 / MCP posture that the
+	// published metadata already advertises, so operators cannot
+	// silently ship a laxer runtime than what clients expect. Set
+	// PROD_MODE=false explicitly for dev / single-replica work that
+	// needs one of the compatibility toggles.
 	// env: PROD_MODE.
 	ProdMode bool
 	// UpstreamAuthorization, when non-empty, is set verbatim as the
@@ -139,8 +163,13 @@ func Load() (*Config, error) {
 	c.UpstreamMCPURL = os.Getenv("UPSTREAM_MCP_URL")
 	if c.UpstreamMCPURL == "" {
 		missing = append(missing, "UPSTREAM_MCP_URL")
-	} else if err := validateUpstreamMCPURL(c.UpstreamMCPURL); err != nil {
-		return nil, err
+	} else {
+		normalized, mount, err := validateUpstreamMCPURL(c.UpstreamMCPURL)
+		if err != nil {
+			return nil, err
+		}
+		c.UpstreamMCPURL = normalized
+		c.UpstreamMCPMountPath = mount
 	}
 
 	secret := os.Getenv("TOKEN_SIGNING_SECRET")
@@ -246,6 +275,8 @@ func Load() (*Config, error) {
 	// state hides a client-side CSRF bug; strict mode refuses the request.
 	c.CompatAllowStateless = strings.ToLower(os.Getenv("COMPAT_ALLOW_STATELESS")) == "true"
 
+	c.ResourceName = os.Getenv("MCP_RESOURCE_NAME")
+
 	c.MCPLogBodyMax = 65536
 	if v := os.Getenv("MCP_LOG_BODY_MAX"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
@@ -253,6 +284,17 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("MCP_LOG_BODY_MAX must be a non-negative integer, got %q", v)
 		}
 		c.MCPLogBodyMax = n
+	}
+
+	// TrimSpace so a stray space or trailing newline (common with .env
+	// loaders / heredocs) is treated as "unset" instead of compiling
+	// into a regex that quietly matches paths containing that whitespace.
+	if v := strings.TrimSpace(os.Getenv("ACCESS_LOG_SKIP_RE")); v != "" {
+		re, err := regexp.Compile(v)
+		if err != nil {
+			return nil, fmt.Errorf("ACCESS_LOG_SKIP_RE is not a valid regexp: %w", err)
+		}
+		c.AccessLogSkipRE = re
 	}
 
 	// TRUST_PROXY_HEADERS defaults to false. Honoring XFF/X-Real-IP behind an
@@ -290,7 +332,9 @@ func Load() (*Config, error) {
 		c.PerSubjectConcurrency = n
 	}
 
-	c.ProdMode = strings.ToLower(os.Getenv("PROD_MODE")) == "true"
+	// Default ON: the strict posture must match the advertised
+	// metadata. Explicit "false" opts out for dev / single-replica.
+	c.ProdMode = strings.ToLower(os.Getenv("PROD_MODE")) != "false"
 
 	// PROD_MODE fails closed on every compatibility flag that relaxes
 	// a security control. None of these flags are exploitable when
@@ -312,6 +356,9 @@ func Load() (*Config, error) {
 		}
 		if c.RedisURL == "" {
 			violations = append(violations, "REDIS_URL unset (no replay store → no single-use codes, no refresh-rotation reuse detection)")
+		}
+		if c.TrustProxyHeaders && len(c.TrustedProxyCIDRs) == 0 {
+			violations = append(violations, "TRUST_PROXY_HEADERS=true without TRUSTED_PROXY_CIDRS (forwarded-header spoofing can bypass per-IP limits)")
 		}
 		if len(violations) > 0 {
 			return nil, fmt.Errorf("PROD_MODE=true rejects unsafe settings: %s", strings.Join(violations, "; "))
@@ -391,39 +438,83 @@ func validateOIDCIssuerURL(raw string) error {
 	}
 }
 
-// validateUpstreamMCPURL enforces the origin-only shape that the
-// reverse-proxy rewrite relies on: absolute URL with a real authority,
-// http(s) scheme, no userinfo/fragment/query, no opaque form, no path.
-// The proxy forwards the client request path verbatim, so an upstream
-// path would either be ignored or silently wrong — fail loud at
-// startup instead.
-func validateUpstreamMCPURL(raw string) error {
+// validateUpstreamMCPURL enforces the shape the reverse-proxy relies
+// on: absolute URL with a real authority, http(s) scheme, no
+// userinfo/fragment/query, no opaque form, and a non-empty path
+// component. The path is the MCP mount on this proxy (public) and
+// simultaneously the upstream path — they match verbatim, no rewrite.
+// Requiring a path up-front keeps discovery metadata unambiguous and
+// turns typo/bogus paths into a 404 at the router instead of opaque
+// upstream errors. A path that collides with a control-plane route
+// owned by the proxy is rejected so the MCP reverse-proxy cannot
+// silently shadow /token, /authorize, etc.
+//
+// Returns the normalized URL and the mount path. The trailing "/" on
+// a multi-segment path is stripped ("/api/" → "/api") so downstream
+// comparisons are canonical.
+func validateUpstreamMCPURL(raw string) (string, string, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return fmt.Errorf("UPSTREAM_MCP_URL is not a valid URL: %w", err)
+		return "", "", fmt.Errorf("UPSTREAM_MCP_URL is not a valid URL: %w", err)
 	}
 	if u.Opaque != "" || u.Host == "" {
-		return fmt.Errorf("UPSTREAM_MCP_URL must be an absolute URL with a host, got %q", raw)
+		return "", "", fmt.Errorf("UPSTREAM_MCP_URL must be an absolute URL with a host, got %q", raw)
 	}
 	switch u.Scheme {
 	case "http", "https":
 		// both ok — operator picks in-cluster transport
 	default:
-		return fmt.Errorf("UPSTREAM_MCP_URL must use http:// or https://, got scheme %q", u.Scheme)
+		return "", "", fmt.Errorf("UPSTREAM_MCP_URL must use http:// or https://, got scheme %q", u.Scheme)
 	}
 	if u.User != nil {
-		return fmt.Errorf("UPSTREAM_MCP_URL must not contain userinfo")
+		return "", "", fmt.Errorf("UPSTREAM_MCP_URL must not contain userinfo")
 	}
 	if u.Fragment != "" || u.RawFragment != "" {
-		return fmt.Errorf("UPSTREAM_MCP_URL must not contain a fragment")
+		return "", "", fmt.Errorf("UPSTREAM_MCP_URL must not contain a fragment")
 	}
 	if u.RawQuery != "" || u.ForceQuery {
-		return fmt.Errorf("UPSTREAM_MCP_URL must not contain a query string")
+		return "", "", fmt.Errorf("UPSTREAM_MCP_URL must not contain a query string")
 	}
-	if u.Path != "" && u.Path != "/" {
-		return fmt.Errorf("UPSTREAM_MCP_URL must be origin-only (no path), got %q", u.Path)
+	if len(u.Path) > 1 && strings.HasSuffix(u.Path, "/") {
+		u.Path = strings.TrimRight(u.Path, "/")
 	}
-	return nil
+	if u.Path == "" || u.Path == "/" {
+		return "", "", fmt.Errorf("UPSTREAM_MCP_URL must include an explicit path (e.g. %q), got origin-only %q", strings.TrimRight(raw, "/")+"/mcp", raw)
+	}
+	if strings.Contains(u.Path, "//") {
+		return "", "", fmt.Errorf("UPSTREAM_MCP_URL path must not contain empty segments, got %q", u.Path)
+	}
+	// The mount path is treated as opaque: no normalization, no
+	// dot-segment resolution, no case folding. Whatever the operator
+	// types is what chi mounts and what the upstream sees.
+	//
+	// Restrict to RFC 3986 unreserved + "/". RFC 3986 also allows
+	// pct-encoded and sub-delims (`:`, `*`, `{`, `}`, `!`, `$`, `&`,
+	// `'`, `(`, `)`, `,`, `;`, `=`, `@`, `+`) in paths, but several of
+	// those have meaning to chi's router (`:` = path param, `*` =
+	// catchall, `{` / `}` = regex param) and the rest have no
+	// established use in MCP mounts. The conservative allowlist keeps
+	// the literal/pattern boundary unambiguous; expand only with a
+	// concrete operator need (none today).
+	for i := 0; i < len(u.Path); i++ {
+		c := u.Path[i]
+		switch {
+		case c >= 'A' && c <= 'Z',
+			c >= 'a' && c <= 'z',
+			c >= '0' && c <= '9',
+			c == '-', c == '.', c == '_', c == '~', c == '/':
+			continue
+		default:
+			return "", "", fmt.Errorf("UPSTREAM_MCP_URL path may only contain unreserved characters and '/', got %q", u.Path)
+		}
+	}
+	reserved := []string{"/healthz", "/register", "/authorize", "/callback", "/token", "/.well-known"}
+	for _, r := range reserved {
+		if u.Path == r || strings.HasPrefix(u.Path, r+"/") {
+			return "", "", fmt.Errorf("UPSTREAM_MCP_URL path %q collides with reserved route %q", u.Path, r)
+		}
+	}
+	return u.String(), u.Path, nil
 }
 
 // validateProxyBaseURL enforces the invariants downstream code relies on:

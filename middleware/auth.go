@@ -92,12 +92,33 @@ func (a *Auth) Validate(next http.Handler) http.Handler {
 // writeAuthError returns 401 with WWW-Authenticate pointing to the protected
 // resource metadata (RFC 9728 §5.1). errCode must be one of the RFC 6750 §3.1
 // codes: invalid_request, invalid_token, insufficient_scope.
+//
+// The challenge includes an `error_description` attribute (RFC 6750 §3 —
+// MAY) so a log observer / API gateway / client developer tool that only
+// sees the header (not the JSON body) can still tell the two failure
+// modes apart. Descriptions are short, fixed, and carry no caller-
+// controlled data — pure allowlist lookup to rule out any header-
+// injection concerns.
 func (a *Auth) writeAuthError(w http.ResponseWriter, errCode string) {
+	desc := errorDescriptions[errCode]
 	w.Header().Set("WWW-Authenticate", fmt.Sprintf(
-		`Bearer error="%s", resource_metadata="%s/.well-known/oauth-protected-resource"`,
-		errCode, a.baseURL,
+		`Bearer error="%s", error_description="%s", resource_metadata="%s/.well-known/oauth-protected-resource"`,
+		errCode, desc, a.baseURL,
 	))
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusUnauthorized)
-	_ = json.NewEncoder(w).Encode(map[string]string{"error": errCode})
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"error":             errCode,
+		"error_description": desc,
+	})
+}
+
+// errorDescriptions maps each RFC 6750 §3.1 error code to a short,
+// fixed description. Closed allowlist — anything that slips past the
+// callers' own allowlist falls back to the empty string rather than
+// echoing an unknown value into the header.
+var errorDescriptions = map[string]string{
+	"invalid_request":    "bearer credential is missing or malformed",
+	"invalid_token":      "bearer token is invalid, expired, or not intended for this resource",
+	"insufficient_scope": "bearer token lacks the scope required for this resource",
 }

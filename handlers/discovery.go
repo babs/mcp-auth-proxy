@@ -14,6 +14,14 @@ func Discovery(baseURL string) http.HandlerFunc {
 		"code_challenge_methods_supported": []string{"S256"},
 		// PKCE-only proxy: no client secrets are validated
 		"token_endpoint_auth_methods_supported": []string{"none"},
+		// RFC 8414 §2 (RECOMMENDED). Explicit empty array — the proxy
+		// carries no scope model of its own (scopes are not parsed at
+		// /authorize, not encoded in access tokens, not checked by the
+		// RS middleware). Publishing `[]` is more informative than
+		// omitting the field: a client that auto-configures least-
+		// privilege requests sees a concrete "no scopes" answer rather
+		// than having to probe.
+		"scopes_supported": []string{},
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {
