@@ -503,7 +503,7 @@ Origin-only URLs (no path / lone `/`), query, fragment, userinfo, and paths that
 The router is built in [`main.go`](./main.go) (`func main`) — see that file rather than a copy here, since this block historically rotted. High level:
 
 - Global middlewares: in-flight WaitGroup → strip inbound `X-Request-Id` → `chimw.RequestID` → `zapMiddleware` → `chimw.Recoverer` → per-IP rate limiter.
-- OAuth endpoints (`/register`, `/authorize`, `/callback`, `/token`) carry per-endpoint rate limiters when `RATE_LIMIT_ENABLED=true` (passthrough otherwise). `replayStore` is wired only when `REDIS_URL` is set.
+- OAuth endpoints (`/register`, `/authorize`, `/callback`, `/token`) and the discovery surface (`/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource`, mount-suffixed variants, and the openid-configuration / under-mount 404 carve-outs) carry per-endpoint rate limiters when `RATE_LIMIT_ENABLED=true` (passthrough otherwise). Discovery is silent on rate-limit per RFC 8414 §3 / RFC 9728 §3.1; the 60/min/IP ceiling here only catches floods. `replayStore` is wired only when `REDIS_URL` is set.
 - Liveness `/healthz` (always 200) on the public listener; readiness `/readyz` lives ONLY on the metrics listener (an unauthenticated `/readyz` on the public port is a Redis-DoS amplifier — see comment at `main.go:304`).
 - MCP proxy mounts at `cfg.UpstreamMCPMountPath` (path from `UPSTREAM_MCP_URL`) under `authMW.Validate` → `RPCPeek` → per-subject concurrency limiter. Client path == upstream path, verbatim, no rewrite.
 

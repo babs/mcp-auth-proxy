@@ -204,7 +204,7 @@ func buildTestProxy(t *testing.T, oidcProvider *mockOIDCProvider, mcpServer *moc
 	authMW := middleware.NewAuth(tm, zap.NewNop(), proxyBaseURL, time.Time{})
 
 	r := chi.NewRouter()
-	registerDiscoveryRoutes(r, proxyBaseURL, "/mcp", "")
+	registerDiscoveryRoutes(r, proxyBaseURL, "/mcp", "", nil)
 	r.Post("/register", handlers.Register(tm, zap.NewNop(), proxyBaseURL))
 	r.Get("/authorize", handlers.Authorize(tm, zap.NewNop(), proxyBaseURL, oauth2Cfg, handlers.AuthorizeConfig{
 		PKCERequired: true,

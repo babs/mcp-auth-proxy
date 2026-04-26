@@ -285,6 +285,7 @@ func main() {
 	callbackLimit := passthrough
 	tokenLimit := passthrough
 	mcpLimit := passthrough
+	discoveryLimit := passthrough
 	if cfg.RateLimitEnabled {
 		registerLimit = rateLimiter(10, time.Minute, "register", ipKeyFunc)
 		authorizeLimit = rateLimiter(30, time.Minute, "authorize", ipKeyFunc)
@@ -294,6 +295,12 @@ func main() {
 		// POST /mcp so per-path keying would add no dimension — per-subject
 		// concurrency below handles the "one caller hogging one tool" shape.
 		mcpLimit = rateLimiter(600, time.Minute, "mcp", ipKeyFunc)
+		// Discovery (RFC 8414 / RFC 9728): legitimate clients hit
+		// /.well-known/* once per session. The ceiling here only catches
+		// floods. Production MCP servers (Cloudflare/GitHub/Atlassian)
+		// limit silently at the edge; same posture here. RFC 8414 §3 and
+		// RFC 9728 §3.1 are silent on rate-limit, so 429 is not anti-spec.
+		discoveryLimit = rateLimiter(60, time.Minute, "discovery", ipKeyFunc)
 		logger.Info("rate_limit_enabled", zap.Bool("trust_proxy_headers", cfg.TrustProxyHeaders))
 	} else {
 		logger.Info("rate_limit_disabled")
@@ -311,7 +318,7 @@ func main() {
 		logger.Info("per_subject_concurrency_enabled", zap.Int64("cap", cfg.PerSubjectConcurrency))
 	}
 
-	registerDiscoveryRoutes(r, cfg.ProxyBaseURL, cfg.UpstreamMCPMountPath, cfg.ResourceName)
+	registerDiscoveryRoutes(r, cfg.ProxyBaseURL, cfg.UpstreamMCPMountPath, cfg.ResourceName, discoveryLimit)
 	r.With(registerLimit).Post("/register", handlers.Register(tm, logger, cfg.ProxyBaseURL))
 	r.With(authorizeLimit).Get("/authorize", handlers.Authorize(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, handlers.AuthorizeConfig{
 		PKCERequired:         cfg.PKCERequired,
@@ -813,7 +820,14 @@ func wellKnownNotFound(w http.ResponseWriter, _ *http.Request) {
 // and upstream (e.g. "/mcp", "/api/v1/mcp"). The per-resource PRM
 // and AS-meta compat routes are published at <mountPath>-suffixed
 // paths so MCP clients that probe the resource URL variant find them.
-func registerDiscoveryRoutes(r chi.Router, baseURL, mountPath, resourceName string) {
+// limiter is the rate-limit middleware applied to every served well-
+// known path. Pass `passthrough` when rate limiting is disabled, or
+// `nil` (treated as identity) when callers don't need a limiter at
+// all (tests).
+func registerDiscoveryRoutes(r chi.Router, baseURL, mountPath, resourceName string, limiter func(http.Handler) http.Handler) {
+	if limiter == nil {
+		limiter = func(h http.Handler) http.Handler { return h }
+	}
 	// OAuth Protected Resource Metadata (RFC 9728).
 	// - Root "/"-suffixed resource: Claude.ai canonicalizes RFC 8707
 	//   resource indicators with a trailing slash, so this document
@@ -823,8 +837,8 @@ func registerDiscoveryRoutes(r chi.Router, baseURL, mountPath, resourceName stri
 	//   https://host<mountPath> publishes PRM at
 	//   /.well-known/oauth-protected-resource<mountPath> with
 	//   resource=https://host<mountPath>.
-	r.Get("/.well-known/oauth-protected-resource", handlers.ResourceMetadata(baseURL+"/", baseURL, resourceName))
-	r.Get("/.well-known/oauth-protected-resource"+mountPath, handlers.ResourceMetadata(baseURL+mountPath, baseURL, resourceName))
+	r.With(limiter).Get("/.well-known/oauth-protected-resource", handlers.ResourceMetadata(baseURL+"/", baseURL, resourceName))
+	r.With(limiter).Get("/.well-known/oauth-protected-resource"+mountPath, handlers.ResourceMetadata(baseURL+mountPath, baseURL, resourceName))
 
 	// OAuth 2.0 Authorization Server Metadata (RFC 8414).
 	// Canonical location is the root well-known path. The mountPath-
@@ -833,19 +847,21 @@ func registerDiscoveryRoutes(r chi.Router, baseURL, mountPath, resourceName stri
 	// same document there avoids a confusing 401 from the downstream
 	// auth-gated catch-all.
 	asMeta := handlers.Discovery(baseURL)
-	r.Get("/.well-known/oauth-authorization-server", asMeta)
-	r.Get("/.well-known/oauth-authorization-server"+mountPath, asMeta)
+	r.With(limiter).Get("/.well-known/oauth-authorization-server", asMeta)
+	r.With(limiter).Get("/.well-known/oauth-authorization-server"+mountPath, asMeta)
 
 	// We are not an OIDC provider and we do not mirror upstream OIDC
 	// discovery. Clients that probe these paths should get 404 so
-	// they fall back to the OAuth metadata above.
+	// they fall back to the OAuth metadata above. The 404 path is
+	// also rate-limited — otherwise it becomes the cheapest flood
+	// surface (smallest body, no JSON build).
 	nf := http.HandlerFunc(wellKnownNotFound)
-	r.Handle("/.well-known/openid-configuration", nf)
-	r.Handle("/.well-known/openid-configuration"+mountPath, nf)
+	r.With(limiter).Handle("/.well-known/openid-configuration", nf)
+	r.With(limiter).Handle("/.well-known/openid-configuration"+mountPath, nf)
 	// Non-spec probes: some clients look for well-known paths under
 	// the resource URL (<mountPath>/.well-known/...). RFC 8414/9728
 	// put these at the origin root. Return 404 so the client falls
 	// back to the canonical locations above instead of being
 	// auth-gated by the MCP mount itself.
-	r.Handle(mountPath+"/.well-known/*", nf)
+	r.With(limiter).Handle(mountPath+"/.well-known/*", nf)
 }
