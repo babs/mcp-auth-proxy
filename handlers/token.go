@@ -264,9 +264,15 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 		// every descendant access + refresh in the lineage. Once
 		// minted at /authorize the binding is invariant for the
 		// life of the family.
-		Resource:  code.Resource,
-		IssuedAt:  now,
-		ExpiresAt: now.Add(refreshTokenTTL),
+		Resource: code.Resource,
+		IssuedAt: now,
+		// FamilyIssuedAt is set ONCE here at code redemption and
+		// inherited unchanged by every rotation. REVOKE_BEFORE is
+		// compared against this stamp so a steadily rotating
+		// attacker cannot outlive a bulk revocation by pushing
+		// IssuedAt forward on every refresh.
+		FamilyIssuedAt: now,
+		ExpiresAt:      now.Add(refreshTokenTTL),
 	}
 	refreshToken, err := tm.SealJSON(refresh, token.PurposeRefresh)
 	if err != nil {
@@ -325,12 +331,26 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 		return
 	}
 
-	// Bulk revocation: reject refresh tokens issued before the cutoff.
-	// Without this check, REVOKE_BEFORE only invalidates access tokens and a
-	// compromised refresh token would silently mint fresh ones past the cutoff.
-	if !revokeBefore.IsZero() && refresh.IssuedAt.Before(revokeBefore) {
+	// Bulk revocation: reject refresh tokens whose family was first
+	// issued before the cutoff. Comparing against FamilyIssuedAt
+	// (not IssuedAt) closes a quiet-rotation bypass: every rotation
+	// pushes IssuedAt forward, so a comparison against IssuedAt let
+	// an attacker who keeps rotating a stolen refresh outlive
+	// REVOKE_BEFORE indefinitely. FamilyIssuedAt is minted once at
+	// code redemption and inherited unchanged across the lineage,
+	// so the cutoff catches the whole family.
+	//
+	// Legacy refresh tokens sealed before FamilyIssuedAt existed
+	// carry a zero value; fall back to IssuedAt for them so a
+	// rolling deploy doesn't immediately invalidate active sessions
+	// — the next rotation populates FamilyIssuedAt.
+	cutoffStamp := refresh.FamilyIssuedAt
+	if cutoffStamp.IsZero() {
+		cutoffStamp = refresh.IssuedAt
+	}
+	if !revokeBefore.IsZero() && cutoffStamp.Before(revokeBefore) {
 		logger.Debug("refresh_token_revoked_iat_cutoff",
-			zap.Time("issued_at", refresh.IssuedAt),
+			zap.Time("family_issued_at", cutoffStamp),
 			zap.Time("revoke_before", revokeBefore),
 		)
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh token revoked")
@@ -413,21 +433,29 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 	// The rotated refresh inherits the FamilyID so reuse detection spans the
 	// entire lineage; a fresh TokenID makes it single-use on its own. Empty
 	// FamilyID was rejected upfront (C2), so the field is always set here.
-	// Resource is also inherited verbatim — once bound at /authorize the
-	// RFC 8707 resource is invariant for the life of the family.
+	// Resource and FamilyIssuedAt are also inherited verbatim — once bound
+	// at /authorize the RFC 8707 resource and the family-origin stamp are
+	// invariant for the life of the family. Legacy refreshes sealed without
+	// FamilyIssuedAt seed it from IssuedAt on the first rotation so the
+	// REVOKE_BEFORE invariant tightens forward as sessions rotate.
 	now := time.Now()
+	familyIssuedAt := refresh.FamilyIssuedAt
+	if familyIssuedAt.IsZero() {
+		familyIssuedAt = refresh.IssuedAt
+	}
 	newRefresh := sealedRefresh{
-		TokenID:   uuid.New().String(),
-		FamilyID:  refresh.FamilyID,
-		Subject:   refresh.Subject,
-		Email:     refresh.Email,
-		Groups:    refresh.Groups,
-		ClientID:  client.ID,
-		Typ:       token.PurposeRefresh,
-		Audience:  audience,
-		Resource:  refresh.Resource,
-		IssuedAt:  now,
-		ExpiresAt: now.Add(refreshTokenTTL),
+		TokenID:        uuid.New().String(),
+		FamilyID:       refresh.FamilyID,
+		Subject:        refresh.Subject,
+		Email:          refresh.Email,
+		Groups:         refresh.Groups,
+		ClientID:       client.ID,
+		Typ:            token.PurposeRefresh,
+		Audience:       audience,
+		Resource:       refresh.Resource,
+		IssuedAt:       now,
+		FamilyIssuedAt: familyIssuedAt,
+		ExpiresAt:      now.Add(refreshTokenTTL),
 	}
 	newRefreshToken, err := tm.SealJSON(newRefresh, token.PurposeRefresh)
 	if err != nil {

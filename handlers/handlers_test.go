@@ -108,16 +108,18 @@ func sealCode(t *testing.T, tm *token.Manager, clientUUID, redirectURI, codeChal
 // sealRefresh creates an encrypted refresh token for testing.
 func sealRefresh(t *testing.T, tm *token.Manager, subject, email, clientUUID string) string {
 	t.Helper()
+	now := time.Now()
 	sr := sealedRefresh{
-		TokenID:   uuid.New().String(),
-		FamilyID:  uuid.New().String(),
-		Subject:   subject,
-		Email:     email,
-		ClientID:  clientUUID,
-		Typ:       token.PurposeRefresh,
-		Audience:  testBaseURL,
-		IssuedAt:  time.Now(),
-		ExpiresAt: time.Now().Add(7 * 24 * time.Hour),
+		TokenID:        uuid.New().String(),
+		FamilyID:       uuid.New().String(),
+		Subject:        subject,
+		Email:          email,
+		ClientID:       clientUUID,
+		Typ:            token.PurposeRefresh,
+		Audience:       testBaseURL,
+		IssuedAt:       now,
+		FamilyIssuedAt: now,
+		ExpiresAt:      now.Add(7 * 24 * time.Hour),
 	}
 	tok, err := tm.SealJSON(sr, token.PurposeRefresh)
 	if err != nil {
@@ -2682,9 +2684,11 @@ func TestTokenRefresh_NotRevokedAfterCutoff(t *testing.T) {
 	}
 }
 
-// TestTokenRefresh_NewTokenCarriesIssuedAt verifies that the rotated refresh
-// token has its IssuedAt updated to "now" so it survives a future REVOKE_BEFORE
-// cutoff applied to its predecessor.
+// TestTokenRefresh_NewTokenCarriesIssuedAt verifies that the rotated
+// refresh token has its IssuedAt updated to "now". Per-rotation
+// freshness is what the replay-store reuse-detection cares about;
+// the bulk REVOKE_BEFORE cutoff is anchored to FamilyIssuedAt
+// instead and is exercised by TestTokenRefresh_FamilyIssuedAt_*.
 func TestTokenRefresh_NewTokenCarriesIssuedAt(t *testing.T) {
 	tm := newTestTokenManager(t)
 	logger := zap.NewNop()
@@ -2732,6 +2736,181 @@ func TestTokenRefresh_NewTokenCarriesIssuedAt(t *testing.T) {
 	}
 	if newRefresh.Audience != testBaseURL {
 		t.Errorf("rotated refresh audience: got %q, want %q", newRefresh.Audience, testBaseURL)
+	}
+}
+
+// TestTokenRefresh_FamilyIssuedAt_Inherited pins C-M3: a rotated
+// refresh inherits FamilyIssuedAt from its predecessor, so the
+// stamp the bulk REVOKE_BEFORE cutoff is compared against does NOT
+// drift forward across rotations. Without this, a quietly rotating
+// attacker could outlive an operator's bulk revocation.
+func TestTokenRefresh_FamilyIssuedAt_Inherited(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+	encClientID, internalID := registerClient(t, tm, []string{"https://app.example.com/callback"})
+
+	familyOrigin := time.Now().Add(-3 * time.Hour)
+	parent := sealedRefresh{
+		TokenID:        uuid.New().String(),
+		FamilyID:       uuid.New().String(),
+		Subject:        "user",
+		Email:          "u@example.com",
+		ClientID:       internalID,
+		Typ:            token.PurposeRefresh,
+		Audience:       testBaseURL,
+		IssuedAt:       time.Now().Add(-30 * time.Minute),
+		FamilyIssuedAt: familyOrigin,
+		ExpiresAt:      time.Now().Add(7 * 24 * time.Hour),
+	}
+	parentStr, err := tm.SealJSON(parent, token.PurposeRefresh)
+	if err != nil {
+		t.Fatalf("SealJSON: %v", err)
+	}
+
+	form := url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {parentStr},
+		"client_id":     {encClientID},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rr := httptest.NewRecorder()
+	Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("rotation: want 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp map[string]any
+	json.NewDecoder(rr.Body).Decode(&resp)
+	var rotated sealedRefresh
+	if err := tm.OpenJSON(resp["refresh_token"].(string), &rotated, token.PurposeRefresh); err != nil {
+		t.Fatalf("OpenJSON rotated: %v", err)
+	}
+	if !rotated.FamilyIssuedAt.Equal(familyOrigin) {
+		t.Errorf("FamilyIssuedAt drifted across rotation: got %v, want %v", rotated.FamilyIssuedAt, familyOrigin)
+	}
+	if !rotated.IssuedAt.After(parent.IssuedAt) {
+		t.Errorf("rotated IssuedAt should advance, got %v (parent %v)", rotated.IssuedAt, parent.IssuedAt)
+	}
+}
+
+// TestTokenRefresh_RevokeBefore_CatchesRotatedFamily pins C-M3 from
+// the operator's perspective: an operator who sets REVOKE_BEFORE to
+// a stamp AFTER a session's family origin must invalidate the
+// session even when the attacker has already rotated the refresh
+// once. Comparing against IssuedAt would let the rotated token
+// sneak past; comparing against FamilyIssuedAt catches it.
+func TestTokenRefresh_RevokeBefore_CatchesRotatedFamily(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+	encClientID, internalID := registerClient(t, tm, []string{"https://app.example.com/callback"})
+
+	familyOrigin := time.Now().Add(-3 * time.Hour)
+	// Rotated refresh: IssuedAt is "now" (just rotated), but the
+	// family was first issued 3h ago. Operator sets REVOKE_BEFORE
+	// to 1h ago — the family origin predates it, the rotated stamp
+	// does not.
+	rotated := sealedRefresh{
+		TokenID:        uuid.New().String(),
+		FamilyID:       uuid.New().String(),
+		Subject:        "user",
+		Email:          "u@example.com",
+		ClientID:       internalID,
+		Typ:            token.PurposeRefresh,
+		Audience:       testBaseURL,
+		IssuedAt:       time.Now(),
+		FamilyIssuedAt: familyOrigin,
+		ExpiresAt:      time.Now().Add(7 * 24 * time.Hour),
+	}
+	rotatedStr, err := tm.SealJSON(rotated, token.PurposeRefresh)
+	if err != nil {
+		t.Fatalf("SealJSON: %v", err)
+	}
+	cutoff := time.Now().Add(-1 * time.Hour)
+
+	form := url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {rotatedStr},
+		"client_id":     {encClientID},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rr := httptest.NewRecorder()
+	Token(tm, logger, testBaseURL, cutoff, nil)(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("REVOKE_BEFORE must catch rotated family; got status %d body %s", rr.Code, rr.Body.String())
+	}
+	var oauthErr OAuthError
+	json.NewDecoder(rr.Body).Decode(&oauthErr)
+	if oauthErr.Error != "invalid_grant" {
+		t.Errorf("error = %q, want invalid_grant", oauthErr.Error)
+	}
+}
+
+// TestTokenRefresh_LegacyZeroFamilyIssuedAt_FallsBackToIssuedAt
+// pins the rolling-deploy backstop: a refresh sealed before
+// FamilyIssuedAt existed (zero value) is evaluated against
+// IssuedAt for REVOKE_BEFORE, and the rotated descendant tightens
+// the invariant by adopting the parent's IssuedAt as its
+// FamilyIssuedAt seed.
+func TestTokenRefresh_LegacyZeroFamilyIssuedAt_FallsBackToIssuedAt(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+	encClientID, internalID := registerClient(t, tm, []string{"https://app.example.com/callback"})
+
+	parentIssued := time.Now().Add(-2 * time.Hour)
+	legacy := sealedRefresh{
+		TokenID:   uuid.New().String(),
+		FamilyID:  uuid.New().String(),
+		Subject:   "user",
+		Email:     "u@example.com",
+		ClientID:  internalID,
+		Typ:       token.PurposeRefresh,
+		Audience:  testBaseURL,
+		IssuedAt:  parentIssued,
+		ExpiresAt: time.Now().Add(7 * 24 * time.Hour),
+		// FamilyIssuedAt deliberately zero — emulates a refresh
+		// sealed by a pre-C-M3 build.
+	}
+	legacyStr, err := tm.SealJSON(legacy, token.PurposeRefresh)
+	if err != nil {
+		t.Fatalf("SealJSON: %v", err)
+	}
+
+	// Rotation succeeds with no cutoff.
+	form := url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {legacyStr},
+		"client_id":     {encClientID},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rr := httptest.NewRecorder()
+	Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("legacy rotation: want 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp map[string]any
+	json.NewDecoder(rr.Body).Decode(&resp)
+	var rotated sealedRefresh
+	if err := tm.OpenJSON(resp["refresh_token"].(string), &rotated, token.PurposeRefresh); err != nil {
+		t.Fatalf("OpenJSON rotated: %v", err)
+	}
+	if !rotated.FamilyIssuedAt.Equal(parentIssued) {
+		t.Errorf("rotation should seed FamilyIssuedAt from parent IssuedAt; got %v want %v", rotated.FamilyIssuedAt, parentIssued)
+	}
+
+	// Now apply REVOKE_BEFORE just after the legacy parent's
+	// IssuedAt — the legacy parent (zero FamilyIssuedAt → falls
+	// back to IssuedAt) must be rejected.
+	cutoff := parentIssued.Add(1 * time.Minute)
+	rr2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(form.Encode()))
+	req2.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	Token(tm, logger, testBaseURL, cutoff, nil)(rr2, req2)
+	if rr2.Code != http.StatusBadRequest {
+		t.Fatalf("REVOKE_BEFORE on legacy refresh: want 400, got %d: %s", rr2.Code, rr2.Body.String())
 	}
 }
 

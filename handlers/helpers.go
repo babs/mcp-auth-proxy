@@ -137,9 +137,19 @@ type sealedRefresh struct {
 	// must remain bound to the same RFC 8707 resource the client
 	// requested at /authorize. Empty on refresh tokens sealed before
 	// this field existed.
-	Resource  string    `json:"res,omitempty"`
-	IssuedAt  time.Time `json:"iat"`
-	ExpiresAt time.Time `json:"exp"`
+	Resource string    `json:"res,omitempty"`
+	IssuedAt time.Time `json:"iat"`
+	// FamilyIssuedAt is the IssuedAt of the FIRST refresh in this
+	// rotation lineage (the one minted at code redemption) and is
+	// inherited verbatim by every rotated descendant. REVOKE_BEFORE
+	// is compared against this value, NOT IssuedAt — otherwise a
+	// quietly rotating attacker's refresh would survive a bulk
+	// revocation cutoff because each rotation pushed IssuedAt
+	// forward. Zero on tokens sealed before this field existed; the
+	// refresh handler falls back to IssuedAt in that case so a
+	// rolling deploy keeps active sessions valid.
+	FamilyIssuedAt time.Time `json:"fiat,omitempty"`
+	ExpiresAt      time.Time `json:"exp"`
 }
 
 // maxBodySize limits POST request bodies to prevent memory exhaustion.
