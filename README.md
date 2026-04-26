@@ -121,7 +121,7 @@ All configuration via **environment variables**. Bold = required.
 | **`OIDC_CLIENT_SECRET`** | — | IdP client secret |
 | **`PROXY_BASE_URL`** | — | Public URL of this proxy (audience-bound into every sealed token) |
 | **`UPSTREAM_MCP_URL`** | — | Upstream MCP URL. Must include an explicit path — origin-only (`http://backend`) and lone-`/` (`http://backend/`) are rejected at startup. The path is used verbatim on both sides: it's the proxy's public mount *and* the path forwarded to the upstream. `http://mcp:8000/api/v1/mcp` → proxy exposes `/api/v1/mcp`, upstream sees `/api/v1/mcp`, client points at `{PROXY_BASE_URL}/api/v1/mcp`. Query, fragment, userinfo, and paths that collide with a control-plane route (`/healthz`, `/register`, `/authorize`, `/callback`, `/token`, `/.well-known`) are rejected too. |
-| **`TOKEN_SIGNING_SECRET`** | — | ≥ 32 bytes, AES-GCM key; must be byte-identical across replicas |
+| **`TOKEN_SIGNING_SECRET`** | — | ≥ 32 bytes, AES-GCM key; must be byte-identical across replicas. `PROD_MODE=true` additionally rejects secrets with < 16 distinct bytes (patterned / human-typed values like `aaaa…` or `0123…`). Generate with `openssl rand -hex 32` or `manifests/scripts/generate-signing-secret.sh` |
 | `LISTEN_ADDR` | `:8080` | Public bind address |
 | `METRICS_ADDR` | `127.0.0.1:9090` | Prometheus bind address (separate listener). Loopback-only by default so `/metrics` and `/readyz` are never exposed on the public interface; override to `:9090` or an explicit interface when a scraper must reach the pod |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |

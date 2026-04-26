@@ -16,7 +16,9 @@ func setAllRequired(t *testing.T) {
 	t.Setenv("OIDC_CLIENT_SECRET", "client-secret")
 	t.Setenv("PROXY_BASE_URL", "https://proxy.example.com")
 	t.Setenv("UPSTREAM_MCP_URL", "http://localhost:3000/mcp")
-	t.Setenv("TOKEN_SIGNING_SECRET", "this-secret-is-at-least-32-bytes!")
+	// 32 bytes, hex-encoded -> 16 distinct ASCII chars; clears the
+	// PROD_MODE entropy gate (>=16 distinct bytes).
+	t.Setenv("TOKEN_SIGNING_SECRET", "0123456789abcdef0123456789abcdef")
 	t.Setenv("REDIS_URL", "redis://localhost:6379/0")
 }
 
@@ -43,8 +45,8 @@ func TestLoad_AllVarsSet(t *testing.T) {
 	if cfg.UpstreamMCPURL != "http://localhost:3000/mcp" {
 		t.Errorf("UpstreamMCPURL = %q, want %q", cfg.UpstreamMCPURL, "http://localhost:3000/mcp")
 	}
-	if string(cfg.TokenSigningSecret) != "this-secret-is-at-least-32-bytes!" {
-		t.Errorf("TokenSigningSecret = %q, want %q", cfg.TokenSigningSecret, "this-secret-is-at-least-32-bytes!")
+	if string(cfg.TokenSigningSecret) != "0123456789abcdef0123456789abcdef" {
+		t.Errorf("TokenSigningSecret = %q, want fixture value", cfg.TokenSigningSecret)
 	}
 }
 
@@ -649,10 +651,15 @@ func TestLoad_PerSubjectConcurrency_Negative(t *testing.T) {
 }
 
 // L1: TOKEN_SIGNING_SECRET with fewer than 16 distinct bytes surfaces a
-// non-fatal weakness warning that main.go logs at startup. High-entropy
-// secrets yield no warning.
+// non-fatal weakness warning that main.go logs at startup under
+// PROD_MODE=false. PROD_MODE=true promotes this to a hard error
+// (covered by TestLoad_ProdMode_BlocksLowEntropySecret).
 func TestLoad_SecretWeaknessWarning_LowEntropy(t *testing.T) {
 	setAllRequired(t)
+	// PROD_MODE=false to keep the warning path observable; under
+	// PROD_MODE=true the same secret would fail Load() outright.
+	t.Setenv("PROD_MODE", "false")
+	t.Setenv("REDIS_REQUIRED", "false")
 	// 32 bytes but only one distinct byte → 1 < 16.
 	t.Setenv("TOKEN_SIGNING_SECRET", strings.Repeat("a", 32))
 	cfg, err := Load()
@@ -1053,6 +1060,61 @@ func TestLoad_ProdMode_AllowsTrustProxyHeadersWithCIDRs(t *testing.T) {
 	}
 }
 
+// TestLoad_ProdMode_BlocksLowEntropySecret pins the entropy gate:
+// PROD_MODE=true rejects a TOKEN_SIGNING_SECRET with <16 distinct
+// bytes (patterned / human-typed). Same secret accepted with a
+// warning when PROD_MODE=false.
+func TestLoad_ProdMode_BlocksLowEntropySecret(t *testing.T) {
+	patterned := strings.Repeat("a", 32) // 1 distinct byte, 32 bytes long
+
+	t.Run("prod_mode_rejects", func(t *testing.T) {
+		setAllRequired(t)
+		t.Setenv("PROD_MODE", "true")
+		t.Setenv("REDIS_URL", "redis://localhost:6379/0")
+		t.Setenv("TOKEN_SIGNING_SECRET", patterned)
+		_, err := Load()
+		if err == nil {
+			t.Fatal("expected error for patterned secret under PROD_MODE=true")
+		}
+		if !strings.Contains(err.Error(), "TOKEN_SIGNING_SECRET") || !strings.Contains(err.Error(), "distinct bytes") {
+			t.Errorf("error %q should mention TOKEN_SIGNING_SECRET + distinct bytes", err)
+		}
+	})
+
+	t.Run("dev_mode_warns", func(t *testing.T) {
+		setAllRequired(t)
+		t.Setenv("PROD_MODE", "false")
+		t.Setenv("REDIS_REQUIRED", "false")
+		t.Setenv("TOKEN_SIGNING_SECRET", patterned)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("dev mode should accept patterned secret with a warning, got error: %v", err)
+		}
+		if cfg.SecretWeaknessWarning() == "" {
+			t.Error("SecretWeaknessWarning should be non-empty for a patterned secret")
+		}
+	})
+}
+
+// TestLoad_ProdMode_BlocksLowEntropyPreviousSecret pins the same gate
+// on rolling-rotation entries so a cutover cannot regress the entropy
+// floor by carrying an old patterned secret in
+// TOKEN_SIGNING_SECRETS_PREVIOUS.
+func TestLoad_ProdMode_BlocksLowEntropyPreviousSecret(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("PROD_MODE", "true")
+	t.Setenv("REDIS_URL", "redis://localhost:6379/0")
+	// Strong primary, weak previous.
+	t.Setenv("TOKEN_SIGNING_SECRETS_PREVIOUS", strings.Repeat("b", 32))
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected error for patterned previous secret under PROD_MODE=true")
+	}
+	if !strings.Contains(err.Error(), "TOKEN_SIGNING_SECRETS_PREVIOUS") {
+		t.Errorf("error %q should mention TOKEN_SIGNING_SECRETS_PREVIOUS", err)
+	}
+}
+
 // TestLoad_ProdMode_PassesWithSafeDefaults ensures PROD_MODE=true does
 // NOT fail when every safety flag is in its default (secure) state
 // and REDIS_URL is configured.
@@ -1074,8 +1136,12 @@ func TestLoad_ProdMode_PassesWithSafeDefaults(t *testing.T) {
 // paste multi-line blocks from a secret manager; each entry must
 // clear the 32-byte floor.
 func TestLoad_TokenSigningSecretsPrevious(t *testing.T) {
-	longA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaA"
-	longB := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbB"
+	// Use 32-byte fixtures with 16+ distinct bytes so the PROD_MODE
+	// entropy gate doesn't trip — this test covers parsing /
+	// whitespace-splitting / length-floor, not the entropy floor
+	// (covered separately).
+	longA := "0123456789abcdef0123456789abcdee"
+	longB := "fedcba9876543210fedcba9876543211"
 	t.Run("single_previous", func(t *testing.T) {
 		setAllRequired(t)
 		t.Setenv("TOKEN_SIGNING_SECRETS_PREVIOUS", longA)
