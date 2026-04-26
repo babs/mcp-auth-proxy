@@ -46,6 +46,17 @@ func Token(tm *token.Manager, logger *zap.Logger, audience string, revokeBefore 
 		}
 
 		if err := r.ParseForm(); err != nil {
+			// Distinguish a body that exceeded MaxBodySize (1 MB
+			// cap) from a structurally-malformed body, so a client
+			// log observer can tell "I posted too much" from "I
+			// posted garbage". RFC 6749 §5.2 has no dedicated code
+			// for either; "invalid_request" is correct in both
+			// cases — we just sharpen the description.
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				writeOAuthError(w, http.StatusRequestEntityTooLarge, "invalid_request", "request body exceeds the 1 MB cap")
+				return
+			}
 			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "malformed form body")
 			return
 		}

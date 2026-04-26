@@ -89,6 +89,48 @@ func TestValidate_MissingHeader(t *testing.T) {
 	}
 }
 
+// TestValidate_BlankBearerCredential pins the empty-after-Bearer
+// disambiguation: `Authorization: Bearer    ` (whitespace-only
+// credential) is malformed, not a failed token. RFC 6750 §3.1
+// reserves `invalid_token` for "presented but failed validation"; the
+// blank case belongs in `invalid_request` so a client log observer
+// can tell "I forgot the token" from "my token expired".
+func TestValidate_BlankBearerCredential(t *testing.T) {
+	auth, _ := setupAuth(t)
+
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("next handler should not be called")
+	})
+
+	cases := []struct {
+		name   string
+		header string
+	}{
+		{"trailing_spaces", "Bearer    "},
+		{"trailing_tab", "Bearer\t\t"},
+		{"trailing_mixed", "Bearer  \t  "},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/mcp", nil)
+			req.Header.Set("Authorization", tc.header)
+			rr := httptest.NewRecorder()
+			auth.Validate(next).ServeHTTP(rr, req)
+
+			if rr.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401", rr.Code)
+			}
+			var body map[string]string
+			if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if body["error"] != "invalid_request" {
+				t.Errorf("error = %q, want invalid_request (blank credential is malformed, not a failed token)", body["error"])
+			}
+		})
+	}
+}
+
 func TestValidate_WWWAuthenticateHeader(t *testing.T) {
 	auth, _ := setupAuth(t)
 

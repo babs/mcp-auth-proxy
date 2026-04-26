@@ -56,6 +56,41 @@ data:
   # ALLOWED_GROUPS: "admin,mcp-users"   # uncomment to restrict access
   # REVOKE_BEFORE: ""                    # RFC3339 bulk-revocation cutoff
   COMPAT_ALLOW_STATELESS: "false"
+
+  # Strict-posture gate. Default (true) fails startup if any
+  # compatibility flag weakens a security control (PKCE_REQUIRED=false,
+  # COMPAT_ALLOW_STATELESS=true, REDIS_REQUIRED=false, REDIS_URL empty,
+  # legacy TRUST_PROXY_HEADERS=true without TRUSTED_PROXY_CIDRS). Set
+  # to "false" only for dev / single-replica work that needs one of
+  # the relaxation toggles.
+  PROD_MODE: "true"
+
+  # CIDRs of peers whose X-Forwarded-For / X-Real-IP / True-Client-IP
+  # headers are honored for rate-limit keying. Other peers fall back
+  # to RemoteAddr. Preferred over the legacy TRUST_PROXY_HEADERS bool.
+  # Uncomment when the proxy sits behind a known L4/L7 frontend:
+  # TRUSTED_PROXY_CIDRS: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+
+  # Per-subject in-flight cap on the authenticated MCP route. Excess
+  # requests get 503 temporarily_unavailable + Retry-After: 1. "0"
+  # disables the limit.
+  MCP_PER_SUBJECT_CONCURRENCY: "16"
+
+  # Max bytes buffered per authenticated request for JSON-RPC method
+  # extraction into access logs. "0" disables buffering entirely (no
+  # rpc_method / rpc_tool / rpc_id fields).
+  MCP_LOG_BODY_MAX: "65536"
+
+  # Optional human-readable display name advertised under resource_name
+  # in the RFC 9728 PRM. Used by MCP clients for consent / UI display.
+  # MCP_RESOURCE_NAME: "ACME MCP"
+
+  # When set, sent verbatim as the Authorization header on every
+  # request to the upstream MCP backend (full value incl. scheme,
+  # e.g. "Bearer s3cr3t"). TREAT AS A SECRET — mount from a Secret,
+  # not from this ConfigMap. Listed here for visibility only.
+  # UPSTREAM_AUTHORIZATION_HEADER: ""  # use envFrom: secretRef instead
+
   # Access-log path filter (public listener only). Go RE2 regexp matched
   # against r.URL.Path; matches are dropped from the access log. Handler
   # response, Prometheus counters, and panic recovery are unaffected.

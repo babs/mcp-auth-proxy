@@ -209,7 +209,7 @@ func TestDiscovery(t *testing.T) {
 		}
 	}
 
-	for _, k := range []string{"response_types_supported", "grant_types_supported", "code_challenge_methods_supported", "token_endpoint_auth_methods_supported"} {
+	for _, k := range []string{"response_types_supported", "response_modes_supported", "grant_types_supported", "code_challenge_methods_supported", "token_endpoint_auth_methods_supported"} {
 		if _, ok := meta[k]; !ok {
 			t.Errorf("missing field %s", k)
 		}
@@ -2811,6 +2811,129 @@ func TestRedirectURIMatches_LoopbackPortAgnostic(t *testing.T) {
 	}
 }
 
+// TestAuthorize_LoopbackPortRelaxation_Accepts_DifferentPort verifies
+// the RFC 8252 §7.3 relaxation lands end-to-end at /authorize: a
+// native client registered with one ephemeral port comes back at
+// /authorize with a different port and is accepted (302 to the IdP).
+// Strict port equality would force re-registration on every native-app
+// launch — exactly what RFC 8252 §7.3 forbids.
+func TestAuthorize_LoopbackPortRelaxation_Accepts_DifferentPort(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+
+	registered := "http://127.0.0.1:8080/cb"
+	requested := "http://127.0.0.1:47521/cb"
+	encClientID, _ := registerClient(t, tm, []string{registered})
+
+	q := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {encClientID},
+		"redirect_uri":          {requested},
+		"code_challenge":        {pkceChallenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk")},
+		"code_challenge_method": {"S256"},
+		"state":                 {"native-app-state"},
+	}
+	req := httptest.NewRequest(http.MethodGet, "/authorize?"+q.Encode(), nil)
+	rr := httptest.NewRecorder()
+	Authorize(tm, logger, testBaseURL, testOAuth2Config(), AuthorizeConfig{PKCERequired: true})(rr, req)
+
+	// Success path: 302 to the IdP authorization endpoint (NOT a
+	// redirect-error response — the registered URI is loopback and
+	// only the port differs, so the relaxation accepts).
+	if rr.Code != http.StatusFound {
+		t.Fatalf("want 302 to IdP, got %d: %s", rr.Code, rr.Body.String())
+	}
+	loc := rr.Header().Get("Location")
+	if !strings.HasPrefix(loc, testOAuth2Config().Endpoint.AuthURL) {
+		t.Errorf("Location should redirect to IdP authorize endpoint, got %q", loc)
+	}
+}
+
+// TestAuthorize_LoopbackPortRelaxation_RejectsDifferentHost — the
+// relaxation is port-only. A registered loopback URI must NOT match
+// a non-loopback requested URI even if every other component lines
+// up. Locks the boundary that keeps the relaxation from becoming an
+// open-redirect primitive.
+func TestAuthorize_LoopbackPortRelaxation_RejectsDifferentHost(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+
+	registered := "http://127.0.0.1:8080/cb"
+	encClientID, _ := registerClient(t, tm, []string{registered})
+
+	// Non-loopback host with otherwise identical shape — must be
+	// rejected with JSON 400 (this is a redirect_uri-trust failure,
+	// so RFC 6749 §4.1.2.1 says render on the AS, not redirect).
+	q := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {encClientID},
+		"redirect_uri":          {"http://evil.example.com:8080/cb"},
+		"code_challenge":        {pkceChallenge("v")},
+		"code_challenge_method": {"S256"},
+		"state":                 {"s"},
+	}
+	req := httptest.NewRequest(http.MethodGet, "/authorize?"+q.Encode(), nil)
+	rr := httptest.NewRecorder()
+	Authorize(tm, logger, testBaseURL, testOAuth2Config(), AuthorizeConfig{PKCERequired: true})(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("want 400 (untrusted redirect target), got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestTokenAuthCode_LoopbackPortMustEcho — at /token, RFC 6749 §4.1.3
+// requires byte equality between the redirect_uri sent to /authorize
+// and the redirect_uri sent to /token. The loopback-port relaxation
+// at /authorize does NOT carry into /token: a native client must echo
+// the exact ephemeral port it used at /authorize, not its registered
+// value or a different ephemeral one. This is RFC-correct and
+// asymmetric with the /authorize relaxation; the test pins the
+// asymmetry so a future "let's relax this too" change is loud.
+func TestTokenAuthCode_LoopbackPortMustEcho(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+
+	authorizeURI := "http://127.0.0.1:47521/cb" // captured into the sealed code
+	codeVerifier := "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+	encClientID, internalID := registerClient(t, tm, []string{"http://127.0.0.1:8080/cb"})
+
+	sc := sealedCode{
+		TokenID:       uuid.New().String(),
+		FamilyID:      uuid.New().String(),
+		ClientID:      internalID,
+		RedirectURI:   authorizeURI, // what the client sent to /authorize
+		CodeChallenge: pkceChallenge(codeVerifier),
+		Subject:       "user-sub",
+		Email:         "user@example.com",
+		Typ:           token.PurposeCode,
+		Audience:      testBaseURL,
+		ExpiresAt:     time.Now().Add(60 * time.Second),
+	}
+	authCode, err := tm.SealJSON(sc, token.PurposeCode)
+	if err != nil {
+		t.Fatalf("SealJSON: %v", err)
+	}
+
+	// Echo a DIFFERENT port at /token. Even though both are loopback
+	// and the registered URI also uses a different port, /token must
+	// reject — what counts is what the client sent to /authorize.
+	form := url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {authCode},
+		"redirect_uri":  {"http://127.0.0.1:99999/cb"},
+		"client_id":     {encClientID},
+		"code_verifier": {codeVerifier},
+	}
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rr := httptest.NewRecorder()
+	Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("want 400 (redirect_uri mismatch at /token), got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
 // TestTokenAuthCode_PKCEDowngradeReject pins RFC 9700 §4.8.2: a /token
 // request that supplies a code_verifier against a code minted with no
 // code_challenge must be rejected explicitly. This closes the silent-accept
@@ -2958,6 +3081,124 @@ func TestTokenAuthCode_Replay_RevokesRefreshFamily(t *testing.T) {
 	}
 	if oe.ErrorCode != "refresh_family_revoked" {
 		t.Errorf("want error_code=refresh_family_revoked, got %q (description=%q)", oe.ErrorCode, oe.ErrorDescription)
+	}
+}
+
+// TestTokenAuthCode_Replay_RevokesRotatedRefresh verifies that the
+// family-revoke triggered by a code replay (RFC 6749 §4.1.2) reaches
+// every descendant refresh, not just the first-generation one. The
+// scenario:
+//
+//  1. Legitimate redemption mints refresh-A (FamilyID = code.FamilyID)
+//  2. Legitimate rotation of refresh-A mints refresh-B (same FamilyID)
+//  3. Attacker replays the original code → family revoked
+//  4. Legitimate rotation of refresh-B is rejected with
+//     refresh_family_revoked
+//
+// Without family-id inheritance from the code, refresh-B would have a
+// fresh family and survive the revoke — the test exists to lock the
+// inheritance behavior in handleAuthorizationCode + handleRefreshToken.
+func TestTokenAuthCode_Replay_RevokesRotatedRefresh(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+	store := replay.NewMemoryStore()
+
+	redirectURI := "https://app.example.com/callback"
+	encClientID, internalID := registerClient(t, tm, []string{redirectURI})
+
+	codeVerifier := "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+	sc := sealedCode{
+		TokenID:       uuid.New().String(),
+		FamilyID:      uuid.New().String(),
+		ClientID:      internalID,
+		RedirectURI:   redirectURI,
+		CodeChallenge: pkceChallenge(codeVerifier),
+		Subject:       "user-sub",
+		Email:         "user@example.com",
+		Typ:           token.PurposeCode,
+		Audience:      testBaseURL,
+		ExpiresAt:     time.Now().Add(60 * time.Second),
+	}
+	authCode, err := tm.SealJSON(sc, token.PurposeCode)
+	if err != nil {
+		t.Fatalf("SealJSON: %v", err)
+	}
+
+	postForm := func(form url.Values) *httptest.ResponseRecorder {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/token", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rr := httptest.NewRecorder()
+		Token(tm, logger, testBaseURL, time.Time{}, store)(rr, req)
+		return rr
+	}
+
+	// 1. First redemption — refresh-A.
+	first := postForm(url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {authCode},
+		"redirect_uri":  {redirectURI},
+		"client_id":     {encClientID},
+		"code_verifier": {codeVerifier},
+	})
+	if first.Code != http.StatusOK {
+		t.Fatalf("first exchange: want 200, got %d: %s", first.Code, first.Body.String())
+	}
+	var firstTok struct {
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := json.NewDecoder(first.Body).Decode(&firstTok); err != nil {
+		t.Fatalf("decode first: %v", err)
+	}
+
+	// 2. Legitimate rotation of refresh-A → refresh-B.
+	rotation := postForm(url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {firstTok.RefreshToken},
+		"client_id":     {encClientID},
+	})
+	if rotation.Code != http.StatusOK {
+		t.Fatalf("legit rotation: want 200, got %d: %s", rotation.Code, rotation.Body.String())
+	}
+	var rotated struct {
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := json.NewDecoder(rotation.Body).Decode(&rotated); err != nil {
+		t.Fatalf("decode rotation: %v", err)
+	}
+	if rotated.RefreshToken == "" || rotated.RefreshToken == firstTok.RefreshToken {
+		t.Fatalf("rotation did not return a new refresh_token (got %q vs prior %q)", rotated.RefreshToken, firstTok.RefreshToken)
+	}
+
+	// 3. Attacker replays the original code. (Local var deliberately
+	// not named `replay` — would shadow the imported replay package.)
+	replayResp := postForm(url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {authCode},
+		"redirect_uri":  {redirectURI},
+		"client_id":     {encClientID},
+		"code_verifier": {codeVerifier},
+	})
+	if replayResp.Code != http.StatusBadRequest {
+		t.Fatalf("code replay: want 400, got %d: %s", replayResp.Code, replayResp.Body.String())
+	}
+
+	// 4. Rotation of refresh-B (the LIVE descendant) must now be
+	//    rejected with refresh_family_revoked. This is the bit the
+	//    new test adds — the prior test only verified refresh-A.
+	rotateB := postForm(url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {rotated.RefreshToken},
+		"client_id":     {encClientID},
+	})
+	if rotateB.Code != http.StatusBadRequest {
+		t.Fatalf("rotation of descendant after code replay: want 400, got %d: %s", rotateB.Code, rotateB.Body.String())
+	}
+	var oe OAuthError
+	if err := json.NewDecoder(rotateB.Body).Decode(&oe); err != nil {
+		t.Fatalf("decode descendant rotation: %v", err)
+	}
+	if oe.ErrorCode != "refresh_family_revoked" {
+		t.Errorf("descendant: want error_code=refresh_family_revoked, got %q (description=%q)", oe.ErrorCode, oe.ErrorDescription)
 	}
 }
 

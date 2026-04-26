@@ -906,6 +906,50 @@ func TestLoad_UpstreamMCPURL_RejectsRouterPatternChars(t *testing.T) {
 	}
 }
 
+// TestLoad_UpstreamMCPURL_ReservedPrefix_NotShadowed pins the
+// reserved-route collision check. The validator rejects exact match
+// (`/healthz`) and a slash-bounded prefix (`/healthz/x`) but
+// deliberately allows close-but-not-reserved siblings
+// (`/healthzfoo`, `/registerx`) — chi mounts those as distinct routes
+// from the control plane. This test locks the boundary so a future
+// reserved-list addition (e.g. `/healthcheck`) is forced to think
+// about the prefix-collision implication.
+func TestLoad_UpstreamMCPURL_ReservedPrefix_NotShadowed(t *testing.T) {
+	cases := []struct {
+		path    string
+		wantErr bool
+	}{
+		// Exact reserved route: rejected.
+		{"/healthz", true},
+		{"/register", true},
+		{"/authorize", true},
+		{"/callback", true},
+		{"/token", true},
+		// Slash-bounded prefix: rejected.
+		{"/healthz/x", true},
+		{"/.well-known/x", true},
+		// Close-but-not-reserved sibling: ALLOWED. Mount is a
+		// literal route, no shadowing risk.
+		{"/healthzfoo", false},
+		{"/registerx", false},
+		{"/tokenize", false},
+		{"/callbacks", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			setAllRequired(t)
+			t.Setenv("UPSTREAM_MCP_URL", "http://backend:8080"+tc.path)
+			_, err := Load()
+			if tc.wantErr && err == nil {
+				t.Fatalf("expected reserved-route error for %q, got nil", tc.path)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("expected %q to be allowed (non-reserved sibling), got error: %v", tc.path, err)
+			}
+		})
+	}
+}
+
 // TestLoad_ProdMode_BlocksUnsafeFlags covers P1a: PROD_MODE=true must
 // fail startup when any compatibility flag that relaxes a security
 // control is set. Each violation is tested independently so the
