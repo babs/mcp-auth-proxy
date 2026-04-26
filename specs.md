@@ -294,7 +294,7 @@ Error responses use RFC 7591 §3.2.2 codes: `invalid_redirect_uri` for any redir
 - `redirect_uri` (required, must match a registered URI — exact match)
 - `code_challenge` (required if `PKCE_REQUIRED=true`, optional otherwise; 43-128 unreserved characters per RFC 7636)
 - `code_challenge_method=S256` (required if `code_challenge` present)
-- `state` (optional — if absent, a random state is generated server-side for Cursor/MCP Inspector compatibility)
+- `state` (required by default; strict mode rejects `/authorize` with 400 `invalid_request` when absent. Set `COMPAT_ALLOW_STATELESS=true` to keep the legacy server-synth behavior for Cursor / MCP Inspector — `mcp_auth_access_denied_total{reason="state_missing"}` is incremented either way for visibility)
 - `resource` (optional, RFC 8707 — accepted when it matches either `{PROXY_BASE_URL}` / `{PROXY_BASE_URL}/` or the configured mount resource `{PROXY_BASE_URL}<mount>`)
 
 **Behavior:**
@@ -652,16 +652,15 @@ ENTRYPOINT ["/usr/local/bin/mcp-auth-proxy"]
 - **Refresh-token bulk revocation**: `REVOKE_BEFORE` applies to refresh tokens too — a leaked refresh cannot mint fresh access tokens past the cutoff. Refresh tokens carry their own `iat` for this check
 - **redirect_uri**: exact match; `http://` allowed only to a loopback host (full 127/8 range, `::1`, `::ffff:127.0.0.1`, `::0.0.0.1`, `localhost`, `localhost.`); non-http(s) schemes rejected even on loopback; fragments and userinfo rejected; length capped at 512 chars; at most 5 entries per client registration
 - **Structured logs**: zap, JSON format, include `request_id` in each log. Inbound `X-Request-Id` is stripped before chi mints one, to prevent log-forgery via client-controlled IDs. Authenticated requests additionally carry `sub` and `email` from the bearer token. JSON-RPC requests to the upstream MCP server also carry `rpc_method` (e.g. `tools/call`), `rpc_tool` (the `params.name` field), and `rpc_id`. `rpc_method` and `rpc_tool` are capped at 128 characters, `rpc_id` at 64; all three pass through a narrow allowlist (ASCII alphanumerics plus `._:/-+`), so arbitrary attacker-supplied strings cannot bloat or smuggle into log lines. Set `MCP_LOG_BODY_MAX=0` to suppress the `rpc_*` fields entirely. Set `ACCESS_LOG_SKIP_RE` (Go RE2 regexp matched against `r.URL.Path`) to drop entire access-log lines for matching paths — typical use is `^/healthz$` to silence liveness-probe noise; the active pattern is echoed under `access_log_skip_re` in the `startup_config` audit line so an operator triaging "where did `/healthz` go?" can see it immediately
-- **Business metrics**: alongside the Prometheus Go runtime counters, the `metrics` package emits `mcp_auth_tokens_issued_total{grant_type}`, `mcp_auth_access_denied_total{reason}`, `mcp_auth_replay_detected_total{kind}`, `mcp_auth_rate_limited_total{endpoint}`, and `mcp_auth_clients_registered_total` so security-relevant events are alertable
+- **Business metrics**: alongside the Prometheus Go runtime counters, the `metrics` package emits `mcp_auth_tokens_issued_total{grant_type}`, `mcp_auth_access_denied_total{reason}`, `mcp_auth_replay_detected_total{kind}`, `mcp_auth_rate_limited_total{endpoint}`, `mcp_auth_clients_registered_total`, and `mcp_auth_groups_claim_shape_mismatch_total` (id_token `groups` claim failed to decode as `[]string` — the user is admitted with empty groups, so this is NOT a denial; tracked separately so an IdP schema migration is visible before it cascades into a real `group` denial spike)
 - **Graceful shutdown**: context with SIGINT/SIGTERM signals, deadline configurable via `SHUTDOWN_TIMEOUT` (default 120s) — calibrate to the expected SSE stream duration to avoid cutting ongoing MCP sessions during a rolling deploy. The K8s `terminationGracePeriodSeconds` must be ≥ `SHUTDOWN_TIMEOUT`
 - **Timeouts**: `ReadTimeout: 30s`, `WriteTimeout: 0` (SSE), `IdleTimeout: 120s`
 - **Proxy must support SSE**: do not buffer `text/event-stream` responses, immediate flush required
 - **Body size limit**: POST endpoints limited to 1 MB (`MaxBytesReader`)
-- **Rate limiting**: per-IP rate limits on `/register` (10/min), `/authorize` (30/min), `/callback` (30/min), `/token` (60/min). Enabled by default; disable via `RATE_LIMIT_ENABLED=false`. The limiter keys on `X-Forwarded-For`/`X-Real-IP`/`RemoteAddr`, so deployments must terminate behind a trusted L4/L7 frontend — otherwise the headers can be spoofed
+- **Rate limiting**: per-IP rate limits on `/register` (10/min), `/authorize` (30/min), `/callback` (30/min), `/token` (60/min), and the authenticated MCP route (600/min). Enabled by default; disable via `RATE_LIMIT_ENABLED=false`. The limiter keys on the stripped `RemoteAddr` by default. Forwarded-header trust is opt-in: set `TRUSTED_PROXY_CIDRS` to honor `X-Forwarded-For`/`X-Real-IP`/`True-Client-IP` only from peers whose immediate `RemoteAddr` falls inside the listed networks (preferred), or `TRUST_PROXY_HEADERS=true` for blanket legacy trust (rejected by `PROD_MODE=true` unless CIDRs are also configured)
 - **Email verification**: `email_verified=false` in the id_token is rejected at `/callback` with 403 `access_denied` + `error_code: email_not_verified`. Missing claim is accepted — not all IdPs emit it
 - **Replay protection (optional, Redis-gated)**: set `REDIS_URL` to enable two layered controls — (1) single-use authorization codes via `SET NX` on the code's `tid`, and (2) refresh rotation with reuse detection per OAuth 2.1 §6.1: each refresh carries a `tid` + `fam` (family id, shared across rotations); replaying an already-rotated refresh revokes the whole family for 7 days, forcing the lineage back through `/authorize`. On Redis failure the handler fails closed with 503. Without Redis, codes are replayable within the 60s TTL (mitigated by PKCE + audience) and refresh tokens rotate without reuse detection
 - **Group filtering**: optional via `ALLOWED_GROUPS` — enforced at callback time (403 before code issuance). Groups propagated through sealed chain to upstream `X-User-Groups` header
-- **State parameter**: if client omits `state` (MCP Inspector, Cursor), a random 32-char hex value is generated server-side
 - **307/308 redirect following**: proxy follows 307/308 redirects server-side for Python MCP backends (FastAPI/Starlette redirect `/mcp` → `/mcp/`). Same-host only, body replayed, max 10 hops
 - **Resource URI**: `/.well-known/oauth-protected-resource` returns `resource` with trailing slash for Claude.ai compatibility (RFC 8707)
 - **Tests**: unit tests on PKCE validation, token issue/validate, `/register`, `/authorize`, `/token` handlers, group filtering, audience-rejection across all sealed types, `REVOKE_BEFORE` on refresh tokens, authorization-code single-use (with an in-memory replay store), PKCE failure not burning a code, refresh rotation with reuse detection revoking the whole family, miniredis-backed tests for Redis prefixing and cross-deployment isolation, Go 1.22 fuzz targets on the AES-GCM open path (`FuzzOpenJSON`, `FuzzValidate`), and a full E2E flow against a mock OIDC provider including `email_verified=false` rejection and `email_verified=true` acceptance
@@ -699,10 +698,20 @@ spec:
             name: mcp-auth-proxy-secret
         - configMapRef:
             name: mcp-auth-proxy-config
-        readinessProbe:
+        livenessProbe:
           httpGet:
             path: /healthz
-            port: 8080
+            port: http
+        # /readyz lives ONLY on the metrics port — an unauthenticated
+        # readiness endpoint on the public listener is a Redis-DoS
+        # amplifier (a sustained probe flood saturates the pool, flips
+        # readiness fleet-wide, and drops every pod from the Service
+        # simultaneously). Probe via the metrics port the kubelet can
+        # reach in-cluster.
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: metrics
         ports:
         - { name: http,    containerPort: 8080 }
         - { name: metrics, containerPort: 9090 }

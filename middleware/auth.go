@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/babs/mcp-auth-proxy/metrics"
 	"github.com/babs/mcp-auth-proxy/token"
 	"go.uber.org/zap"
 )
@@ -52,10 +53,26 @@ func (a *Auth) Validate(next http.Handler) http.Handler {
 		}
 
 		tokenStr := strings.TrimSpace(authHeader[len(bearerPrefix):])
+		// `Bearer    ` (whitespace-only credential) is malformed, not a
+		// failed token. RFC 6750 §3.1 reserves `invalid_token` for
+		// "presented but failed validation"; the absent/blank case
+		// belongs in `invalid_request` so a client log observer can
+		// tell "I forgot the token" from "my token expired".
+		if tokenStr == "" {
+			a.writeAuthError(w, "invalid_request")
+			return
+		}
 
 		claims, err := a.tokenManager.Validate(tokenStr)
 		if err != nil {
 			a.logger.Debug("token_validation_failed", zap.Error(err))
+			// Reason label split: `invalid_token` covers shape /
+			// signature / TTL failures; `audience_mismatch` and
+			// `token_revoked_iat_cutoff` are tracked separately so a
+			// rotation gone wrong (audience drift) or a bulk revoke
+			// (REVOKE_BEFORE) is alertable independently of routine
+			// expired-token noise.
+			metrics.AccessDenied.WithLabelValues("invalid_token").Inc()
 			a.writeAuthError(w, "invalid_token")
 			return
 		}
@@ -68,6 +85,7 @@ func (a *Auth) Validate(next http.Handler) http.Handler {
 				zap.String("got", claims.Audience),
 				zap.String("want", a.baseURL),
 			)
+			metrics.AccessDenied.WithLabelValues("audience_mismatch").Inc()
 			a.writeAuthError(w, "invalid_token")
 			return
 		}
@@ -78,6 +96,7 @@ func (a *Auth) Validate(next http.Handler) http.Handler {
 				zap.Time("issued_at", claims.IssuedAt),
 				zap.Time("revoke_before", a.revokeBefore),
 			)
+			metrics.AccessDenied.WithLabelValues("token_revoked_iat_cutoff").Inc()
 			a.writeAuthError(w, "invalid_token")
 			return
 		}
