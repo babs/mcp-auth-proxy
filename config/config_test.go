@@ -1216,6 +1216,51 @@ func TestLoad_TrustedProxyCIDRs(t *testing.T) {
 	})
 }
 
+// TestLoad_TrustedProxyHeader covers R2-H1 wiring: optional opt-in
+// header pin, allowlisted to the three forms operators realistically
+// use, typo rejected at startup.
+func TestLoad_TrustedProxyHeader(t *testing.T) {
+	t.Run("default_unset_yields_empty", func(t *testing.T) {
+		setAllRequired(t)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.TrustedProxyHeader != "" {
+			t.Errorf("want empty default, got %q", cfg.TrustedProxyHeader)
+		}
+	})
+	t.Run("accepts_x_real_ip", func(t *testing.T) {
+		setAllRequired(t)
+		t.Setenv("TRUSTED_PROXY_HEADER", "X-Real-IP")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.TrustedProxyHeader != "X-Real-Ip" {
+			t.Errorf("want canonical X-Real-Ip, got %q", cfg.TrustedProxyHeader)
+		}
+	})
+	t.Run("accepts_true_client_ip_lowercase", func(t *testing.T) {
+		setAllRequired(t)
+		t.Setenv("TRUSTED_PROXY_HEADER", "true-client-ip")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.TrustedProxyHeader != "True-Client-Ip" {
+			t.Errorf("want canonical True-Client-Ip, got %q", cfg.TrustedProxyHeader)
+		}
+	})
+	t.Run("rejects_unknown", func(t *testing.T) {
+		setAllRequired(t)
+		t.Setenv("TRUSTED_PROXY_HEADER", "X-Custom-Forwarded")
+		if _, err := Load(); err == nil {
+			t.Fatal("unknown header value should fail startup")
+		}
+	})
+}
+
 // TestLoad_UpstreamAuthorizationHeader covers the
 // UPSTREAM_AUTHORIZATION_HEADER feature: operator supplies the full
 // header value (scheme + credentials); Config captures it verbatim.

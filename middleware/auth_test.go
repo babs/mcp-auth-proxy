@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,13 +23,13 @@ func setupAuth(t *testing.T) (*Auth, *token.Manager) {
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
-	auth := NewAuth(tm, zap.NewNop(), testBaseURL, time.Time{})
+	auth := NewAuth(tm, zap.NewNop(), testBaseURL, "/mcp", time.Time{})
 	return auth, tm
 }
 
 func issueToken(t *testing.T, tm *token.Manager, sub, email string, ttl time.Duration) string {
 	t.Helper()
-	raw, _, err := tm.Issue(testBaseURL, sub, email, "test-client", nil, ttl)
+	raw, _, err := tm.Issue(testBaseURL, sub, email, "test-client", nil, ttl, "")
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
@@ -149,9 +150,50 @@ func TestValidate_WWWAuthenticateHeader(t *testing.T) {
 	}
 
 	// RFC 6750 §3: challenge carries error + error_description + resource_metadata.
-	expected := `Bearer error="invalid_request", error_description="bearer credential is missing or malformed", resource_metadata="` + testBaseURL + `/.well-known/oauth-protected-resource"`
+	// resource_metadata MUST be the path-scoped PRM URL (RFC 9728 §5.3) so a
+	// strict client fetches a document whose `resource` matches the URL it
+	// called — setupAuth() mounts the proxy at "/mcp", so the metadata URL
+	// includes that suffix.
+	expected := `Bearer error="invalid_request", error_description="bearer credential is missing or malformed", resource_metadata="` + testBaseURL + `/.well-known/oauth-protected-resource/mcp"`
 	if wwwAuth != expected {
 		t.Errorf("WWW-Authenticate header mismatch\ngot:  %q\nwant: %q", wwwAuth, expected)
+	}
+}
+
+// TestValidate_PathScopedResourceMetadata pins R1-H1: when the
+// middleware is constructed with a non-empty mount path, the bearer
+// challenge points at the path-scoped PRM. RFC 9728 §5.3 requires a
+// strict client that fetches the document to find a matching
+// `resource` value; pointing at the root PRM (resource=baseURL/)
+// would be discarded.
+func TestValidate_PathScopedResourceMetadata(t *testing.T) {
+	tm, err := token.NewManager(testSecret)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	cases := []struct {
+		name     string
+		mount    string
+		wantPath string
+	}{
+		{"mcp", "/mcp", "/mcp"},
+		{"nested_path", "/api/v1/mcp", "/api/v1/mcp"},
+		{"empty_mount_falls_back_to_root", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			auth := NewAuth(tm, zap.NewNop(), testBaseURL, tc.mount, time.Time{})
+			req := httptest.NewRequest(http.MethodGet, "/x", nil)
+			rr := httptest.NewRecorder()
+			auth.Validate(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				t.Fatal("next must not be called")
+			})).ServeHTTP(rr, req)
+			wa := rr.Header().Get("WWW-Authenticate")
+			wantSubstr := `resource_metadata="` + testBaseURL + `/.well-known/oauth-protected-resource` + tc.wantPath + `"`
+			if !strings.Contains(wa, wantSubstr) {
+				t.Errorf("WWW-Authenticate missing path-scoped PRM\ngot:  %q\nwant substring: %q", wa, wantSubstr)
+			}
+		})
 	}
 }
 
@@ -205,7 +247,7 @@ func TestValidate_GroupsInContext(t *testing.T) {
 	auth, tm := setupAuth(t)
 
 	groups := []string{"admin", "dev"}
-	raw, _, err := tm.Issue(testBaseURL, "user-grp", "grp@example.com", "test-client", groups, 5*time.Minute)
+	raw, _, err := tm.Issue(testBaseURL, "user-grp", "grp@example.com", "test-client", groups, 5*time.Minute, "")
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
@@ -241,7 +283,7 @@ func TestValidate_RevokedByIat(t *testing.T) {
 
 	// Set cutoff to 1 second in the future — token was issued before it
 	cutoff := time.Now().Add(1 * time.Second)
-	auth := NewAuth(tm, zap.NewNop(), testBaseURL, cutoff)
+	auth := NewAuth(tm, zap.NewNop(), testBaseURL, "/mcp", cutoff)
 
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("next handler should not be called")
@@ -265,12 +307,12 @@ func TestValidate_RejectsWrongAudience(t *testing.T) {
 	}
 
 	// Token minted for a sibling instance with the same secret but different baseURL.
-	raw, _, err := tm.Issue("https://other-proxy.example.com", "user-x", "x@example.com", "test-client", nil, 5*time.Minute)
+	raw, _, err := tm.Issue("https://other-proxy.example.com", "user-x", "x@example.com", "test-client", nil, 5*time.Minute, "")
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
 
-	auth := NewAuth(tm, zap.NewNop(), testBaseURL, time.Time{})
+	auth := NewAuth(tm, zap.NewNop(), testBaseURL, "/mcp", time.Time{})
 
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("next handler should not be called for a token with the wrong audience")
@@ -287,6 +329,62 @@ func TestValidate_RejectsWrongAudience(t *testing.T) {
 	}
 }
 
+// TestValidate_RejectsCrossMountResource pins R1-M1: a token whose
+// `res` claim names a different mount on the same proxy origin must
+// be rejected by the bearer middleware. Models the future
+// multi-mount case where two MCP backends share the proxy origin
+// (and signing secret) — without the resource check, a token minted
+// for /mcp-a would silently authorize against /mcp-b. Tokens with
+// no `res` claim (legacy / pre-rolling-deploy) stay accepted.
+func TestValidate_RejectsCrossMountResource(t *testing.T) {
+	tm, err := token.NewManager(testSecret)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	cases := []struct {
+		name         string
+		tokenRes     string
+		expectAccept bool
+	}{
+		{"matching_resource_accepted", testBaseURL + "/mcp", true},
+		{"empty_resource_accepted_for_legacy", "", true},
+		{"sibling_mount_rejected", testBaseURL + "/mcp-other", false},
+		{"different_origin_rejected", "https://other.example/mcp", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, _, err := tm.Issue(testBaseURL, "user", "u@example.com", "cid", nil, 5*time.Minute, tc.tokenRes)
+			if err != nil {
+				t.Fatalf("Issue: %v", err)
+			}
+			auth := NewAuth(tm, zap.NewNop(), testBaseURL, "/mcp", time.Time{})
+			var nextCalled bool
+			next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				nextCalled = true
+				w.WriteHeader(http.StatusOK)
+			})
+			req := httptest.NewRequest(http.MethodGet, "/mcp", nil)
+			req.Header.Set("Authorization", "Bearer "+raw)
+			rr := httptest.NewRecorder()
+			auth.Validate(next).ServeHTTP(rr, req)
+
+			if tc.expectAccept {
+				if !nextCalled || rr.Code != http.StatusOK {
+					t.Errorf("want accept, got status=%d nextCalled=%v", rr.Code, nextCalled)
+				}
+			} else {
+				if nextCalled {
+					t.Errorf("want reject, but next was called")
+				}
+				if rr.Code != http.StatusUnauthorized {
+					t.Errorf("want 401, got %d", rr.Code)
+				}
+			}
+		})
+	}
+}
+
 func TestValidate_NotRevokedAfterCutoff(t *testing.T) {
 	tm, err := token.NewManager(testSecret)
 	if err != nil {
@@ -295,7 +393,7 @@ func TestValidate_NotRevokedAfterCutoff(t *testing.T) {
 
 	// Set cutoff to 1 hour ago — token issued now is after the cutoff
 	cutoff := time.Now().Add(-1 * time.Hour)
-	auth := NewAuth(tm, zap.NewNop(), testBaseURL, cutoff)
+	auth := NewAuth(tm, zap.NewNop(), testBaseURL, "/mcp", cutoff)
 
 	raw := issueToken(t, tm, "user-ok", "ok@example.com", 5*time.Minute)
 

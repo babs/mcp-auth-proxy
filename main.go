@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -183,7 +184,7 @@ func main() {
 		logger.Info("upstream_authorization_header_configured")
 	}
 
-	authMW := middleware.NewAuth(tm, logger, cfg.ProxyBaseURL, cfg.RevokeBefore)
+	authMW := middleware.NewAuth(tm, logger, cfg.ProxyBaseURL, cfg.UpstreamMCPMountPath, cfg.RevokeBefore)
 
 	// Signal lifecycle. Three handlers listen for SIGINT/SIGTERM over the
 	// process lifetime; Go's signal package fans out each delivery to every
@@ -268,13 +269,21 @@ func main() {
 	ipKeyFunc := httprate.KeyByIP
 	switch {
 	case len(cfg.TrustedProxyCIDRs) > 0:
-		ipKeyFunc = cidrAwareKey(cfg.TrustedProxyCIDRs)
+		ipKeyFunc = cidrAwareKey(cfg.TrustedProxyCIDRs, cfg.TrustedProxyHeader)
 		if cfg.TrustProxyHeaders {
 			logger.Warn("trust_proxy_headers_superseded_by_cidrs",
 				zap.String("hint", "TRUST_PROXY_HEADERS is ignored when TRUSTED_PROXY_CIDRS is set"),
 			)
 		}
 	case cfg.TrustProxyHeaders:
+		// Legacy blanket-trust path (TRUST_PROXY_HEADERS=true,
+		// TRUSTED_PROXY_CIDRS unset). httprate.KeyByRealIP picks the
+		// leftmost XFF / True-Client-IP / X-Real-IP without
+		// validating the peer; any client can mint an unbounded
+		// rate-limit bucket per request. Kept ONLY because removing
+		// it would silently regress existing deployments — config
+		// rejects this combo under PROD_MODE=true so production
+		// pods cannot land here.
 		ipKeyFunc = httprate.KeyByRealIP
 		logger.Warn("trust_proxy_headers_deprecated",
 			zap.String("hint", "migrate to TRUSTED_PROXY_CIDRS; TRUST_PROXY_HEADERS trusts every peer"),
@@ -323,6 +332,7 @@ func main() {
 	r.With(authorizeLimit).Get("/authorize", handlers.Authorize(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, handlers.AuthorizeConfig{
 		PKCERequired:         cfg.PKCERequired,
 		ResourceURIs:         []string{cfg.ProxyBaseURL + cfg.UpstreamMCPMountPath},
+		CanonicalResource:    cfg.ProxyBaseURL + cfg.UpstreamMCPMountPath,
 		CompatAllowStateless: cfg.CompatAllowStateless,
 	}))
 	r.With(callbackLimit).Get("/callback", handlers.Callback(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, idTokenVerifier, handlers.CallbackConfig{
@@ -501,31 +511,118 @@ func mustLogger(level string) *zap.Logger {
 // so the router composition is identical in both modes.
 func passthrough(next http.Handler) http.Handler { return next }
 
-// cidrAwareKey returns an httprate.KeyFunc that honors forwarded
-// headers (httprate.KeyByRealIP) only when r.RemoteAddr falls inside
-// one of the configured trusted-proxy networks. Everything else
-// falls back to the raw RemoteAddr, which prevents a direct-to-pod
-// client from spoofing a rate-limit key via X-Forwarded-For.
+// cidrAwareKey returns an httprate.KeyFunc that resolves the rate-limit
+// bucket key from forwarded headers ONLY when the immediate peer is
+// inside one of the configured trusted-proxy networks, and ONLY by
+// walking right-to-left through `X-Forwarded-For` (or another
+// operator-pinned header) until the first hop NOT covered by the
+// trusted-proxy CIDRs is reached. That hop is the closest untrusted
+// origin — the actual client from the trusted ingress' perspective.
+//
+// Why not httprate.KeyByRealIP: that helper picks `True-Client-IP`
+// then `X-Real-IP` then leftmost XFF without sanitization. None are
+// trusted-proxy gated. Most off-the-shelf ingresses (nginx-ingress
+// with `compute-full-forwarded-for=true`, Envoy without
+// `xff_num_trusted_hops`, Cloudflare without strict header
+// stripping) APPEND to XFF and pass `True-Client-IP` through
+// verbatim from the caller. A client that egresses through such an
+// ingress can mint an unbounded rate-limit bucket per request just
+// by varying the header.
+//
+// `header` selects which header carries the hop list. Default
+// `X-Forwarded-For`. Operator may pin `X-Real-IP` or
+// `True-Client-IP` via TRUSTED_PROXY_HEADER when their ingress is
+// known to OVERWRITE (not append) that header — in which case the
+// header carries exactly one trusted hop and the rightmost-walk
+// degenerates to "use the value verbatim".
+//
+// Falls back to the raw RemoteAddr (httprate.KeyByIP) when the peer
+// is not trusted, the header is absent, or every hop in the list is
+// itself trusted (legitimate but useless — can't bucket per-client
+// without an external client identity).
 //
 // Kept in main.go — not a package concern; parsing of the CIDR list
 // lives in config.Load and the wiring is trivially one place.
-func cidrAwareKey(cidrs []*net.IPNet) httprate.KeyFunc {
+func cidrAwareKey(cidrs []*net.IPNet, header string) httprate.KeyFunc {
+	if header == "" {
+		header = "X-Forwarded-For"
+	}
 	return func(r *http.Request) (string, error) {
 		host, _, err := net.SplitHostPort(r.RemoteAddr)
 		if err != nil {
 			host = r.RemoteAddr
 		}
 		ip := net.ParseIP(host)
-		if ip == nil {
+		if ip == nil || !cidrContainsAny(cidrs, ip) {
 			return httprate.KeyByIP(r)
 		}
-		for _, c := range cidrs {
-			if c.Contains(ip) {
-				return httprate.KeyByRealIP(r)
+		raw := r.Header.Get(header)
+		if raw == "" {
+			return httprate.KeyByIP(r)
+		}
+		// Walk right-to-left: the rightmost entry was added by the
+		// trusted ingress (its view of the immediate peer); each
+		// step left was added by the hop further out. Stop at the
+		// first hop NOT in the trusted-proxy set — that is the
+		// closest untrusted origin (the actual client per the
+		// trusted ingress).
+		hops := strings.Split(raw, ",")
+		for i := len(hops) - 1; i >= 0; i-- {
+			candidate := strings.TrimSpace(hops[i])
+			if candidate == "" {
+				continue
+			}
+			// IPv6 forms in XFF are usually bare (RFC 7239 §6 uses
+			// the `Forwarded` header for bracketed forms); strip a
+			// stray bracket pair and a trailing :port for both
+			// families just in case an upstream synthesizes them.
+			candidate = stripPortAndBrackets(candidate)
+			hopIP := net.ParseIP(candidate)
+			if hopIP == nil {
+				return httprate.KeyByIP(r)
+			}
+			if !cidrContainsAny(cidrs, hopIP) {
+				return canonicalIPKey(hopIP), nil
 			}
 		}
 		return httprate.KeyByIP(r)
 	}
+}
+
+func cidrContainsAny(cidrs []*net.IPNet, ip net.IP) bool {
+	for _, c := range cidrs {
+		if c.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// stripPortAndBrackets normalises a hop entry that may carry an
+// optional `:port` suffix or `[ipv6]` bracket form. Anything that
+// doesn't fit those shapes is returned verbatim so a malformed entry
+// trips the net.ParseIP check at the call site.
+func stripPortAndBrackets(s string) string {
+	if len(s) >= 2 && s[0] == '[' {
+		if end := strings.IndexByte(s, ']'); end > 0 {
+			return s[1:end]
+		}
+	}
+	if i := strings.LastIndexByte(s, ':'); i > 0 && strings.IndexByte(s, ':') == i {
+		return s[:i]
+	}
+	return s
+}
+
+// canonicalIPKey mirrors httprate's internal canonicalisation so the
+// trusted-XFF key collates with the direct-RemoteAddr key. Without
+// this, a v4-mapped v6 form ("::ffff:1.2.3.4") would bucket
+// separately from the bare v4 ("1.2.3.4").
+func canonicalIPKey(ip net.IP) string {
+	if v4 := ip.To4(); v4 != nil {
+		return v4.String()
+	}
+	return ip.String()
 }
 
 // rateLimiter builds an httprate middleware that emits a JSON OAuth error on

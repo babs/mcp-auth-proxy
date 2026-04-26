@@ -29,12 +29,17 @@ const (
 
 // sanitizeRequestHeaders strips inbound headers that must not reach the
 // upstream: forwarding/IP headers that could spoof client identity at the
-// upstream ACL layer, and any X-User-* headers the caller may have injected
-// to impersonate a different user. Must be called before injectIdentityHeaders
-// so the proxy-owned values are never accidentally deleted. Also called on
-// every redirect hop to prevent smuggling across path transitions (H2, H9).
+// upstream ACL layer, the MCP client's bearer credential, and any X-User-*
+// headers the caller may have injected to impersonate a different user.
+// Authorization is always stripped here so the redirect-follow hop and the
+// first-hop Director share a single source of truth — the operator-supplied
+// upstream credential is re-applied on every hop AFTER this runs. Must be
+// called before injectIdentityHeaders so the proxy-owned values are never
+// accidentally deleted. Also called on every redirect hop to prevent
+// smuggling across path transitions (H2, H9).
 func sanitizeRequestHeaders(req *http.Request) {
 	for _, h := range []string{
+		"Authorization",
 		"Cookie",
 		"Proxy-Authorization",
 		"X-Forwarded-For",

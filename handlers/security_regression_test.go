@@ -50,7 +50,7 @@ func TestC1a_RegisterBlobRejectedAsBearer(t *testing.T) {
 	// as a Bearer token. Before the fix this was accepted as a 24h credential.
 	encClientID, _ := registerClient(t, tm, []string{"https://app.example.com/callback"})
 
-	auth := middleware.NewAuth(tm, zap.NewNop(), testBaseURL, time.Time{})
+	auth := middleware.NewAuth(tm, zap.NewNop(), testBaseURL, "/mcp", time.Time{})
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("middleware must not forward a sealed-client blob as a bearer")
 	})
@@ -147,7 +147,7 @@ func TestC1d_RefreshBlobRejectedAsBearer(t *testing.T) {
 
 	refreshStr := sealRefresh(t, tm, "user-sub", "user@example.com", internalID)
 
-	auth := middleware.NewAuth(tm, zap.NewNop(), testBaseURL, time.Time{})
+	auth := middleware.NewAuth(tm, zap.NewNop(), testBaseURL, "/mcp", time.Time{})
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("middleware must not forward a sealedRefresh blob as a bearer")
 	})
@@ -170,7 +170,7 @@ func TestC1e_AccessBlobRejectedAtTokenRefresh(t *testing.T) {
 	encClientID, _ := registerClient(t, tm, []string{"https://app.example.com/callback"})
 
 	// A legitimate access token issued by tm.Issue — purpose = "access".
-	accessTok, _, err := tm.Issue(testBaseURL, "user-sub", "user@example.com", "some-client", nil, 5*time.Minute)
+	accessTok, _, err := tm.Issue(testBaseURL, "user-sub", "user@example.com", "some-client", nil, 5*time.Minute, "")
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}

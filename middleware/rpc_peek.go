@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"mime"
 	"net/http"
 	"strings"
 
@@ -100,8 +101,15 @@ func RPCPeek(cfg RPCPeekConfig) func(http.Handler) http.Handler {
 			}
 
 			// Conditions under which we skip body inspection entirely.
+			// Content-Type is parsed via mime.ParseMediaType so a
+			// client sending "Application/JSON" or
+			// "application/json; charset=utf-8" still matches —
+			// RFC 9110 §8.3 makes type/subtype case-insensitive.
+			// Without this, a client could suppress per-tool metrics
+			// and rpc_method/rpc_tool/rpc_id access-log enrichment
+			// just by varying the header case.
 			if cfg.MaxBodyBytes == 0 ||
-				!strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") ||
+				!isJSONContentType(r.Header.Get("Content-Type")) ||
 				r.ContentLength < 0 || r.ContentLength > cfg.MaxBodyBytes {
 				next.ServeHTTP(w, r)
 				return
@@ -199,6 +207,22 @@ func RPCPeek(cfg RPCPeekConfig) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
+}
+
+// isJSONContentType reports whether the Content-Type header value
+// declares an application/json body. mime.ParseMediaType strips
+// parameters and lowercases the type/subtype, so "Application/JSON",
+// "application/json; charset=utf-8" and "application/json" all match.
+// A malformed header is treated as non-JSON (skip peek).
+func isJSONContentType(ct string) bool {
+	if ct == "" {
+		return false
+	}
+	mt, _, err := mime.ParseMediaType(ct)
+	if err != nil {
+		return false
+	}
+	return mt == "application/json"
 }
 
 // sanitize caps s at maxLen runes and keeps only a narrow allowlist

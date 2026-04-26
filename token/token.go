@@ -39,10 +39,25 @@ const (
 )
 
 // Claims represents the internal access token payload.
+//
+// Audience binds the token to the proxy base URL that issued it
+// (cross-instance replay defense — two deployments sharing the same
+// TOKEN_SIGNING_SECRET cannot honour each other's tokens).
+//
+// Resource is the RFC 8707 resource indicator this token was minted
+// for — for the single-mount proxy this is always
+// {baseURL}{mountPath}. Sealed and validated separately from
+// Audience so a future multi-mount or multi-tenant deployment that
+// shares an origin cannot honour a token minted for another mount
+// (RFC 8707 §2.2). Empty on tokens minted before this field
+// existed; treated as "unknown" by the middleware (rejected only
+// when the middleware was constructed with a non-empty expected
+// resource — back-compat for callers that haven't opted in).
 type Claims struct {
 	TokenID   string    `json:"tid"`
 	Typ       string    `json:"typ"`
 	Audience  string    `json:"aud"`
+	Resource  string    `json:"res,omitempty"`
 	Subject   string    `json:"sub"`
 	Email     string    `json:"email"`
 	Groups    []string  `json:"grp,omitempty"`
@@ -191,7 +206,12 @@ func (m *Manager) seal(data []byte, purpose string) (string, error) {
 	// view via increase(metric[window]). The in-process warning stays
 	// as a belt-and-braces signal for single-replica or unscraped
 	// deployments.
-	if n := m.sealCount.Add(1); n == sealRotationThreshold {
+	// `>=` rather than `==`: under concurrent seals, two Add(1) calls
+	// can return n=threshold-1 and n=threshold+1 with no goroutine
+	// observing the exact value. The CompareAndSwap on warnedOnce
+	// still keeps the warning one-shot — this just guarantees the
+	// first crossing always trips it.
+	if n := m.sealCount.Add(1); n >= sealRotationThreshold {
 		if m.logger != nil && m.warnedOnce.CompareAndSwap(false, true) {
 			m.logger.Warn("token_seal_rotation_threshold",
 				zap.Uint64("seal_count", n),
@@ -255,15 +275,24 @@ func (m *Manager) OpenJSON(sealed string, v any, purpose string) error {
 	return json.Unmarshal(data, v)
 }
 
-// Issue creates a new opaque access token. The audience binds the token to a
-// specific proxy deployment so it cannot be replayed against a sibling instance
-// that happens to share the same signing secret.
-func (m *Manager) Issue(audience, subject, email, clientID string, groups []string, ttl time.Duration) (string, *Claims, error) {
+// Issue creates a new opaque access token.
+//
+// audience binds the token to a specific proxy deployment so it
+// cannot be replayed against a sibling instance that happens to
+// share the same signing secret.
+//
+// resource is the RFC 8707 resource indicator this token was minted
+// for. Sealed alongside audience so a future multi-mount deployment
+// sharing the proxy origin cannot accept a token minted for a
+// different mount (RFC 8707 §2.2). Pass "" when the caller does not
+// participate in the resource binding (legacy / non-MCP callers).
+func (m *Manager) Issue(audience, subject, email, clientID string, groups []string, ttl time.Duration, resource string) (string, *Claims, error) {
 	now := time.Now()
 	claims := &Claims{
 		TokenID:   uuid.New().String(),
 		Typ:       PurposeAccess,
 		Audience:  audience,
+		Resource:  resource,
 		Subject:   subject,
 		Email:     email,
 		Groups:    groups,

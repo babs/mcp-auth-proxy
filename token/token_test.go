@@ -48,7 +48,7 @@ func TestIssueAndValidate(t *testing.T) {
 	clientID := "client-abc"
 	ttl := 5 * time.Minute
 
-	tok, issuedClaims, err := m.Issue(audience, subject, email, clientID, nil, ttl)
+	tok, issuedClaims, err := m.Issue(audience, subject, email, clientID, nil, ttl, "")
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
@@ -87,7 +87,7 @@ func TestIssueAndValidate(t *testing.T) {
 func TestValidateExpired(t *testing.T) {
 	m := mustNewManager(t, make([]byte, 32))
 
-	tok, _, err := m.Issue("https://proxy.example.com", "user", "u@example.com", "cid", nil, time.Millisecond)
+	tok, _, err := m.Issue("https://proxy.example.com", "user", "u@example.com", "cid", nil, time.Millisecond, "")
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
@@ -103,7 +103,7 @@ func TestValidateExpired(t *testing.T) {
 func TestValidateTampered(t *testing.T) {
 	m := mustNewManager(t, make([]byte, 32))
 
-	tok, _, err := m.Issue("https://proxy.example.com", "user", "u@example.com", "cid", nil, 5*time.Minute)
+	tok, _, err := m.Issue("https://proxy.example.com", "user", "u@example.com", "cid", nil, 5*time.Minute, "")
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
@@ -148,7 +148,7 @@ func TestDifferentSecrets(t *testing.T) {
 	m1 := mustNewManager(t, secret1)
 	m2 := mustNewManager(t, secret2)
 
-	tok, _, err := m1.Issue("https://proxy.example.com", "user", "u@example.com", "cid", nil, 5*time.Minute)
+	tok, _, err := m1.Issue("https://proxy.example.com", "user", "u@example.com", "cid", nil, 5*time.Minute, "")
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
@@ -246,7 +246,7 @@ func TestSealCount_IncrementsOnEverySeal(t *testing.T) {
 		t.Errorf("SealCount = %d, want 5", got)
 	}
 	// Issue also seals.
-	if _, _, err := m.Issue("aud", "sub", "e@e", "cid", nil, time.Minute); err != nil {
+	if _, _, err := m.Issue("aud", "sub", "e@e", "cid", nil, time.Minute, ""); err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
 	if got := m.SealCount(); got != 6 {
@@ -281,7 +281,7 @@ func TestSealMetric_InvokedPerPurpose(t *testing.T) {
 		t.Fatalf("SealJSON session 2: %v", err)
 	}
 	// Issue seals an access token too.
-	if _, _, err := m.Issue("aud", "sub", "e@e", "cid", nil, time.Minute); err != nil {
+	if _, _, err := m.Issue("aud", "sub", "e@e", "cid", nil, time.Minute, ""); err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
 

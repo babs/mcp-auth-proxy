@@ -14,26 +14,77 @@ import (
 	"github.com/babs/mcp-auth-proxy/middleware"
 )
 
-// TestCIDRAwareKey covers P1c: only peers inside a trusted CIDR get
-// their XFF honored. Direct-to-pod clients outside the allowlist fall
-// back to RemoteAddr-keyed buckets regardless of forwarded headers.
+// TestCIDRAwareKey covers R2-H1: keying walks XFF right-to-left from
+// the trusted ingress, stopping at the first hop NOT in the trusted
+// CIDR set. That stops a client behind a typical k8s ingress from
+// minting an unbounded rate-limit bucket per request by appending
+// arbitrary leftmost values.
 func TestCIDRAwareKey(t *testing.T) {
-	_, cidr, err := net.ParseCIDR("10.0.0.0/8")
+	_, podCIDR, err := net.ParseCIDR("10.0.0.0/8")
 	if err != nil {
 		t.Fatalf("parse cidr: %v", err)
 	}
-	keyFn := cidrAwareKey([]*net.IPNet{cidr})
+	keyFn := cidrAwareKey([]*net.IPNet{podCIDR}, "")
 
-	t.Run("trusted_peer_honors_xff", func(t *testing.T) {
+	t.Run("trusted_peer_uses_rightmost_untrusted_xff_hop", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/x", nil)
 		req.RemoteAddr = "10.1.2.3:12345"
-		req.Header.Set("X-Forwarded-For", "203.0.113.99")
+		// nginx-ingress style: client IP is rightmost-trusted-1.
+		req.Header.Set("X-Forwarded-For", "203.0.113.99, 10.42.0.7")
 		key, err := keyFn(req)
 		if err != nil {
 			t.Fatalf("keyFn: %v", err)
 		}
 		if key != "203.0.113.99" {
-			t.Errorf("trusted peer: want key from XFF %q, got %q", "203.0.113.99", key)
+			t.Errorf("want client IP from rightmost-trusted-1, got %q", key)
+		}
+	})
+	t.Run("trusted_peer_ignores_attacker_appended_leftmost_xff", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/x", nil)
+		req.RemoteAddr = "10.1.2.3:12345"
+		// Attacker behind an ingress that APPENDS XFF: their value
+		// is the leftmost entry. With a right-to-left walk we land
+		// on the ingress' own view of the immediate peer
+		// (203.0.113.99), not on whatever the attacker forged.
+		req.Header.Set("X-Forwarded-For", "evil-spoof, 203.0.113.99, 10.42.0.7")
+		key, err := keyFn(req)
+		if err != nil {
+			t.Fatalf("keyFn: %v", err)
+		}
+		if key == "evil-spoof" {
+			t.Errorf("attacker spoof leaked into bucket key: %q", key)
+		}
+		if key != "203.0.113.99" {
+			t.Errorf("want client IP from rightmost-trusted-1, got %q", key)
+		}
+	})
+	t.Run("trusted_peer_ignores_true_client_ip_by_default", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/x", nil)
+		req.RemoteAddr = "10.1.2.3:12345"
+		// Default header is X-Forwarded-For; True-Client-IP must
+		// NOT influence the bucket without an explicit opt-in.
+		req.Header.Set("True-Client-IP", "evil-spoof")
+		key, err := keyFn(req)
+		if err != nil {
+			t.Fatalf("keyFn: %v", err)
+		}
+		if key == "evil-spoof" {
+			t.Errorf("True-Client-IP leaked into bucket key without TRUSTED_PROXY_HEADER opt-in: %q", key)
+		}
+	})
+	t.Run("trusted_peer_uses_pinned_header_when_opted_in", func(t *testing.T) {
+		fn := cidrAwareKey([]*net.IPNet{podCIDR}, "X-Real-Ip")
+		req := httptest.NewRequest(http.MethodGet, "/x", nil)
+		req.RemoteAddr = "10.1.2.3:12345"
+		req.Header.Set("X-Real-Ip", "203.0.113.42")
+		// XFF should be ignored when the operator pinned a different header.
+		req.Header.Set("X-Forwarded-For", "203.0.113.99")
+		key, err := fn(req)
+		if err != nil {
+			t.Fatalf("keyFn: %v", err)
+		}
+		if key != "203.0.113.42" {
+			t.Errorf("want pinned X-Real-Ip value, got %q", key)
 		}
 	})
 	t.Run("untrusted_peer_uses_remote_addr", func(t *testing.T) {
@@ -49,6 +100,43 @@ func TestCIDRAwareKey(t *testing.T) {
 		}
 		if key != "203.0.113.50" {
 			t.Errorf("want RemoteAddr-derived key %q, got %q", "203.0.113.50", key)
+		}
+	})
+	t.Run("trusted_peer_no_xff_falls_back_to_remote_addr", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/x", nil)
+		req.RemoteAddr = "10.1.2.3:12345"
+		key, err := keyFn(req)
+		if err != nil {
+			t.Fatalf("keyFn: %v", err)
+		}
+		if key != "10.1.2.3" {
+			t.Errorf("want fallback to RemoteAddr, got %q", key)
+		}
+	})
+	t.Run("trusted_peer_all_hops_trusted_falls_back", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/x", nil)
+		req.RemoteAddr = "10.1.2.3:12345"
+		// Pathological: every XFF entry is itself a trusted hop.
+		// No untrusted origin to bucket on — fall back to RemoteAddr.
+		req.Header.Set("X-Forwarded-For", "10.42.0.1, 10.42.0.2, 10.42.0.3")
+		key, err := keyFn(req)
+		if err != nil {
+			t.Fatalf("keyFn: %v", err)
+		}
+		if key != "10.1.2.3" {
+			t.Errorf("want fallback to RemoteAddr when every XFF hop is trusted, got %q", key)
+		}
+	})
+	t.Run("malformed_xff_hop_falls_back", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/x", nil)
+		req.RemoteAddr = "10.1.2.3:12345"
+		req.Header.Set("X-Forwarded-For", "not-an-ip")
+		key, err := keyFn(req)
+		if err != nil {
+			t.Fatalf("keyFn: %v", err)
+		}
+		if key != "10.1.2.3" {
+			t.Errorf("want fallback to RemoteAddr on malformed hop, got %q", key)
 		}
 	})
 	t.Run("bad_remote_addr_falls_back", func(t *testing.T) {

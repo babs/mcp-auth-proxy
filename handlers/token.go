@@ -45,6 +45,21 @@ func Token(tm *token.Manager, logger *zap.Logger, audience string, revokeBefore 
 			return
 		}
 
+		// RFC 6749 §5.2 / §3.2.1: this AS publishes
+		// token_endpoint_auth_methods_supported=["none"] and DCR
+		// only accepts "none" — there is no client-secret credential
+		// the bearer middleware would accept here. Silently ignoring
+		// an Authorization attempt would let a confused client
+		// believe its Basic / Bearer secret was honoured. Reject
+		// explicitly with `invalid_client` and a 401 challenge so
+		// the client can correct its wiring before relying on a
+		// non-authenticated path.
+		if r.Header.Get("Authorization") != "" {
+			w.Header().Set("WWW-Authenticate", `Basic realm="token", error="invalid_client", error_description="this token endpoint does not authenticate clients (token_endpoint_auth_method=none); remove the Authorization header"`)
+			writeOAuthError(w, http.StatusUnauthorized, "invalid_client", "this token endpoint does not authenticate clients (token_endpoint_auth_method=none); remove the Authorization header")
+			return
+		}
+
 		if err := r.ParseForm(); err != nil {
 			// Distinguish a body that exceeded MaxBodySize (1 MB
 			// cap) from a structurally-malformed body, so a client
@@ -232,14 +247,18 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 				return
 			}
 			// Fail closed on backend errors — do not issue tokens against an
-			// uncertain replay-state result.
+			// uncertain replay-state result. Surfaces the
+			// `replay_store_unavailable` reason on the same denial counter
+			// the runbook tells operators to alert on (a Redis outage hits
+			// both the code and refresh paths under load).
 			logger.Error("replay_store_error", zap.Error(err))
+			metrics.AccessDenied.WithLabelValues("replay_store_unavailable").Inc()
 			writeOAuthError(w, http.StatusServiceUnavailable, "server_error", "replay store unavailable", "replay_store_unavailable")
 			return
 		}
 	}
 
-	accessToken, _, err := tm.Issue(audience, code.Subject, code.Email, client.ID, code.Groups, accessTokenTTL)
+	accessToken, _, err := tm.Issue(audience, code.Subject, code.Email, client.ID, code.Groups, accessTokenTTL, code.Resource)
 	if err != nil {
 		logger.Error("token_issue_failed", zap.Error(err))
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "failed to issue token", "token_issue_failed")
@@ -253,15 +272,26 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 		// can revoke every refresh descended from this redemption
 		// (RFC 6749 §4.1.2). A fresh UUID here would orphan the
 		// lineage from the code that spawned it.
-		FamilyID:  code.FamilyID,
-		Subject:   code.Subject,
-		Email:     code.Email,
-		Groups:    code.Groups,
-		ClientID:  client.ID,
-		Typ:       token.PurposeRefresh,
-		Audience:  audience,
-		IssuedAt:  now,
-		ExpiresAt: now.Add(refreshTokenTTL),
+		FamilyID: code.FamilyID,
+		Subject:  code.Subject,
+		Email:    code.Email,
+		Groups:   code.Groups,
+		ClientID: client.ID,
+		Typ:      token.PurposeRefresh,
+		Audience: audience,
+		// Resource carries the RFC 8707 binding from the code to
+		// every descendant access + refresh in the lineage. Once
+		// minted at /authorize the binding is invariant for the
+		// life of the family.
+		Resource: code.Resource,
+		IssuedAt: now,
+		// FamilyIssuedAt is set ONCE here at code redemption and
+		// inherited unchanged by every rotation. REVOKE_BEFORE is
+		// compared against this stamp so a steadily rotating
+		// attacker cannot outlive a bulk revocation by pushing
+		// IssuedAt forward on every refresh.
+		FamilyIssuedAt: now,
+		ExpiresAt:      now.Add(refreshTokenTTL),
 	}
 	refreshToken, err := tm.SealJSON(refresh, token.PurposeRefresh)
 	if err != nil {
@@ -320,12 +350,26 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 		return
 	}
 
-	// Bulk revocation: reject refresh tokens issued before the cutoff.
-	// Without this check, REVOKE_BEFORE only invalidates access tokens and a
-	// compromised refresh token would silently mint fresh ones past the cutoff.
-	if !revokeBefore.IsZero() && refresh.IssuedAt.Before(revokeBefore) {
+	// Bulk revocation: reject refresh tokens whose family was first
+	// issued before the cutoff. Comparing against FamilyIssuedAt
+	// (not IssuedAt) closes a quiet-rotation bypass: every rotation
+	// pushes IssuedAt forward, so a comparison against IssuedAt let
+	// an attacker who keeps rotating a stolen refresh outlive
+	// REVOKE_BEFORE indefinitely. FamilyIssuedAt is minted once at
+	// code redemption and inherited unchanged across the lineage,
+	// so the cutoff catches the whole family.
+	//
+	// Legacy refresh tokens sealed before FamilyIssuedAt existed
+	// carry a zero value; fall back to IssuedAt for them so a
+	// rolling deploy doesn't immediately invalidate active sessions
+	// — the next rotation populates FamilyIssuedAt.
+	cutoffStamp := refresh.FamilyIssuedAt
+	if cutoffStamp.IsZero() {
+		cutoffStamp = refresh.IssuedAt
+	}
+	if !revokeBefore.IsZero() && cutoffStamp.Before(revokeBefore) {
 		logger.Debug("refresh_token_revoked_iat_cutoff",
-			zap.Time("issued_at", refresh.IssuedAt),
+			zap.Time("family_issued_at", cutoffStamp),
 			zap.Time("revoke_before", revokeBefore),
 		)
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh token revoked")
@@ -372,6 +416,7 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 		revoked, alreadyClaimed, err := replayStore.ClaimOrCheckFamily(r.Context(), familyKey, claimKey, claimTTL, refreshTokenTTL)
 		if err != nil {
 			logger.Error("replay_store_error", zap.Error(err))
+			metrics.AccessDenied.WithLabelValues("replay_store_unavailable").Inc()
 			writeOAuthError(w, http.StatusServiceUnavailable, "server_error", "replay store unavailable", "replay_store_unavailable")
 			return
 		}
@@ -398,7 +443,7 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 		}
 	}
 
-	accessToken, _, err := tm.Issue(audience, refresh.Subject, refresh.Email, client.ID, refresh.Groups, accessTokenTTL)
+	accessToken, _, err := tm.Issue(audience, refresh.Subject, refresh.Email, client.ID, refresh.Groups, accessTokenTTL, refresh.Resource)
 	if err != nil {
 		logger.Error("token_refresh_issue_failed", zap.Error(err))
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "failed to issue token", "token_issue_failed")
@@ -408,18 +453,29 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 	// The rotated refresh inherits the FamilyID so reuse detection spans the
 	// entire lineage; a fresh TokenID makes it single-use on its own. Empty
 	// FamilyID was rejected upfront (C2), so the field is always set here.
+	// Resource and FamilyIssuedAt are also inherited verbatim — once bound
+	// at /authorize the RFC 8707 resource and the family-origin stamp are
+	// invariant for the life of the family. Legacy refreshes sealed without
+	// FamilyIssuedAt seed it from IssuedAt on the first rotation so the
+	// REVOKE_BEFORE invariant tightens forward as sessions rotate.
 	now := time.Now()
+	familyIssuedAt := refresh.FamilyIssuedAt
+	if familyIssuedAt.IsZero() {
+		familyIssuedAt = refresh.IssuedAt
+	}
 	newRefresh := sealedRefresh{
-		TokenID:   uuid.New().String(),
-		FamilyID:  refresh.FamilyID,
-		Subject:   refresh.Subject,
-		Email:     refresh.Email,
-		Groups:    refresh.Groups,
-		ClientID:  client.ID,
-		Typ:       token.PurposeRefresh,
-		Audience:  audience,
-		IssuedAt:  now,
-		ExpiresAt: now.Add(refreshTokenTTL),
+		TokenID:        uuid.New().String(),
+		FamilyID:       refresh.FamilyID,
+		Subject:        refresh.Subject,
+		Email:          refresh.Email,
+		Groups:         refresh.Groups,
+		ClientID:       client.ID,
+		Typ:            token.PurposeRefresh,
+		Audience:       audience,
+		Resource:       refresh.Resource,
+		IssuedAt:       now,
+		FamilyIssuedAt: familyIssuedAt,
+		ExpiresAt:      now.Add(refreshTokenTTL),
 	}
 	newRefreshToken, err := tm.SealJSON(newRefresh, token.PurposeRefresh)
 	if err != nil {

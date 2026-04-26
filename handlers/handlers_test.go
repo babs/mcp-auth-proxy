@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -12,10 +13,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/babs/mcp-auth-proxy/metrics"
 	"github.com/babs/mcp-auth-proxy/replay"
 	"github.com/babs/mcp-auth-proxy/token"
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 	"golang.org/x/oauth2"
 )
@@ -108,16 +111,18 @@ func sealCode(t *testing.T, tm *token.Manager, clientUUID, redirectURI, codeChal
 // sealRefresh creates an encrypted refresh token for testing.
 func sealRefresh(t *testing.T, tm *token.Manager, subject, email, clientUUID string) string {
 	t.Helper()
+	now := time.Now()
 	sr := sealedRefresh{
-		TokenID:   uuid.New().String(),
-		FamilyID:  uuid.New().String(),
-		Subject:   subject,
-		Email:     email,
-		ClientID:  clientUUID,
-		Typ:       token.PurposeRefresh,
-		Audience:  testBaseURL,
-		IssuedAt:  time.Now(),
-		ExpiresAt: time.Now().Add(7 * 24 * time.Hour),
+		TokenID:        uuid.New().String(),
+		FamilyID:       uuid.New().String(),
+		Subject:        subject,
+		Email:          email,
+		ClientID:       clientUUID,
+		Typ:            token.PurposeRefresh,
+		Audience:       testBaseURL,
+		IssuedAt:       now,
+		FamilyIssuedAt: now,
+		ExpiresAt:      now.Add(7 * 24 * time.Hour),
 	}
 	tok, err := tm.SealJSON(sr, token.PurposeRefresh)
 	if err != nil {
@@ -1459,7 +1464,18 @@ func TestCallback_OIDCErrorResponse(t *testing.T) {
 // test seeds a real session, lets the IdP-error redirect-back path
 // fire, and asserts the sanitized description lands in the redirect
 // query string.
-func TestCallback_OIDCError_AllowlistAndSanitize(t *testing.T) {
+// TestCallback_OIDCError_AllowlistedErrorAndFixedDescription pins
+// two contracts on the validated-session IdP-error redirect:
+//
+//  1. The `error` code is allowlisted (RFC 6749 §4.1.2.1); anything
+//     outside the closed set collapses to `server_error`.
+//  2. The `error_description` is ALWAYS the fixed proxy-owned text,
+//     never the caller-supplied one — even after the sanitizer
+//     would have admitted it. C-M1: a phisher who can craft a
+//     /callback URL with arbitrary query params (and a fresh sealed
+//     state) must not be able to deliver attacker-controlled text
+//     into a legit MCP-client error UI under the proxy's branding.
+func TestCallback_OIDCError_AllowlistedErrorAndFixedDescription(t *testing.T) {
 	tm := newTestTokenManager(t)
 	oauth2Cfg := testOAuth2Config()
 	verifyFunc := func(_ context.Context, _ string) (*oidc.IDToken, error) {
@@ -1485,46 +1501,37 @@ func TestCallback_OIDCError_AllowlistAndSanitize(t *testing.T) {
 		return state
 	}
 
-	longDesc := strings.Repeat("A", 250) + "<will-be-trimmed>"
+	const fixedDesc = "authorization denied by identity provider"
 
 	tests := []struct {
 		name       string
 		errorParam string
 		descParam  string
 		wantErr    string
-		wantDescIs func(string) bool
 	}{
 		{
 			name:       "unknown_error_collapsed_to_server_error",
 			errorParam: "attacker-controlled_value",
 			descParam:  "hi",
 			wantErr:    "server_error",
-			wantDescIs: func(s string) bool { return s == "hi" },
 		},
 		{
-			name:       "description_truncated_to_200",
+			name:       "phishing_description_replaced",
 			errorParam: "access_denied",
-			descParam:  longDesc,
+			descParam:  "Visit https://attacker.example/login to recover your session",
 			wantErr:    "access_denied",
-			wantDescIs: func(s string) bool { return len(s) == 200 && strings.HasPrefix(s, "AAAA") },
 		},
 		{
-			name:       "crlf_stripped",
+			name:       "long_description_replaced",
+			errorParam: "access_denied",
+			descParam:  strings.Repeat("A", 250),
+			wantErr:    "access_denied",
+		},
+		{
+			name:       "crlf_description_replaced",
 			errorParam: "invalid_request",
 			descParam:  "line1\r\nline2",
 			wantErr:    "invalid_request",
-			wantDescIs: func(s string) bool {
-				return !strings.ContainsAny(s, "\r\n") && strings.Contains(s, "line1line2")
-			},
-		},
-		{
-			name:       "non_ascii_stripped",
-			errorParam: "access_denied",
-			descParam:  "café naïve",
-			wantErr:    "access_denied",
-			wantDescIs: func(s string) bool {
-				return strings.Contains(s, "caf") && !strings.ContainsRune(s, 'é')
-			},
 		},
 	}
 
@@ -1546,13 +1553,11 @@ func TestCallback_OIDCError_AllowlistAndSanitize(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parse Location: %v", err)
 			}
-			gotErr := loc.Query().Get("error")
-			gotDesc := loc.Query().Get("error_description")
-			if gotErr != tc.wantErr {
-				t.Errorf("error = %q, want %q", gotErr, tc.wantErr)
+			if got := loc.Query().Get("error"); got != tc.wantErr {
+				t.Errorf("error = %q, want %q", got, tc.wantErr)
 			}
-			if !tc.wantDescIs(gotDesc) {
-				t.Errorf("unexpected error_description %q", gotDesc)
+			if got := loc.Query().Get("error_description"); got != fixedDesc {
+				t.Errorf("error_description = %q, want fixed text %q", got, fixedDesc)
 			}
 		})
 	}
@@ -2682,9 +2687,11 @@ func TestTokenRefresh_NotRevokedAfterCutoff(t *testing.T) {
 	}
 }
 
-// TestTokenRefresh_NewTokenCarriesIssuedAt verifies that the rotated refresh
-// token has its IssuedAt updated to "now" so it survives a future REVOKE_BEFORE
-// cutoff applied to its predecessor.
+// TestTokenRefresh_NewTokenCarriesIssuedAt verifies that the rotated
+// refresh token has its IssuedAt updated to "now". Per-rotation
+// freshness is what the replay-store reuse-detection cares about;
+// the bulk REVOKE_BEFORE cutoff is anchored to FamilyIssuedAt
+// instead and is exercised by TestTokenRefresh_FamilyIssuedAt_*.
 func TestTokenRefresh_NewTokenCarriesIssuedAt(t *testing.T) {
 	tm := newTestTokenManager(t)
 	logger := zap.NewNop()
@@ -2732,6 +2739,281 @@ func TestTokenRefresh_NewTokenCarriesIssuedAt(t *testing.T) {
 	}
 	if newRefresh.Audience != testBaseURL {
 		t.Errorf("rotated refresh audience: got %q, want %q", newRefresh.Audience, testBaseURL)
+	}
+}
+
+// TestTokenRefresh_FamilyIssuedAt_Inherited pins C-M3: a rotated
+// refresh inherits FamilyIssuedAt from its predecessor, so the
+// stamp the bulk REVOKE_BEFORE cutoff is compared against does NOT
+// drift forward across rotations. Without this, a quietly rotating
+// attacker could outlive an operator's bulk revocation.
+func TestTokenRefresh_FamilyIssuedAt_Inherited(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+	encClientID, internalID := registerClient(t, tm, []string{"https://app.example.com/callback"})
+
+	familyOrigin := time.Now().Add(-3 * time.Hour)
+	parent := sealedRefresh{
+		TokenID:        uuid.New().String(),
+		FamilyID:       uuid.New().String(),
+		Subject:        "user",
+		Email:          "u@example.com",
+		ClientID:       internalID,
+		Typ:            token.PurposeRefresh,
+		Audience:       testBaseURL,
+		IssuedAt:       time.Now().Add(-30 * time.Minute),
+		FamilyIssuedAt: familyOrigin,
+		ExpiresAt:      time.Now().Add(7 * 24 * time.Hour),
+	}
+	parentStr, err := tm.SealJSON(parent, token.PurposeRefresh)
+	if err != nil {
+		t.Fatalf("SealJSON: %v", err)
+	}
+
+	form := url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {parentStr},
+		"client_id":     {encClientID},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rr := httptest.NewRecorder()
+	Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("rotation: want 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp map[string]any
+	json.NewDecoder(rr.Body).Decode(&resp)
+	var rotated sealedRefresh
+	if err := tm.OpenJSON(resp["refresh_token"].(string), &rotated, token.PurposeRefresh); err != nil {
+		t.Fatalf("OpenJSON rotated: %v", err)
+	}
+	if !rotated.FamilyIssuedAt.Equal(familyOrigin) {
+		t.Errorf("FamilyIssuedAt drifted across rotation: got %v, want %v", rotated.FamilyIssuedAt, familyOrigin)
+	}
+	if !rotated.IssuedAt.After(parent.IssuedAt) {
+		t.Errorf("rotated IssuedAt should advance, got %v (parent %v)", rotated.IssuedAt, parent.IssuedAt)
+	}
+}
+
+// TestTokenRefresh_RevokeBefore_CatchesRotatedFamily pins C-M3 from
+// the operator's perspective: an operator who sets REVOKE_BEFORE to
+// a stamp AFTER a session's family origin must invalidate the
+// session even when the attacker has already rotated the refresh
+// once. Comparing against IssuedAt would let the rotated token
+// sneak past; comparing against FamilyIssuedAt catches it.
+func TestTokenRefresh_RevokeBefore_CatchesRotatedFamily(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+	encClientID, internalID := registerClient(t, tm, []string{"https://app.example.com/callback"})
+
+	familyOrigin := time.Now().Add(-3 * time.Hour)
+	// Rotated refresh: IssuedAt is "now" (just rotated), but the
+	// family was first issued 3h ago. Operator sets REVOKE_BEFORE
+	// to 1h ago — the family origin predates it, the rotated stamp
+	// does not.
+	rotated := sealedRefresh{
+		TokenID:        uuid.New().String(),
+		FamilyID:       uuid.New().String(),
+		Subject:        "user",
+		Email:          "u@example.com",
+		ClientID:       internalID,
+		Typ:            token.PurposeRefresh,
+		Audience:       testBaseURL,
+		IssuedAt:       time.Now(),
+		FamilyIssuedAt: familyOrigin,
+		ExpiresAt:      time.Now().Add(7 * 24 * time.Hour),
+	}
+	rotatedStr, err := tm.SealJSON(rotated, token.PurposeRefresh)
+	if err != nil {
+		t.Fatalf("SealJSON: %v", err)
+	}
+	cutoff := time.Now().Add(-1 * time.Hour)
+
+	form := url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {rotatedStr},
+		"client_id":     {encClientID},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rr := httptest.NewRecorder()
+	Token(tm, logger, testBaseURL, cutoff, nil)(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("REVOKE_BEFORE must catch rotated family; got status %d body %s", rr.Code, rr.Body.String())
+	}
+	var oauthErr OAuthError
+	json.NewDecoder(rr.Body).Decode(&oauthErr)
+	if oauthErr.Error != "invalid_grant" {
+		t.Errorf("error = %q, want invalid_grant", oauthErr.Error)
+	}
+}
+
+// TestTokenRefresh_LegacyZeroFamilyIssuedAt_FallsBackToIssuedAt
+// pins the rolling-deploy backstop: a refresh sealed before
+// FamilyIssuedAt existed (zero value) is evaluated against
+// IssuedAt for REVOKE_BEFORE, and the rotated descendant tightens
+// the invariant by adopting the parent's IssuedAt as its
+// FamilyIssuedAt seed.
+func TestTokenRefresh_LegacyZeroFamilyIssuedAt_FallsBackToIssuedAt(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+	encClientID, internalID := registerClient(t, tm, []string{"https://app.example.com/callback"})
+
+	parentIssued := time.Now().Add(-2 * time.Hour)
+	legacy := sealedRefresh{
+		TokenID:   uuid.New().String(),
+		FamilyID:  uuid.New().String(),
+		Subject:   "user",
+		Email:     "u@example.com",
+		ClientID:  internalID,
+		Typ:       token.PurposeRefresh,
+		Audience:  testBaseURL,
+		IssuedAt:  parentIssued,
+		ExpiresAt: time.Now().Add(7 * 24 * time.Hour),
+		// FamilyIssuedAt deliberately zero — emulates a refresh
+		// sealed by a pre-C-M3 build.
+	}
+	legacyStr, err := tm.SealJSON(legacy, token.PurposeRefresh)
+	if err != nil {
+		t.Fatalf("SealJSON: %v", err)
+	}
+
+	// Rotation succeeds with no cutoff.
+	form := url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {legacyStr},
+		"client_id":     {encClientID},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rr := httptest.NewRecorder()
+	Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("legacy rotation: want 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp map[string]any
+	json.NewDecoder(rr.Body).Decode(&resp)
+	var rotated sealedRefresh
+	if err := tm.OpenJSON(resp["refresh_token"].(string), &rotated, token.PurposeRefresh); err != nil {
+		t.Fatalf("OpenJSON rotated: %v", err)
+	}
+	if !rotated.FamilyIssuedAt.Equal(parentIssued) {
+		t.Errorf("rotation should seed FamilyIssuedAt from parent IssuedAt; got %v want %v", rotated.FamilyIssuedAt, parentIssued)
+	}
+
+	// Now apply REVOKE_BEFORE just after the legacy parent's
+	// IssuedAt — the legacy parent (zero FamilyIssuedAt → falls
+	// back to IssuedAt) must be rejected.
+	cutoff := parentIssued.Add(1 * time.Minute)
+	rr2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(form.Encode()))
+	req2.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	Token(tm, logger, testBaseURL, cutoff, nil)(rr2, req2)
+	if rr2.Code != http.StatusBadRequest {
+		t.Fatalf("REVOKE_BEFORE on legacy refresh: want 400, got %d: %s", rr2.Code, rr2.Body.String())
+	}
+}
+
+// failingReplayStore is a Store that always fails. Used to drive the
+// replay-store-unavailable branch in /token without needing a real
+// Redis outage.
+type failingReplayStore struct{ err error }
+
+func (f *failingReplayStore) ClaimOnce(_ context.Context, _ string, _ time.Duration) error {
+	return f.err
+}
+func (f *failingReplayStore) Mark(_ context.Context, _ string, _ time.Duration) error {
+	return f.err
+}
+func (f *failingReplayStore) Exists(_ context.Context, _ string) (bool, error) {
+	return false, f.err
+}
+func (f *failingReplayStore) ClaimOrCheckFamily(_ context.Context, _, _ string, _, _ time.Duration) (bool, bool, error) {
+	return false, false, f.err
+}
+func (f *failingReplayStore) Close() error { return nil }
+
+// TestToken_ReplayStoreUnavailable_IncrementsAccessDenied pins R1-M2:
+// both grant paths must increment
+// mcp_auth_access_denied_total{reason="replay_store_unavailable"}
+// when the replay store fails, so the operator alert documented in
+// docs/runbooks/redis-outage.md actually fires.
+func TestToken_ReplayStoreUnavailable_IncrementsAccessDenied(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+	store := &failingReplayStore{err: errors.New("redis: connection refused")}
+
+	encClientID, internalID := registerClient(t, tm, []string{"https://app.example.com/callback"})
+
+	cases := []struct {
+		name     string
+		buildReq func() *http.Request
+	}{
+		{
+			name: "authorization_code_grant",
+			buildReq: func() *http.Request {
+				codeVerifier := "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+				codeChallenge := pkceChallenge(codeVerifier)
+				redirectURI := "https://app.example.com/callback"
+				sc := sealedCode{
+					TokenID:       uuid.New().String(),
+					FamilyID:      uuid.New().String(),
+					ClientID:      internalID,
+					RedirectURI:   redirectURI,
+					CodeChallenge: codeChallenge,
+					Subject:       "user-sub",
+					Email:         "user@example.com",
+					Typ:           token.PurposeCode,
+					Audience:      testBaseURL,
+					ExpiresAt:     time.Now().Add(60 * time.Second),
+				}
+				authCode, err := tm.SealJSON(sc, token.PurposeCode)
+				if err != nil {
+					t.Fatalf("SealJSON: %v", err)
+				}
+				form := url.Values{
+					"grant_type":    {"authorization_code"},
+					"code":          {authCode},
+					"redirect_uri":  {redirectURI},
+					"client_id":     {encClientID},
+					"code_verifier": {codeVerifier},
+				}
+				req := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(form.Encode()))
+				req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+				return req
+			},
+		},
+		{
+			name: "refresh_token_grant",
+			buildReq: func() *http.Request {
+				refreshTokenStr := sealRefresh(t, tm, "user-sub", "user@example.com", internalID)
+				form := url.Values{
+					"grant_type":    {"refresh_token"},
+					"refresh_token": {refreshTokenStr},
+					"client_id":     {encClientID},
+				}
+				req := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(form.Encode()))
+				req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+				return req
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			before := testutil.ToFloat64(metrics.AccessDenied.WithLabelValues("replay_store_unavailable"))
+			rr := httptest.NewRecorder()
+			Token(tm, logger, testBaseURL, time.Time{}, store)(rr, tc.buildReq())
+			if rr.Code != http.StatusServiceUnavailable {
+				t.Fatalf("want 503, got %d: %s", rr.Code, rr.Body.String())
+			}
+			after := testutil.ToFloat64(metrics.AccessDenied.WithLabelValues("replay_store_unavailable"))
+			if after-before != 1 {
+				t.Errorf("AccessDenied{replay_store_unavailable} delta = %v, want 1", after-before)
+			}
+		})
 	}
 }
 
@@ -3787,7 +4069,17 @@ func TestCallback_IdPError_NoSession_DoesNotReflectAttackerDescription(t *testin
 // supplied (sanitized) error_description is forwarded to the
 // client — operators of legit clients want to see why the IdP
 // refused.
-func TestCallback_IdPError_WithSession_ForwardsDescription(t *testing.T) {
+// TestCallback_IdPError_WithSession_ReplacesAttackerDescription
+// pins C-M1: even when the sealed state opens cleanly, the
+// `error_description` from /callback is fully attacker-controlled
+// (anyone can craft the URL once they know or steal a state).
+// The handler MUST substitute a fixed description on the redirect
+// path so the registered redirect_uri never receives
+// caller-controlled phishing text under the proxy's branding.
+// The RFC 6749 §4.1.2.1 `error` code is still allowlisted and
+// forwarded verbatim — clients need it for machine-readable
+// branching.
+func TestCallback_IdPError_WithSession_ReplacesAttackerDescription(t *testing.T) {
 	tm := newTestTokenManager(t)
 	logger := zap.NewNop()
 
@@ -3805,8 +4097,9 @@ func TestCallback_IdPError_WithSession_ForwardsDescription(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seal session: %v", err)
 	}
+	const phishingPayload = "Visit https://attacker.example/login to recover your session"
 	target := "/callback?error=access_denied&error_description=" +
-		url.QueryEscape("user denied scope") +
+		url.QueryEscape(phishingPayload) +
 		"&state=" + url.QueryEscape(state)
 	req := httptest.NewRequest(http.MethodGet, target, nil)
 	rr := httptest.NewRecorder()
@@ -3819,8 +4112,18 @@ func TestCallback_IdPError_WithSession_ForwardsDescription(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse Location: %v", err)
 	}
-	if got := loc.Query().Get("error_description"); got != "user denied scope" {
-		t.Errorf("forwarded error_description = %q, want %q", got, "user denied scope")
+	got := loc.Query().Get("error_description")
+	if strings.Contains(got, "attacker.example") || strings.Contains(got, phishingPayload) {
+		t.Errorf("attacker-controlled text leaked into redirect: error_description=%q", got)
+	}
+	if got != "authorization denied by identity provider" {
+		t.Errorf("error_description = %q, want fixed text", got)
+	}
+	if errCode := loc.Query().Get("error"); errCode != "access_denied" {
+		t.Errorf("error code lost on redirect: got %q, want access_denied", errCode)
+	}
+	if st := loc.Query().Get("state"); st != "client-state" {
+		t.Errorf("state lost on redirect: got %q", st)
 	}
 }
 
@@ -3961,6 +4264,44 @@ func TestToken_RejectsURLQueryParams(t *testing.T) {
 	_ = json.Unmarshal(rr.Body.Bytes(), &e)
 	if e.Error != "invalid_request" {
 		t.Errorf("want error=invalid_request, got %q", e.Error)
+	}
+}
+
+// TestToken_RejectsAuthorizationHeader pins R1-L1: discovery
+// advertises token_endpoint_auth_methods_supported=["none"] and DCR
+// only accepts "none". A client that sends Basic / Bearer credentials
+// in the Authorization header would otherwise be silently ignored —
+// the request might still succeed (PKCE + sealed client_id still
+// apply) and the client would walk away thinking the secret was
+// honoured. Reject with 401 + invalid_client + WWW-Authenticate so
+// the misconfiguration surfaces immediately.
+func TestToken_RejectsAuthorizationHeader(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+
+	cases := []struct{ name, header string }{
+		{"basic", "Basic dXNlcjpwYXNz"},
+		{"bearer", "Bearer some-token"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader("grant_type=refresh_token"))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req.Header.Set("Authorization", tc.header)
+			rr := httptest.NewRecorder()
+			Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
+			if rr.Code != http.StatusUnauthorized {
+				t.Fatalf("want 401, got %d: %s", rr.Code, rr.Body.String())
+			}
+			var e OAuthError
+			_ = json.Unmarshal(rr.Body.Bytes(), &e)
+			if e.Error != "invalid_client" {
+				t.Errorf("want error=invalid_client, got %q", e.Error)
+			}
+			if wa := rr.Header().Get("WWW-Authenticate"); wa == "" || !strings.Contains(wa, "invalid_client") {
+				t.Errorf("WWW-Authenticate missing invalid_client challenge: %q", wa)
+			}
+		})
 	}
 }
 

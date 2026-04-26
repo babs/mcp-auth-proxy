@@ -180,6 +180,43 @@ func TestRPCPeek_NonJSON(t *testing.T) {
 	}
 }
 
+// TestRPCPeek_ContentTypeCaseInsensitive pins R2-L2: the
+// Content-Type header value is case-insensitive on type/subtype
+// per RFC 9110 §8.3 and may carry parameters; without
+// canonicalisation a client sending "Application/JSON" or
+// "application/json; charset=utf-8" would bypass peek and silently
+// suppress per-tool metrics + access-log enrichment.
+func TestRPCPeek_ContentTypeCaseInsensitive(t *testing.T) {
+	cases := []string{
+		"application/json",
+		"Application/JSON",
+		"APPLICATION/JSON",
+		"application/json; charset=utf-8",
+		"Application/JSON; charset=UTF-8",
+	}
+	for _, ct := range cases {
+		t.Run(ct, func(t *testing.T) {
+			body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"shell"}}`
+			r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/mcp", strings.NewReader(body))
+			r.Header.Set("Content-Type", ct)
+			r.ContentLength = int64(len(body))
+			r, rec := withLogRec(r)
+
+			mw := RPCPeek(defaultCfg())(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))
+			mw.ServeHTTP(httptest.NewRecorder(), r)
+
+			if rec.RPCMethod != "tools/call" {
+				t.Errorf("Content-Type %q: rec.RPCMethod = %q, want tools/call", ct, rec.RPCMethod)
+			}
+			if rec.RPCTool != "shell" {
+				t.Errorf("Content-Type %q: rec.RPCTool = %q, want shell", ct, rec.RPCTool)
+			}
+		})
+	}
+}
+
 // Test 4: Content-Length > max is a passthrough — no rpc fields set.
 func TestRPCPeek_ContentLengthExceedsMax(t *testing.T) {
 	body := `{"method":"tools/call"}`

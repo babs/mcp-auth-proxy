@@ -66,7 +66,7 @@ Drop this in front, point it at your existing IdP, done.
 
 | RFC / Spec | What we implement |
 |---|---|
-| [OAuth 2.1 draft-13](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1-13) | Authorization code + PKCE, hardened defaults |
+| [OAuth 2.1 draft-13](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1-13) | Authorization code + PKCE, hardened defaults. Tracks the draft pinned by MCP Authorization 2025-06-18; later drafts (currently `draft-15`) not yet adopted |
 | [RFC 8414](https://datatracker.ietf.org/doc/html/rfc8414) | `/.well-known/oauth-authorization-server` |
 | [RFC 9728](https://datatracker.ietf.org/doc/html/rfc9728) | `/.well-known/oauth-protected-resource` + `WWW-Authenticate` |
 | [RFC 7591](https://datatracker.ietf.org/doc/html/rfc7591) | Dynamic Client Registration on `POST /register` |
@@ -136,8 +136,9 @@ All configuration via **environment variables**. Bold = required.
 | `REDIS_KEY_PREFIX` | `mcp-auth-proxy:` | Key prefix for shared Redis; set to empty to opt out of namespacing |
 | `RATE_LIMIT_ENABLED` | `true` | Per-IP rate limiting on pre-auth endpoints and on the authenticated MCP route. Disable only behind a WAF that already enforces it |
 | `TOKEN_SIGNING_SECRETS_PREVIOUS` | _(empty)_ | Whitespace-separated retired signing secrets accepted on Open during a rolling rotation. New seals always use `TOKEN_SIGNING_SECRET` (primary); Open tries primary first, then each previous. See [`docs/runbooks/key-rotation.md`](./docs/runbooks/key-rotation.md) |
-| `TRUSTED_PROXY_CIDRS` | _(empty)_ | Comma-separated CIDRs of peers whose `X-Forwarded-For` / `X-Real-IP` / `True-Client-IP` headers are honored for rate-limit keying. Other peers fall back to RemoteAddr. Preferred over the legacy `TRUST_PROXY_HEADERS` bool |
-| `TRUST_PROXY_HEADERS` | `false` | **Legacy.** Blanket trust of every peer's forwarded headers. Superseded by `TRUSTED_PROXY_CIDRS` when both are set; kept for backward compatibility |
+| `TRUSTED_PROXY_CIDRS` | _(empty)_ | Comma-separated CIDRs of peers whose forwarding header (default `X-Forwarded-For`) is walked right-to-left for rate-limit keying. The first hop NOT in the trusted set is the bucket key; everything left of it (typically appended by the client) is ignored. Other peers fall back to RemoteAddr. Preferred over the legacy `TRUST_PROXY_HEADERS` bool |
+| `TRUSTED_PROXY_HEADER` | `X-Forwarded-For` | Pin which forwarding header carries the hop list. Allowlist: `X-Forwarded-For`, `X-Real-IP`, `True-Client-IP`. Pin `X-Real-IP` / `True-Client-IP` only when the trusted ingress is known to OVERWRITE (not append) that header — otherwise a client behind a passthrough ingress can spoof an unbounded rate-limit bucket per request |
+| `TRUST_PROXY_HEADERS` | `false` | **Legacy.** Blanket trust of every peer's forwarded headers (delegates to `httprate.KeyByRealIP`, which honours leftmost-XFF / `True-Client-IP` / `X-Real-IP` without validation). Superseded by `TRUSTED_PROXY_CIDRS` when both are set; rejected entirely under `PROD_MODE=true` without `TRUSTED_PROXY_CIDRS` because the bucket key becomes attacker-spoofable |
 | `PROD_MODE` | `true` | Fails startup if any compatibility flag that weakens a security control is set (`PKCE_REQUIRED=false`, `COMPAT_ALLOW_STATELESS=true`, `REDIS_REQUIRED=false`, `REDIS_URL` empty, or legacy `TRUST_PROXY_HEADERS=true` without `TRUSTED_PROXY_CIDRS`). Default **on** so the runtime posture matches the OAuth 2.1 / MCP guarantees the published metadata advertises. Set `PROD_MODE=false` explicitly for dev / single-replica work that needs one of the relaxation toggles |
 | `UPSTREAM_AUTHORIZATION_HEADER` | _(empty)_ | When set, sent verbatim as the `Authorization` header on every request to the upstream MCP backend. Full header value incl. scheme, e.g. `Bearer xyz`. Treat as a secret |
 | `MCP_PER_SUBJECT_CONCURRENCY` | `16` | Per-subject in-flight cap on the authenticated MCP route. Excess requests get 503 `temporarily_unavailable` + `Retry-After: 1`. Idle subjects (no in-flight work for ≥5 min) are reclaimed by a background pruner so map memory stays proportional to active principals. `0` disables |
