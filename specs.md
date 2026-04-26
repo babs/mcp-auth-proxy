@@ -651,6 +651,7 @@ The `manifests/` folder ships a turn-key demo: a Docker Compose stack (Keycloak 
 `config.Load()` fails closed on the following config mistakes (fatal at startup):
 
 - `TOKEN_SIGNING_SECRET` shorter than 32 bytes.
+- `TOKEN_SIGNING_SECRET` with fewer than 16 distinct bytes (patterned / human-typed) when `PROD_MODE=true`. Same gate applies to every entry in `TOKEN_SIGNING_SECRETS_PREVIOUS` so a rolling rotation cannot regress the entropy floor. Under `PROD_MODE=false` the same secret triggers a non-fatal weakness warning instead.
 - `SHUTDOWN_TIMEOUT` non-positive or greater than 15 minutes (L2).
 - `REDIS_KEY_PREFIX` containing `{`, `}`, `\r`, `\n`, or any byte outside the 0x20..0x7E ASCII-printable range (L3).
 - `PROXY_BASE_URL` with a scheme other than `https://` (or `http://` to a loopback host), a non-empty userinfo, a fragment, or a path beyond `/` (L8).

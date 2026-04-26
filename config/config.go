@@ -198,9 +198,11 @@ func Load() (*Config, error) {
 		// unique byte values signals a human-picked or repeating pattern
 		// (e.g. "aaaaaaaa..."): the AES-GCM key derived from SHA-256 is
 		// still 256 bits wide, but the secret itself has far less effective
-		// entropy than its length suggests. Warn only — rejecting at
-		// startup would break deployments whose secrets happen to land just
-		// under the threshold by chance.
+		// entropy than its length suggests. Warn here unconditionally; the
+		// PROD_MODE violations block below promotes this to a hard error
+		// when strict mode is on, so dev / single-replica deployments that
+		// knowingly use a patterned secret keep working under
+		// PROD_MODE=false.
 		if distinct := distinctByteCount(c.TokenSigningSecret); distinct < 16 {
 			c.secretWeakWarning = fmt.Sprintf(
 				"TOKEN_SIGNING_SECRET has only %d distinct bytes (<16); effective entropy is much lower than its length suggests",
@@ -383,6 +385,21 @@ func Load() (*Config, error) {
 		}
 		if c.TrustProxyHeaders && len(c.TrustedProxyCIDRs) == 0 {
 			violations = append(violations, "TRUST_PROXY_HEADERS=true without TRUSTED_PROXY_CIDRS (forwarded-header spoofing can bypass per-IP limits)")
+		}
+		// Promote the L1 low-entropy warning to a hard fail under
+		// PROD_MODE. A 32-byte secret with <16 distinct bytes signals
+		// a human-typed or repeating pattern; the AES-GCM key derived
+		// from SHA-256 stays 256 bits wide but the *secret* itself
+		// has far less effective entropy than its length suggests.
+		// Dev / single-replica work that intentionally uses a
+		// patterned secret should set PROD_MODE=false.
+		if d := distinctByteCount(c.TokenSigningSecret); d > 0 && d < 16 {
+			violations = append(violations, fmt.Sprintf("TOKEN_SIGNING_SECRET has %d distinct bytes (<16); patterned secret indicates a human-typed value", d))
+		}
+		for i, prev := range c.TokenSigningSecretsPrevious {
+			if d := distinctByteCount(prev); d > 0 && d < 16 {
+				violations = append(violations, fmt.Sprintf("TOKEN_SIGNING_SECRETS_PREVIOUS[%d] has %d distinct bytes (<16); rolling-rotation cutover would regress entropy floor", i, d))
+			}
 		}
 		if len(violations) > 0 {
 			return nil, fmt.Errorf("PROD_MODE=true rejects unsafe settings: %s", strings.Join(violations, "; "))
