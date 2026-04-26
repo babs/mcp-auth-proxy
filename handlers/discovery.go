@@ -12,6 +12,13 @@ func Discovery(baseURL string) http.HandlerFunc {
 		"response_types_supported":         []string{"code"},
 		"grant_types_supported":            []string{"authorization_code", "refresh_token"},
 		"code_challenge_methods_supported": []string{"S256"},
+		// RFC 8414 §2 (OPTIONAL). The /callback redirect always
+		// emits parameters in the query component (callbackHandler
+		// builds q2 and assigns to redirectParsed.RawQuery). Some
+		// clients default to fragment mode without this hint and
+		// then fail to parse the redirect; advertising "query"
+		// removes the ambiguity.
+		"response_modes_supported": []string{"query"},
 		// PKCE-only proxy: no client secrets are validated
 		"token_endpoint_auth_methods_supported": []string{"none"},
 		// RFC 8414 §2 (RECOMMENDED). Explicit empty array — the proxy

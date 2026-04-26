@@ -768,6 +768,51 @@ func TestProxy_ForwardsPathVerbatim(t *testing.T) {
 	}
 }
 
+// TestProxy_UpstreamHeaderTimeout_FailsFast verifies the wedged-
+// upstream defense: when the backend stops responding mid-handshake
+// (no headers in time), the proxy must surface 502 Bad Gateway
+// rather than hold the goroutine until the client gives up. The
+// 30s production timeout is replaced via Config override to keep
+// the test under a second.
+func TestProxy_UpstreamHeaderTimeout_FailsFast(t *testing.T) {
+	// Upstream that accepts the connection but never writes headers.
+	hung := make(chan struct{})
+	defer close(hung)
+	upstream := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case <-hung:
+		case <-r.Context().Done():
+		}
+	}))
+	defer upstream.Close()
+
+	handler, err := Handler(upstream.URL, zap.NewNop(), Config{
+		ResponseHeaderTimeoutOverride: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Handler: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/mcp", nil)
+	ctx := context.WithValue(req.Context(), middleware.ContextSubject, "u")
+	req = req.WithContext(ctx)
+	rr := httptest.NewRecorder()
+
+	start := time.Now()
+	handler.ServeHTTP(rr, req)
+	elapsed := time.Since(start)
+
+	if rr.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502 (wedged upstream → ErrorHandler)", rr.Code)
+	}
+	// 100ms timeout + transport bookkeeping; allow generous headroom
+	// but cap so a regression that loses the timeout (and lets the
+	// request hang for the full 30s default) shows up as a failure.
+	if elapsed > 5*time.Second {
+		t.Errorf("ServeHTTP took %s — timeout did not fire", elapsed)
+	}
+}
+
 // TestProxy_ForwardsUpstreamErrorStatus pins the proxy's pass-through
 // contract for upstream-emitted error responses. A clean upstream 5xx
 // (or 4xx) MUST reach the client unchanged — only transport-level

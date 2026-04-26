@@ -261,6 +261,14 @@ type Config struct {
 	// request un-authenticated at the HTTP layer and must rely on the
 	// proxy-injected X-User-* identity headers.
 	UpstreamAuthorization string
+
+	// ResponseHeaderTimeoutOverride, when non-zero, replaces the
+	// 30s upstreamResponseHeaderTimeout default. Test-only knob —
+	// production callers leave this at zero. Documented on the
+	// Config struct rather than via a package-level variable so
+	// the override is scoped to a single Handler instance and
+	// cannot leak into another test running in parallel.
+	ResponseHeaderTimeoutOverride time.Duration
 }
 
 // Handler returns a reverse proxy to the upstream MCP server.
@@ -276,8 +284,21 @@ func Handler(upstreamURL string, logger *zap.Logger, cfg Config) (http.Handler, 
 	// mutating the package-level default. Header timeout fails fast on a
 	// wedged upstream; it does NOT cover the response body, so SSE and
 	// chunked streams remain uncapped.
-	baseTransport := http.DefaultTransport.(*http.Transport).Clone()
+	//
+	// Two-value assert: a future caller (or test harness) may have
+	// swapped DefaultTransport for a non-*http.Transport. Falling back
+	// to a fresh *http.Transport keeps startup loud-but-functional
+	// instead of panicking.
+	baseTransport, ok := http.DefaultTransport.(*http.Transport)
+	if ok {
+		baseTransport = baseTransport.Clone()
+	} else {
+		baseTransport = &http.Transport{}
+	}
 	baseTransport.ResponseHeaderTimeout = upstreamResponseHeaderTimeout
+	if cfg.ResponseHeaderTimeoutOverride > 0 {
+		baseTransport.ResponseHeaderTimeout = cfg.ResponseHeaderTimeoutOverride
+	}
 
 	rp := &httputil.ReverseProxy{
 		// Rewrite (vs Director) is used intentionally: Director causes

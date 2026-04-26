@@ -209,7 +209,7 @@ func TestDiscovery(t *testing.T) {
 		}
 	}
 
-	for _, k := range []string{"response_types_supported", "grant_types_supported", "code_challenge_methods_supported", "token_endpoint_auth_methods_supported"} {
+	for _, k := range []string{"response_types_supported", "response_modes_supported", "grant_types_supported", "code_challenge_methods_supported", "token_endpoint_auth_methods_supported"} {
 		if _, ok := meta[k]; !ok {
 			t.Errorf("missing field %s", k)
 		}
@@ -2808,6 +2808,129 @@ func TestRedirectURIMatches_LoopbackPortAgnostic(t *testing.T) {
 				t.Errorf("redirectURIMatches(%q, %q) = %v, want %v", tc.requested, tc.registered, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestAuthorize_LoopbackPortRelaxation_Accepts_DifferentPort verifies
+// the RFC 8252 §7.3 relaxation lands end-to-end at /authorize: a
+// native client registered with one ephemeral port comes back at
+// /authorize with a different port and is accepted (302 to the IdP).
+// Strict port equality would force re-registration on every native-app
+// launch — exactly what RFC 8252 §7.3 forbids.
+func TestAuthorize_LoopbackPortRelaxation_Accepts_DifferentPort(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+
+	registered := "http://127.0.0.1:8080/cb"
+	requested := "http://127.0.0.1:47521/cb"
+	encClientID, _ := registerClient(t, tm, []string{registered})
+
+	q := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {encClientID},
+		"redirect_uri":          {requested},
+		"code_challenge":        {pkceChallenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk")},
+		"code_challenge_method": {"S256"},
+		"state":                 {"native-app-state"},
+	}
+	req := httptest.NewRequest(http.MethodGet, "/authorize?"+q.Encode(), nil)
+	rr := httptest.NewRecorder()
+	Authorize(tm, logger, testBaseURL, testOAuth2Config(), AuthorizeConfig{PKCERequired: true})(rr, req)
+
+	// Success path: 302 to the IdP authorization endpoint (NOT a
+	// redirect-error response — the registered URI is loopback and
+	// only the port differs, so the relaxation accepts).
+	if rr.Code != http.StatusFound {
+		t.Fatalf("want 302 to IdP, got %d: %s", rr.Code, rr.Body.String())
+	}
+	loc := rr.Header().Get("Location")
+	if !strings.HasPrefix(loc, testOAuth2Config().Endpoint.AuthURL) {
+		t.Errorf("Location should redirect to IdP authorize endpoint, got %q", loc)
+	}
+}
+
+// TestAuthorize_LoopbackPortRelaxation_RejectsDifferentHost — the
+// relaxation is port-only. A registered loopback URI must NOT match
+// a non-loopback requested URI even if every other component lines
+// up. Locks the boundary that keeps the relaxation from becoming an
+// open-redirect primitive.
+func TestAuthorize_LoopbackPortRelaxation_RejectsDifferentHost(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+
+	registered := "http://127.0.0.1:8080/cb"
+	encClientID, _ := registerClient(t, tm, []string{registered})
+
+	// Non-loopback host with otherwise identical shape — must be
+	// rejected with JSON 400 (this is a redirect_uri-trust failure,
+	// so RFC 6749 §4.1.2.1 says render on the AS, not redirect).
+	q := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {encClientID},
+		"redirect_uri":          {"http://evil.example.com:8080/cb"},
+		"code_challenge":        {pkceChallenge("v")},
+		"code_challenge_method": {"S256"},
+		"state":                 {"s"},
+	}
+	req := httptest.NewRequest(http.MethodGet, "/authorize?"+q.Encode(), nil)
+	rr := httptest.NewRecorder()
+	Authorize(tm, logger, testBaseURL, testOAuth2Config(), AuthorizeConfig{PKCERequired: true})(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("want 400 (untrusted redirect target), got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestTokenAuthCode_LoopbackPortMustEcho — at /token, RFC 6749 §4.1.3
+// requires byte equality between the redirect_uri sent to /authorize
+// and the redirect_uri sent to /token. The loopback-port relaxation
+// at /authorize does NOT carry into /token: a native client must echo
+// the exact ephemeral port it used at /authorize, not its registered
+// value or a different ephemeral one. This is RFC-correct and
+// asymmetric with the /authorize relaxation; the test pins the
+// asymmetry so a future "let's relax this too" change is loud.
+func TestTokenAuthCode_LoopbackPortMustEcho(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+
+	authorizeURI := "http://127.0.0.1:47521/cb" // captured into the sealed code
+	codeVerifier := "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+	encClientID, internalID := registerClient(t, tm, []string{"http://127.0.0.1:8080/cb"})
+
+	sc := sealedCode{
+		TokenID:       uuid.New().String(),
+		FamilyID:      uuid.New().String(),
+		ClientID:      internalID,
+		RedirectURI:   authorizeURI, // what the client sent to /authorize
+		CodeChallenge: pkceChallenge(codeVerifier),
+		Subject:       "user-sub",
+		Email:         "user@example.com",
+		Typ:           token.PurposeCode,
+		Audience:      testBaseURL,
+		ExpiresAt:     time.Now().Add(60 * time.Second),
+	}
+	authCode, err := tm.SealJSON(sc, token.PurposeCode)
+	if err != nil {
+		t.Fatalf("SealJSON: %v", err)
+	}
+
+	// Echo a DIFFERENT port at /token. Even though both are loopback
+	// and the registered URI also uses a different port, /token must
+	// reject — what counts is what the client sent to /authorize.
+	form := url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {authCode},
+		"redirect_uri":  {"http://127.0.0.1:99999/cb"},
+		"client_id":     {encClientID},
+		"code_verifier": {codeVerifier},
+	}
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rr := httptest.NewRecorder()
+	Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("want 400 (redirect_uri mismatch at /token), got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 
