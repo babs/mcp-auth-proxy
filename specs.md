@@ -574,6 +574,7 @@ Operator-load-bearing invariants that are not surfaced by the env table or the e
 - **307/308 redirect following**: proxy follows server-side for Python MCP backends that redirect `/mcp` → `/mcp/`. Same-host only, body replayed, max 10 hops, scheme downgrade rejected.
 - **PRM `resource` field**: the root `/.well-known/oauth-protected-resource` carries the trailing-slash form for Claude.ai canonicalization (intentional deviation from RFC 9728 §3 — see the Endpoints section). The per-mount variant is spec-strict.
 - **Email verification**: `email_verified=false` in the id_token is rejected at `/callback` with 403 `access_denied` + `error_code: email_not_verified`. A missing claim is accepted — not every IdP emits it.
+- **Security headers**: every response on the public listener carries `Strict-Transport-Security: max-age=63072000; includeSubDomains` (RFC 6797), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer` (RFC 9700 §4.2.4 RECOMMENDED for OAuth ASes — defends against `code` leakage via Referer), and `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`. Headers are set before the handler runs so they apply to every status code, including upstream pass-through 5xx and rate-limiter 429s. Not applied to the metrics listener (Prometheus scrape is in-cluster only). The HSTS `includeSubDomains` directive assumes the operator's parent zone is all-HTTPS.
 
 ---
 
