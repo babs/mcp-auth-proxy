@@ -767,3 +767,50 @@ func TestProxy_ForwardsPathVerbatim(t *testing.T) {
 		})
 	}
 }
+
+// TestProxy_ForwardsUpstreamErrorStatus pins the proxy's pass-through
+// contract for upstream-emitted error responses. A clean upstream 5xx
+// (or 4xx) MUST reach the client unchanged — only transport-level
+// failures should be rewritten to 502 by the ErrorHandler. Without
+// this regression guard, a future change to the error handler could
+// silently squash genuine upstream signals.
+func TestProxy_ForwardsUpstreamErrorStatus(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"500", http.StatusInternalServerError, `{"error":"internal","detail":"db unreachable"}`},
+		{"502", http.StatusBadGateway, `upstream gateway`},
+		{"503", http.StatusServiceUnavailable, `{"error":"overloaded"}`},
+		{"504", http.StatusGatewayTimeout, `timeout`},
+		{"400", http.StatusBadRequest, `{"error":"bad params"}`},
+		{"429", http.StatusTooManyRequests, `slow down`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = fmt.Fprint(w, tc.body)
+			}))
+			defer upstream.Close()
+
+			handler, err := Handler(upstream.URL, zap.NewNop(), Config{})
+			if err != nil {
+				t.Fatalf("Handler: %v", err)
+			}
+			req := httptest.NewRequest(http.MethodGet, "/mcp", nil)
+			ctx := context.WithValue(req.Context(), middleware.ContextSubject, "u")
+			req = req.WithContext(ctx)
+			rr := httptest.NewRecorder()
+			handler.ServeHTTP(rr, req)
+
+			if rr.Code != tc.status {
+				t.Errorf("status = %d, want %d (upstream code must pass through verbatim)", rr.Code, tc.status)
+			}
+			if got := rr.Body.String(); got != tc.body {
+				t.Errorf("body = %q, want %q (upstream body must pass through verbatim)", got, tc.body)
+			}
+		})
+	}
+}

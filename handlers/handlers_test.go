@@ -2961,6 +2961,123 @@ func TestTokenAuthCode_Replay_RevokesRefreshFamily(t *testing.T) {
 	}
 }
 
+// TestTokenAuthCode_Replay_RevokesRotatedRefresh verifies that the
+// family-revoke triggered by a code replay (RFC 6749 §4.1.2) reaches
+// every descendant refresh, not just the first-generation one. The
+// scenario:
+//
+//  1. Legitimate redemption mints refresh-A (FamilyID = code.FamilyID)
+//  2. Legitimate rotation of refresh-A mints refresh-B (same FamilyID)
+//  3. Attacker replays the original code → family revoked
+//  4. Legitimate rotation of refresh-B is rejected with
+//     refresh_family_revoked
+//
+// Without family-id inheritance from the code, refresh-B would have a
+// fresh family and survive the revoke — the test exists to lock the
+// inheritance behavior in handleAuthorizationCode + handleRefreshToken.
+func TestTokenAuthCode_Replay_RevokesRotatedRefresh(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+	store := replay.NewMemoryStore()
+
+	redirectURI := "https://app.example.com/callback"
+	encClientID, internalID := registerClient(t, tm, []string{redirectURI})
+
+	codeVerifier := "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+	sc := sealedCode{
+		TokenID:       uuid.New().String(),
+		FamilyID:      uuid.New().String(),
+		ClientID:      internalID,
+		RedirectURI:   redirectURI,
+		CodeChallenge: pkceChallenge(codeVerifier),
+		Subject:       "user-sub",
+		Email:         "user@example.com",
+		Typ:           token.PurposeCode,
+		Audience:      testBaseURL,
+		ExpiresAt:     time.Now().Add(60 * time.Second),
+	}
+	authCode, err := tm.SealJSON(sc, token.PurposeCode)
+	if err != nil {
+		t.Fatalf("SealJSON: %v", err)
+	}
+
+	postForm := func(form url.Values) *httptest.ResponseRecorder {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/token", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rr := httptest.NewRecorder()
+		Token(tm, logger, testBaseURL, time.Time{}, store)(rr, req)
+		return rr
+	}
+
+	// 1. First redemption — refresh-A.
+	first := postForm(url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {authCode},
+		"redirect_uri":  {redirectURI},
+		"client_id":     {encClientID},
+		"code_verifier": {codeVerifier},
+	})
+	if first.Code != http.StatusOK {
+		t.Fatalf("first exchange: want 200, got %d: %s", first.Code, first.Body.String())
+	}
+	var firstTok struct {
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := json.NewDecoder(first.Body).Decode(&firstTok); err != nil {
+		t.Fatalf("decode first: %v", err)
+	}
+
+	// 2. Legitimate rotation of refresh-A → refresh-B.
+	rotation := postForm(url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {firstTok.RefreshToken},
+		"client_id":     {encClientID},
+	})
+	if rotation.Code != http.StatusOK {
+		t.Fatalf("legit rotation: want 200, got %d: %s", rotation.Code, rotation.Body.String())
+	}
+	var rotated struct {
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := json.NewDecoder(rotation.Body).Decode(&rotated); err != nil {
+		t.Fatalf("decode rotation: %v", err)
+	}
+	if rotated.RefreshToken == "" || rotated.RefreshToken == firstTok.RefreshToken {
+		t.Fatalf("rotation did not return a new refresh_token (got %q vs prior %q)", rotated.RefreshToken, firstTok.RefreshToken)
+	}
+
+	// 3. Attacker replays the original code.
+	replay := postForm(url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {authCode},
+		"redirect_uri":  {redirectURI},
+		"client_id":     {encClientID},
+		"code_verifier": {codeVerifier},
+	})
+	if replay.Code != http.StatusBadRequest {
+		t.Fatalf("code replay: want 400, got %d: %s", replay.Code, replay.Body.String())
+	}
+
+	// 4. Rotation of refresh-B (the LIVE descendant) must now be
+	//    rejected with refresh_family_revoked. This is the bit the
+	//    new test adds — the prior test only verified refresh-A.
+	rotateB := postForm(url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {rotated.RefreshToken},
+		"client_id":     {encClientID},
+	})
+	if rotateB.Code != http.StatusBadRequest {
+		t.Fatalf("rotation of descendant after code replay: want 400, got %d: %s", rotateB.Code, rotateB.Body.String())
+	}
+	var oe OAuthError
+	if err := json.NewDecoder(rotateB.Body).Decode(&oe); err != nil {
+		t.Fatalf("decode descendant rotation: %v", err)
+	}
+	if oe.ErrorCode != "refresh_family_revoked" {
+		t.Errorf("descendant: want error_code=refresh_family_revoked, got %q (description=%q)", oe.ErrorCode, oe.ErrorDescription)
+	}
+}
+
 // TestTokenRefresh_ReplayStore_ReuseRevokesFamily verifies RFC 6749 §10.4 /
 // OAuth 2.1 §6.1 refresh-rotation-with-reuse-detection. Legitimate rotation
 // works; replaying an already-rotated refresh is detected and revokes every
