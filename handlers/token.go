@@ -239,7 +239,7 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 		}
 	}
 
-	accessToken, _, err := tm.Issue(audience, code.Subject, code.Email, client.ID, code.Groups, accessTokenTTL)
+	accessToken, _, err := tm.Issue(audience, code.Subject, code.Email, client.ID, code.Groups, accessTokenTTL, code.Resource)
 	if err != nil {
 		logger.Error("token_issue_failed", zap.Error(err))
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "failed to issue token", "token_issue_failed")
@@ -253,13 +253,18 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 		// can revoke every refresh descended from this redemption
 		// (RFC 6749 §4.1.2). A fresh UUID here would orphan the
 		// lineage from the code that spawned it.
-		FamilyID:  code.FamilyID,
-		Subject:   code.Subject,
-		Email:     code.Email,
-		Groups:    code.Groups,
-		ClientID:  client.ID,
-		Typ:       token.PurposeRefresh,
-		Audience:  audience,
+		FamilyID: code.FamilyID,
+		Subject:  code.Subject,
+		Email:    code.Email,
+		Groups:   code.Groups,
+		ClientID: client.ID,
+		Typ:      token.PurposeRefresh,
+		Audience: audience,
+		// Resource carries the RFC 8707 binding from the code to
+		// every descendant access + refresh in the lineage. Once
+		// minted at /authorize the binding is invariant for the
+		// life of the family.
+		Resource:  code.Resource,
 		IssuedAt:  now,
 		ExpiresAt: now.Add(refreshTokenTTL),
 	}
@@ -398,7 +403,7 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 		}
 	}
 
-	accessToken, _, err := tm.Issue(audience, refresh.Subject, refresh.Email, client.ID, refresh.Groups, accessTokenTTL)
+	accessToken, _, err := tm.Issue(audience, refresh.Subject, refresh.Email, client.ID, refresh.Groups, accessTokenTTL, refresh.Resource)
 	if err != nil {
 		logger.Error("token_refresh_issue_failed", zap.Error(err))
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "failed to issue token", "token_issue_failed")
@@ -408,6 +413,8 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 	// The rotated refresh inherits the FamilyID so reuse detection spans the
 	// entire lineage; a fresh TokenID makes it single-use on its own. Empty
 	// FamilyID was rejected upfront (C2), so the field is always set here.
+	// Resource is also inherited verbatim — once bound at /authorize the
+	// RFC 8707 resource is invariant for the life of the family.
 	now := time.Now()
 	newRefresh := sealedRefresh{
 		TokenID:   uuid.New().String(),
@@ -418,6 +425,7 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 		ClientID:  client.ID,
 		Typ:       token.PurposeRefresh,
 		Audience:  audience,
+		Resource:  refresh.Resource,
 		IssuedAt:  now,
 		ExpiresAt: now.Add(refreshTokenTTL),
 	}

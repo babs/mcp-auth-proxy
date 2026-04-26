@@ -207,7 +207,8 @@ func buildTestProxy(t *testing.T, oidcProvider *mockOIDCProvider, mcpServer *moc
 	registerDiscoveryRoutes(r, proxyBaseURL, "/mcp", "", nil)
 	r.Post("/register", handlers.Register(tm, zap.NewNop(), proxyBaseURL))
 	r.Get("/authorize", handlers.Authorize(tm, zap.NewNop(), proxyBaseURL, oauth2Cfg, handlers.AuthorizeConfig{
-		PKCERequired: true,
+		PKCERequired:      true,
+		CanonicalResource: proxyBaseURL + "/mcp",
 	}))
 	r.Get("/callback", handlers.Callback(tm, zap.NewNop(), proxyBaseURL, oauth2Cfg, verifier, handlers.CallbackConfig{
 		GroupsClaim: "groups",

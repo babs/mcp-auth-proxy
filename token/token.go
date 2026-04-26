@@ -39,10 +39,25 @@ const (
 )
 
 // Claims represents the internal access token payload.
+//
+// Audience binds the token to the proxy base URL that issued it
+// (cross-instance replay defense — two deployments sharing the same
+// TOKEN_SIGNING_SECRET cannot honour each other's tokens).
+//
+// Resource is the RFC 8707 resource indicator this token was minted
+// for — for the single-mount proxy this is always
+// {baseURL}{mountPath}. Sealed and validated separately from
+// Audience so a future multi-mount or multi-tenant deployment that
+// shares an origin cannot honour a token minted for another mount
+// (RFC 8707 §2.2). Empty on tokens minted before this field
+// existed; treated as "unknown" by the middleware (rejected only
+// when the middleware was constructed with a non-empty expected
+// resource — back-compat for callers that haven't opted in).
 type Claims struct {
 	TokenID   string    `json:"tid"`
 	Typ       string    `json:"typ"`
 	Audience  string    `json:"aud"`
+	Resource  string    `json:"res,omitempty"`
 	Subject   string    `json:"sub"`
 	Email     string    `json:"email"`
 	Groups    []string  `json:"grp,omitempty"`
@@ -255,15 +270,24 @@ func (m *Manager) OpenJSON(sealed string, v any, purpose string) error {
 	return json.Unmarshal(data, v)
 }
 
-// Issue creates a new opaque access token. The audience binds the token to a
-// specific proxy deployment so it cannot be replayed against a sibling instance
-// that happens to share the same signing secret.
-func (m *Manager) Issue(audience, subject, email, clientID string, groups []string, ttl time.Duration) (string, *Claims, error) {
+// Issue creates a new opaque access token.
+//
+// audience binds the token to a specific proxy deployment so it
+// cannot be replayed against a sibling instance that happens to
+// share the same signing secret.
+//
+// resource is the RFC 8707 resource indicator this token was minted
+// for. Sealed alongside audience so a future multi-mount deployment
+// sharing the proxy origin cannot accept a token minted for a
+// different mount (RFC 8707 §2.2). Pass "" when the caller does not
+// participate in the resource binding (legacy / non-MCP callers).
+func (m *Manager) Issue(audience, subject, email, clientID string, groups []string, ttl time.Duration, resource string) (string, *Claims, error) {
 	now := time.Now()
 	claims := &Claims{
 		TokenID:   uuid.New().String(),
 		Typ:       PurposeAccess,
 		Audience:  audience,
+		Resource:  resource,
 		Subject:   subject,
 		Email:     email,
 		Groups:    groups,

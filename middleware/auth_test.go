@@ -29,7 +29,7 @@ func setupAuth(t *testing.T) (*Auth, *token.Manager) {
 
 func issueToken(t *testing.T, tm *token.Manager, sub, email string, ttl time.Duration) string {
 	t.Helper()
-	raw, _, err := tm.Issue(testBaseURL, sub, email, "test-client", nil, ttl)
+	raw, _, err := tm.Issue(testBaseURL, sub, email, "test-client", nil, ttl, "")
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
@@ -247,7 +247,7 @@ func TestValidate_GroupsInContext(t *testing.T) {
 	auth, tm := setupAuth(t)
 
 	groups := []string{"admin", "dev"}
-	raw, _, err := tm.Issue(testBaseURL, "user-grp", "grp@example.com", "test-client", groups, 5*time.Minute)
+	raw, _, err := tm.Issue(testBaseURL, "user-grp", "grp@example.com", "test-client", groups, 5*time.Minute, "")
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
@@ -307,7 +307,7 @@ func TestValidate_RejectsWrongAudience(t *testing.T) {
 	}
 
 	// Token minted for a sibling instance with the same secret but different baseURL.
-	raw, _, err := tm.Issue("https://other-proxy.example.com", "user-x", "x@example.com", "test-client", nil, 5*time.Minute)
+	raw, _, err := tm.Issue("https://other-proxy.example.com", "user-x", "x@example.com", "test-client", nil, 5*time.Minute, "")
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
@@ -326,6 +326,62 @@ func TestValidate_RejectsWrongAudience(t *testing.T) {
 
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for cross-audience token, got %d", rr.Code)
+	}
+}
+
+// TestValidate_RejectsCrossMountResource pins R1-M1: a token whose
+// `res` claim names a different mount on the same proxy origin must
+// be rejected by the bearer middleware. Models the future
+// multi-mount case where two MCP backends share the proxy origin
+// (and signing secret) — without the resource check, a token minted
+// for /mcp-a would silently authorize against /mcp-b. Tokens with
+// no `res` claim (legacy / pre-rolling-deploy) stay accepted.
+func TestValidate_RejectsCrossMountResource(t *testing.T) {
+	tm, err := token.NewManager(testSecret)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	cases := []struct {
+		name         string
+		tokenRes     string
+		expectAccept bool
+	}{
+		{"matching_resource_accepted", testBaseURL + "/mcp", true},
+		{"empty_resource_accepted_for_legacy", "", true},
+		{"sibling_mount_rejected", testBaseURL + "/mcp-other", false},
+		{"different_origin_rejected", "https://other.example/mcp", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, _, err := tm.Issue(testBaseURL, "user", "u@example.com", "cid", nil, 5*time.Minute, tc.tokenRes)
+			if err != nil {
+				t.Fatalf("Issue: %v", err)
+			}
+			auth := NewAuth(tm, zap.NewNop(), testBaseURL, "/mcp", time.Time{})
+			var nextCalled bool
+			next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				nextCalled = true
+				w.WriteHeader(http.StatusOK)
+			})
+			req := httptest.NewRequest(http.MethodGet, "/mcp", nil)
+			req.Header.Set("Authorization", "Bearer "+raw)
+			rr := httptest.NewRecorder()
+			auth.Validate(next).ServeHTTP(rr, req)
+
+			if tc.expectAccept {
+				if !nextCalled || rr.Code != http.StatusOK {
+					t.Errorf("want accept, got status=%d nextCalled=%v", rr.Code, nextCalled)
+				}
+			} else {
+				if nextCalled {
+					t.Errorf("want reject, but next was called")
+				}
+				if rr.Code != http.StatusUnauthorized {
+					t.Errorf("want 401, got %d", rr.Code)
+				}
+			}
+		})
 	}
 }
 

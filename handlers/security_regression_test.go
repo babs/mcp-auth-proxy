@@ -170,7 +170,7 @@ func TestC1e_AccessBlobRejectedAtTokenRefresh(t *testing.T) {
 	encClientID, _ := registerClient(t, tm, []string{"https://app.example.com/callback"})
 
 	// A legitimate access token issued by tm.Issue — purpose = "access".
-	accessTok, _, err := tm.Issue(testBaseURL, "user-sub", "user@example.com", "some-client", nil, 5*time.Minute)
+	accessTok, _, err := tm.Issue(testBaseURL, "user-sub", "user@example.com", "some-client", nil, 5*time.Minute, "")
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}

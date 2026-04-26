@@ -52,17 +52,25 @@ type sealedClient struct {
 // verifier used on the proxy-to-IdP leg (H3). Mixing the two would cause
 // the upstream exchange to fail against a downstream-bound verifier.
 type sealedSession struct {
-	ClientID      string    `json:"cid"`
-	RedirectURI   string    `json:"ru"`
-	CodeChallenge string    `json:"cc"`
-	OriginalState string    `json:"os"`
-	Nonce         string    `json:"nonce"`
-	PKCEVerifier  string    `json:"pv"`
-	SvrVerifier   string    `json:"sv,omitempty"`
-	SvrChallenge  string    `json:"sch,omitempty"`
-	Typ           string    `json:"typ"`
-	Audience      string    `json:"aud"`
-	ExpiresAt     time.Time `json:"exp"`
+	ClientID      string `json:"cid"`
+	RedirectURI   string `json:"ru"`
+	CodeChallenge string `json:"cc"`
+	OriginalState string `json:"os"`
+	Nonce         string `json:"nonce"`
+	PKCEVerifier  string `json:"pv"`
+	SvrVerifier   string `json:"sv,omitempty"`
+	SvrChallenge  string `json:"sch,omitempty"`
+	Typ           string `json:"typ"`
+	Audience      string `json:"aud"`
+	// Resource is the canonical RFC 8707 resource indicator the
+	// downstream tokens will be bound to. Captured at /authorize so
+	// the binding is fixed BEFORE the upstream IdP round trip — a
+	// later code-substitution attempt cannot retarget the issued
+	// token to a different mount on a future multi-mount proxy
+	// (RFC 8707 §2.2). Empty on legacy sessions sealed before this
+	// field existed.
+	Resource  string    `json:"res,omitempty"`
+	ExpiresAt time.Time `json:"exp"`
 }
 
 // sealedCode is the encrypted payload inside an authorization code.
@@ -87,6 +95,11 @@ type sealedCode struct {
 	Email         string   `json:"email"`
 	Name          string   `json:"name"`
 	Groups        []string `json:"grp,omitempty"`
+	// Resource is inherited from the originating sealedSession so the
+	// downstream access + refresh tokens carry the same RFC 8707
+	// resource binding the client requested at /authorize. Empty on
+	// codes minted before this field existed.
+	Resource string `json:"res,omitempty"`
 	// ServerPKCE is true when the proxy minted the PKCE pair itself
 	// because the client omitted code_challenge in relaxed mode (H6).
 	// In that case CodeChallenge and SvrVerifier are both populated from
@@ -111,14 +124,20 @@ type sealedCode struct {
 // RFC 6749 §10.4 refresh-rotation-with-reuse-detection. Without a store
 // both fields are set but unused (stateless fallback).
 type sealedRefresh struct {
-	TokenID   string    `json:"tid"`
-	FamilyID  string    `json:"fam"`
-	Subject   string    `json:"sub"`
-	Email     string    `json:"email"`
-	Groups    []string  `json:"grp,omitempty"`
-	ClientID  string    `json:"cid"`
-	Typ       string    `json:"typ"`
-	Audience  string    `json:"aud"`
+	TokenID  string   `json:"tid"`
+	FamilyID string   `json:"fam"`
+	Subject  string   `json:"sub"`
+	Email    string   `json:"email"`
+	Groups   []string `json:"grp,omitempty"`
+	ClientID string   `json:"cid"`
+	Typ      string   `json:"typ"`
+	Audience string   `json:"aud"`
+	// Resource is inherited from the originating code and stays
+	// constant across rotations — every access token in the family
+	// must remain bound to the same RFC 8707 resource the client
+	// requested at /authorize. Empty on refresh tokens sealed before
+	// this field existed.
+	Resource  string    `json:"res,omitempty"`
 	IssuedAt  time.Time `json:"iat"`
 	ExpiresAt time.Time `json:"exp"`
 }

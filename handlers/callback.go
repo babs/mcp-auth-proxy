@@ -350,6 +350,7 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 			SvrVerifier:   session.SvrVerifier,
 			Typ:           token.PurposeCode,
 			Audience:      audience,
+			Resource:      session.Resource,
 			ExpiresAt:     time.Now().Add(codeTTL),
 		}
 

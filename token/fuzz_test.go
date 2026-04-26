@@ -44,7 +44,7 @@ func FuzzValidate(f *testing.F) {
 		f.Fatalf("NewManager: %v", err)
 	}
 
-	if tok, _, err := m.Issue("aud", "sub", "e@x", "cid", nil, 60*time.Second); err == nil {
+	if tok, _, err := m.Issue("aud", "sub", "e@x", "cid", nil, 60*time.Second, ""); err == nil {
 		f.Add(tok)
 	}
 	// Cross-type seeds: payloads sealed under other purposes must all be

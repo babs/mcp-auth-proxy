@@ -332,6 +332,7 @@ func main() {
 	r.With(authorizeLimit).Get("/authorize", handlers.Authorize(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, handlers.AuthorizeConfig{
 		PKCERequired:         cfg.PKCERequired,
 		ResourceURIs:         []string{cfg.ProxyBaseURL + cfg.UpstreamMCPMountPath},
+		CanonicalResource:    cfg.ProxyBaseURL + cfg.UpstreamMCPMountPath,
 		CompatAllowStateless: cfg.CompatAllowStateless,
 	}))
 	r.With(callbackLimit).Get("/callback", handlers.Callback(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, idTokenVerifier, handlers.CallbackConfig{

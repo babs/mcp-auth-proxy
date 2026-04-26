@@ -18,6 +18,15 @@ const sessionTTL = 10 * time.Minute
 type AuthorizeConfig struct {
 	PKCERequired bool // false = allow clients that omit code_challenge (Cursor, MCP Inspector)
 	ResourceURIs []string
+	// CanonicalResource is the RFC 8707 resource indicator every
+	// issued access + refresh token will be bound to. For the
+	// single-mount proxy this is {baseURL}{mountPath}. Sealed into
+	// the session at /authorize so the binding is locked BEFORE
+	// the upstream IdP round trip — a later code-substitution
+	// cannot retarget the issued token to a different mount on a
+	// future multi-mount proxy (RFC 8707 §2.2). Empty disables the
+	// resource-binding plumbing (legacy / non-MCP callers).
+	CanonicalResource string
 	// CompatAllowStateless keeps the legacy behavior of synthesizing a
 	// server-side state when the client omits it. Default false — strict
 	// mode refuses (400 invalid_request) so a client-side CSRF bug cannot
@@ -219,6 +228,7 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 			SvrChallenge:  svrChallenge, // mirrors sessionChallenge in that case
 			Typ:           token.PurposeSession,
 			Audience:      baseURL,
+			Resource:      authzCfg.CanonicalResource,
 			ExpiresAt:     time.Now().Add(sessionTTL),
 		}
 

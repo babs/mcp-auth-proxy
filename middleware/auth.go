@@ -38,7 +38,14 @@ type Auth struct {
 	// root PRM (kept as the legacy form for callers that explicitly
 	// want it; new callers should always pass the mount).
 	protectedResourcePath string
-	revokeBefore          time.Time // tokens with iat before this are rejected (zero = disabled)
+	// expectedResource is the canonical RFC 8707 resource indicator
+	// every accepted token must carry in its `res` claim
+	// ({baseURL}{mountPath} for the single-mount proxy). Empty
+	// disables the check — used by callers that haven't opted into
+	// the resource-binding plumbing yet, and to keep tokens minted
+	// before the field existed accepted during a rolling deploy.
+	expectedResource string
+	revokeBefore     time.Time // tokens with iat before this are rejected (zero = disabled)
 }
 
 // NewAuth builds the bearer-token middleware.
@@ -52,8 +59,25 @@ type Auth struct {
 // with resource={baseURL}{mountPath}; pointing the challenge at the
 // root PRM (resource={baseURL}/) instead would make a strict client
 // reject the document.
+//
+// The expected RFC 8707 resource the bearer must carry in its
+// claims is derived as baseURL+protectedResourcePath. A future
+// multi-mount Auth wiring can pass a list of accepted resources
+// instead, but the current single-mount proxy resolves to one
+// canonical URI.
 func NewAuth(tm *token.Manager, logger *zap.Logger, baseURL, protectedResourcePath string, revokeBefore time.Time) *Auth {
-	return &Auth{tokenManager: tm, logger: logger, baseURL: baseURL, protectedResourcePath: protectedResourcePath, revokeBefore: revokeBefore}
+	expected := ""
+	if protectedResourcePath != "" {
+		expected = baseURL + protectedResourcePath
+	}
+	return &Auth{
+		tokenManager:          tm,
+		logger:                logger,
+		baseURL:               baseURL,
+		protectedResourcePath: protectedResourcePath,
+		expectedResource:      expected,
+		revokeBefore:          revokeBefore,
+	}
 }
 
 // bearerPrefix is used for a case-insensitive match on the auth scheme,
@@ -105,6 +129,24 @@ func (a *Auth) Validate(next http.Handler) http.Handler {
 				zap.String("want", a.baseURL),
 			)
 			metrics.AccessDenied.WithLabelValues("audience_mismatch").Inc()
+			a.writeAuthError(w, "invalid_token")
+			return
+		}
+
+		// Prevent cross-mount replay (RFC 8707 §2.2): a future
+		// multi-mount deployment sharing the proxy origin (and the
+		// signing secret) must not honour a token minted for a
+		// different mount. Skipped when expectedResource is empty
+		// (caller hasn't opted into the resource binding) and when
+		// the token was minted before the `res` claim existed (the
+		// rolling-deploy backstop — those tokens still satisfy
+		// audience + iat, and the next refresh adds the field).
+		if a.expectedResource != "" && claims.Resource != "" && claims.Resource != a.expectedResource {
+			a.logger.Debug("token_resource_mismatch",
+				zap.String("got", claims.Resource),
+				zap.String("want", a.expectedResource),
+			)
+			metrics.AccessDenied.WithLabelValues("resource_mismatch").Inc()
 			a.writeAuthError(w, "invalid_token")
 			return
 		}
