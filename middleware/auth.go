@@ -30,11 +30,30 @@ type Auth struct {
 	tokenManager *token.Manager
 	logger       *zap.Logger
 	baseURL      string
-	revokeBefore time.Time // tokens with iat before this are rejected (zero = disabled)
+	// protectedResourcePath is the mount-path component of the
+	// protected resource served by this Auth instance (e.g. "/mcp",
+	// "/api/v1/mcp"). Appended to the PRM URL emitted in the bearer
+	// challenge so the metadata document a strict RFC 9728 client
+	// fetches has resource == requested URL. Empty falls back to the
+	// root PRM (kept as the legacy form for callers that explicitly
+	// want it; new callers should always pass the mount).
+	protectedResourcePath string
+	revokeBefore          time.Time // tokens with iat before this are rejected (zero = disabled)
 }
 
-func NewAuth(tm *token.Manager, logger *zap.Logger, baseURL string, revokeBefore time.Time) *Auth {
-	return &Auth{tokenManager: tm, logger: logger, baseURL: baseURL, revokeBefore: revokeBefore}
+// NewAuth builds the bearer-token middleware.
+//
+// protectedResourcePath is the mount-path component of the protected
+// resource (e.g. "/mcp"). RFC 9728 §5.3 requires that, when a client
+// retrieves the metadata document linked from the WWW-Authenticate
+// challenge, the document's `resource` field matches the URL the
+// client used for the protected request. The proxy publishes the
+// path-scoped PRM at /.well-known/oauth-protected-resource{mountPath}
+// with resource={baseURL}{mountPath}; pointing the challenge at the
+// root PRM (resource={baseURL}/) instead would make a strict client
+// reject the document.
+func NewAuth(tm *token.Manager, logger *zap.Logger, baseURL, protectedResourcePath string, revokeBefore time.Time) *Auth {
+	return &Auth{tokenManager: tm, logger: logger, baseURL: baseURL, protectedResourcePath: protectedResourcePath, revokeBefore: revokeBefore}
 }
 
 // bearerPrefix is used for a case-insensitive match on the auth scheme,
@@ -108,21 +127,30 @@ func (a *Auth) Validate(next http.Handler) http.Handler {
 	})
 }
 
-// writeAuthError returns 401 with WWW-Authenticate pointing to the protected
-// resource metadata (RFC 9728 §5.1). errCode must be one of the RFC 6750 §3.1
-// codes: invalid_request, invalid_token, insufficient_scope.
+// writeAuthError returns 401 with WWW-Authenticate pointing to the
+// protected resource metadata (RFC 9728 §5.1). errCode must be one of
+// the RFC 6750 §3.1 codes: invalid_request, invalid_token,
+// insufficient_scope.
+//
+// The metadata URL is built from baseURL + protectedResourcePath so a
+// strict RFC 9728 §5.3 client that fetches the document sees a
+// `resource` value matching the URL it called (the path-scoped PRM at
+// /.well-known/oauth-protected-resource{mountPath} advertises
+// resource={baseURL}{mountPath}). When protectedResourcePath is empty
+// we fall back to the root PRM for compatibility with existing
+// non-MCP callers.
 //
 // The challenge includes an `error_description` attribute (RFC 6750 §3 —
-// MAY) so a log observer / API gateway / client developer tool that only
-// sees the header (not the JSON body) can still tell the two failure
-// modes apart. Descriptions are short, fixed, and carry no caller-
-// controlled data — pure allowlist lookup to rule out any header-
-// injection concerns.
+// MAY) so a log observer / API gateway / client developer tool that
+// only sees the header (not the JSON body) can still tell the two
+// failure modes apart. Descriptions are short, fixed, and carry no
+// caller-controlled data — pure allowlist lookup to rule out any
+// header-injection concerns.
 func (a *Auth) writeAuthError(w http.ResponseWriter, errCode string) {
 	desc := errorDescriptions[errCode]
 	w.Header().Set("WWW-Authenticate", fmt.Sprintf(
-		`Bearer error="%s", error_description="%s", resource_metadata="%s/.well-known/oauth-protected-resource"`,
-		errCode, desc, a.baseURL,
+		`Bearer error="%s", error_description="%s", resource_metadata="%s/.well-known/oauth-protected-resource%s"`,
+		errCode, desc, a.baseURL, a.protectedResourcePath,
 	))
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusUnauthorized)

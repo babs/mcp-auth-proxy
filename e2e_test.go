@@ -201,7 +201,7 @@ func buildTestProxy(t *testing.T, oidcProvider *mockOIDCProvider, mcpServer *moc
 		t.Fatalf("proxy.Handler: %v", err)
 	}
 
-	authMW := middleware.NewAuth(tm, zap.NewNop(), proxyBaseURL, time.Time{})
+	authMW := middleware.NewAuth(tm, zap.NewNop(), proxyBaseURL, "/mcp", time.Time{})
 
 	r := chi.NewRouter()
 	registerDiscoveryRoutes(r, proxyBaseURL, "/mcp", "", nil)

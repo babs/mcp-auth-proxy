@@ -184,7 +184,7 @@ func main() {
 		logger.Info("upstream_authorization_header_configured")
 	}
 
-	authMW := middleware.NewAuth(tm, logger, cfg.ProxyBaseURL, cfg.RevokeBefore)
+	authMW := middleware.NewAuth(tm, logger, cfg.ProxyBaseURL, cfg.UpstreamMCPMountPath, cfg.RevokeBefore)
 
 	// Signal lifecycle. Three handlers listen for SIGINT/SIGTERM over the
 	// process lifetime; Go's signal package fans out each delivery to every
