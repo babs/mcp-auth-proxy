@@ -231,7 +231,7 @@ func main() {
 		})
 	})
 	r.Use(chimw.RequestID)
-	r.Use(zapMiddleware(logger, cfg.AccessLogSkipRE))
+	r.Use(zapMiddleware(logger, cfg.AccessLogSkipRE, buildRPCMetricsObserver(cfg)))
 	r.Use(chimw.Recoverer)
 
 	// Per-IP rate limits. By default the limiter keys on the stripped
@@ -575,7 +575,39 @@ func accessLogSkipPattern(re *regexp.Regexp) string {
 	return re.String()
 }
 
-func zapMiddleware(logger *zap.Logger, skipRE *regexp.Regexp) func(http.Handler) http.Handler {
+// rpcMetricsObserver is the per-request hook that records the four
+// per-tool counters. nil when MCP_TOOL_METRICS is disabled — keeps the
+// hot path branch-only when the operator hasn't opted in.
+type rpcMetricsObserver func(tool string, status int, reqBytes int64, respBytes int)
+
+// buildRPCMetricsObserver returns the per-tool metrics callback when
+// MCP_TOOL_METRICS=true and nil otherwise. The callback closes over a
+// single ToolCardinality instance so the cap state is shared across
+// every request. Counters are independent CounterVecs keyed on the
+// resolved (capped + sanitized) tool label.
+func buildRPCMetricsObserver(cfg *config.Config) rpcMetricsObserver {
+	if !cfg.ToolMetricsEnabled {
+		return nil
+	}
+	card := &metrics.ToolCardinality{MaxCardinality: cfg.ToolMetricsMaxCardinality}
+	return func(tool string, status int, reqBytes int64, respBytes int) {
+		label := card.ToolLabel(tool)
+		metrics.RPCCalls.WithLabelValues(label).Inc()
+		if status >= 400 {
+			metrics.RPCCallsFailed.WithLabelValues(label).Inc()
+		}
+		// Content-Length of -1 means chunked / unknown; do not
+		// fabricate a byte count.
+		if reqBytes > 0 {
+			metrics.RPCRequestBytes.WithLabelValues(label).Add(float64(reqBytes))
+		}
+		if respBytes > 0 {
+			metrics.RPCResponseBytes.WithLabelValues(label).Add(float64(respBytes))
+		}
+	}
+}
+
+func zapMiddleware(logger *zap.Logger, skipRE *regexp.Regexp, rpcObs rpcMetricsObserver) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Operator-configured path filter. Skip early to avoid the
@@ -629,6 +661,17 @@ func zapMiddleware(logger *zap.Logger, skipRE *regexp.Regexp) func(http.Handler)
 				fields = append(fields, zap.String("rpc_id", rec.RPCID))
 			}
 			logger.Info("request", fields...)
+
+			// Per-tool RPC metrics observed AFTER the log line so a panic
+			// in the observer cannot lose the access-log entry. Only fires
+			// for requests that actually exercised the JSON-RPC peek path —
+			// non-RPC traffic (discovery, OAuth endpoints) is filtered out
+			// by the rec.RPCMethod presence check, since the `_unknown`
+			// bucket is reserved for genuine RPC-shaped requests where the
+			// tool name simply did not parse.
+			if rpcObs != nil && rec.RPCMethod != "" {
+				rpcObs(rec.RPCTool, ww.Status(), r.ContentLength, ww.BytesWritten())
+			}
 		})
 	}
 }

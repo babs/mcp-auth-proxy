@@ -73,6 +73,20 @@ type Config struct {
 	// pattern fails startup. Default nil (log everything).
 	// env: ACCESS_LOG_SKIP_RE.
 	AccessLogSkipRE *regexp.Regexp
+	// ToolMetricsEnabled gates per-tool Prometheus counters
+	// (mcp_auth_rpc_calls_total{tool}, …). Off by default — the
+	// `tool` label increases series cardinality and may reveal
+	// which workflows tenants invoke. Enable when the visibility
+	// is worth the cardinality + privacy trade. env: MCP_TOOL_METRICS.
+	ToolMetricsEnabled bool
+	// ToolMetricsMaxCardinality caps the number of distinct tool
+	// labels the proxy will mint. Names past the cap collapse into
+	// the `_overflow` bucket so a malicious client that probes
+	// thousands of fictional tool names cannot blow up Prometheus
+	// memory. Default 256 — comfortably above any real upstream's
+	// tool count, low enough to detect runaways. env:
+	// MCP_TOOL_METRICS_MAX_CARDINALITY.
+	ToolMetricsMaxCardinality int
 	// TrustProxyHeaders is the legacy "trust every peer's XFF" switch.
 	// Kept for backward compatibility; prefer TrustedProxyCIDRs in new
 	// deployments. When true AND TrustedProxyCIDRs is empty, every
@@ -295,6 +309,16 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("ACCESS_LOG_SKIP_RE is not a valid regexp: %w", err)
 		}
 		c.AccessLogSkipRE = re
+	}
+
+	c.ToolMetricsEnabled = strings.ToLower(os.Getenv("MCP_TOOL_METRICS")) == "true"
+	c.ToolMetricsMaxCardinality = 256
+	if v := os.Getenv("MCP_TOOL_METRICS_MAX_CARDINALITY"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return nil, fmt.Errorf("MCP_TOOL_METRICS_MAX_CARDINALITY must be a positive integer, got %q", v)
+		}
+		c.ToolMetricsMaxCardinality = n
 	}
 
 	// TRUST_PROXY_HEADERS defaults to false. Honoring XFF/X-Real-IP behind an

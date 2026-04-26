@@ -81,6 +81,16 @@ data:
   # rpc_method / rpc_tool / rpc_id fields).
   MCP_LOG_BODY_MAX: "65536"
 
+  # Per-tool Prometheus counters. Disabled by default — the `tool`
+  # label increases series cardinality and reveals which workflows
+  # tenants invoke. Enable when the operator wants per-tool RED
+  # dashboards / volume audits.
+  # MCP_TOOL_METRICS: "true"
+  # Cap distinct tool labels (default 256). Over-cap names route to
+  # the `_overflow` bucket. Set to "0" only when the upstream
+  # enforces a tool allowlist.
+  # MCP_TOOL_METRICS_MAX_CARDINALITY: "256"
+
   # Optional human-readable display name advertised under resource_name
   # in the RFC 9728 PRM. Used by MCP clients for consent / UI display.
   # MCP_RESOURCE_NAME: "ACME MCP"

@@ -507,6 +507,53 @@ func TestLoad_AccessLogSkipRE_WhitespaceTreatedAsUnset(t *testing.T) {
 	}
 }
 
+func TestLoad_ToolMetrics_DefaultsOff(t *testing.T) {
+	setAllRequired(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.ToolMetricsEnabled {
+		t.Error("ToolMetricsEnabled should default to false (cardinality + privacy trade)")
+	}
+	if cfg.ToolMetricsMaxCardinality != 256 {
+		t.Errorf("ToolMetricsMaxCardinality default = %d, want 256", cfg.ToolMetricsMaxCardinality)
+	}
+}
+
+func TestLoad_ToolMetrics_Enabled(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("MCP_TOOL_METRICS", "true")
+	t.Setenv("MCP_TOOL_METRICS_MAX_CARDINALITY", "32")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.ToolMetricsEnabled {
+		t.Error("ToolMetricsEnabled should be true when MCP_TOOL_METRICS=true")
+	}
+	if cfg.ToolMetricsMaxCardinality != 32 {
+		t.Errorf("ToolMetricsMaxCardinality = %d, want 32", cfg.ToolMetricsMaxCardinality)
+	}
+}
+
+func TestLoad_ToolMetrics_InvalidCardinality(t *testing.T) {
+	cases := []string{"0", "-1", "not-a-number"}
+	for _, in := range cases {
+		t.Run(in, func(t *testing.T) {
+			setAllRequired(t)
+			t.Setenv("MCP_TOOL_METRICS_MAX_CARDINALITY", in)
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("expected error for %q", in)
+			}
+			if !strings.Contains(err.Error(), "MCP_TOOL_METRICS_MAX_CARDINALITY") {
+				t.Errorf("error should mention the env var, got %q", err)
+			}
+		})
+	}
+}
+
 func TestLoad_MCPLogBodyMax_Negative(t *testing.T) {
 	setAllRequired(t)
 	t.Setenv("MCP_LOG_BODY_MAX", "-1")
