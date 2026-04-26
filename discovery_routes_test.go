@@ -18,7 +18,7 @@ func TestRegisterDiscoveryRoutes(t *testing.T) {
 	baseURL := "https://proxy.example.test"
 
 	r := chi.NewRouter()
-	registerDiscoveryRoutes(r, baseURL, "/mcp", "")
+	registerDiscoveryRoutes(r, baseURL, "/mcp", "", nil)
 	// Simulate the production auth-gated catch-all. If any discovery
 	// path falls through to this, the assertion on the status will
 	// flag it (it writes 401 instead of the expected value).
@@ -76,7 +76,7 @@ func TestRegisterDiscoveryRoutes_CustomMount(t *testing.T) {
 	baseURL := "https://proxy.example.test"
 	mount := "/api/v1/mcp"
 	r := chi.NewRouter()
-	registerDiscoveryRoutes(r, baseURL, mount, "")
+	registerDiscoveryRoutes(r, baseURL, mount, "", nil)
 	r.Group(func(r chi.Router) {
 		r.Use(func(next http.Handler) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -129,7 +129,7 @@ func TestRegisterDiscoveryRoutes_CustomMount(t *testing.T) {
 // "404 page not found" from net/http's default (M2).
 func TestWellKnownNotFound_JSONShape(t *testing.T) {
 	r := chi.NewRouter()
-	registerDiscoveryRoutes(r, "https://proxy.example.test", "/mcp", "")
+	registerDiscoveryRoutes(r, "https://proxy.example.test", "/mcp", "", nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/.well-known/openid-configuration", nil)
 	rr := httptest.NewRecorder()
@@ -157,7 +157,7 @@ func TestWellKnownNotFound_JSONShape(t *testing.T) {
 func TestRegisterDiscoveryRoutes_ResourceFields(t *testing.T) {
 	baseURL := "https://proxy.example.test"
 	r := chi.NewRouter()
-	registerDiscoveryRoutes(r, baseURL, "/mcp", "")
+	registerDiscoveryRoutes(r, baseURL, "/mcp", "", nil)
 
 	cases := []struct {
 		path         string
@@ -183,5 +183,38 @@ func TestRegisterDiscoveryRoutes_ResourceFields(t *testing.T) {
 				t.Errorf("resource: want %q, got %v", tc.wantResource, meta["resource"])
 			}
 		})
+	}
+}
+
+// TestRegisterDiscoveryRoutes_LimiterApplied verifies the rate
+// limiter is invoked for every well-known path the function wires.
+// Uses a counting middleware as the "limiter" — the assertion is the
+// invocation count, not a 429 (the actual httprate behavior is
+// covered by httprate's own tests; this test pins the wiring).
+func TestRegisterDiscoveryRoutes_LimiterApplied(t *testing.T) {
+	var called int
+	limiter := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			called++
+			next.ServeHTTP(w, r)
+		})
+	}
+	r := chi.NewRouter()
+	registerDiscoveryRoutes(r, "https://proxy.example.test", "/mcp", "", limiter)
+
+	paths := []string{
+		"/.well-known/oauth-protected-resource",
+		"/.well-known/oauth-protected-resource/mcp",
+		"/.well-known/oauth-authorization-server",
+		"/.well-known/oauth-authorization-server/mcp",
+		"/.well-known/openid-configuration",
+		"/.well-known/openid-configuration/mcp",
+		"/mcp/.well-known/oauth-authorization-server",
+	}
+	for _, p := range paths {
+		r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, p, nil))
+	}
+	if called != len(paths) {
+		t.Errorf("limiter invoked %d times, want %d (%v)", called, len(paths), paths)
 	}
 }
