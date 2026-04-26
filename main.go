@@ -533,7 +533,7 @@ func cidrAwareKey(cidrs []*net.IPNet) httprate.KeyFunc {
 // on abuse patterns per-endpoint. Callers pass the key-func composition
 // (IP-only, IP+path, ...) that matches the bucket semantics they want.
 func rateLimiter(limit int, window time.Duration, endpoint string, keyFuncs ...httprate.KeyFunc) func(http.Handler) http.Handler {
-	return httprate.Limit(
+	httprateMW := httprate.Limit(
 		limit, window,
 		httprate.WithKeyFuncs(keyFuncs...),
 		httprate.WithLimitHandler(func(w http.ResponseWriter, _ *http.Request) {
@@ -543,6 +543,62 @@ func rateLimiter(limit int, window time.Duration, endpoint string, keyFuncs ...h
 			_, _ = io.WriteString(w, `{"error":"temporarily_unavailable","error_description":"rate limit exceeded"}`)
 		}),
 	)
+	// Wrap with suppression so httprate's X-RateLimit-* headers never
+	// reach the client. Production MCP servers (Cloudflare, GitHub
+	// Copilot, Atlassian, Notion, Sentry — surveyed in the red-team
+	// plan) all keep these silent. The IETF rate-limit-headers draft
+	// (security considerations) explicitly notes that disclosing
+	// quota state on auth/error paths leaks operational capacity to
+	// attackers; suppression is the safer default. Retry-After (when
+	// httprate sets it on 429) is preserved — that one is genuine
+	// client-UX and does not advertise the bucket geometry.
+	return func(next http.Handler) http.Handler {
+		return suppressRateLimitHeaders(httprateMW(next))
+	}
+}
+
+// suppressRateLimitHeaders removes the X-RateLimit-* headers httprate
+// sets on every response. Wrap with a small ResponseWriter so the
+// strip happens at WriteHeader time (before the headers are flushed
+// to the client).
+func suppressRateLimitHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(&rateLimitHeaderStripper{ResponseWriter: w}, r)
+	})
+}
+
+type rateLimitHeaderStripper struct {
+	http.ResponseWriter
+	stripped bool
+}
+
+func (s *rateLimitHeaderStripper) WriteHeader(code int) {
+	if !s.stripped {
+		h := s.Header()
+		h.Del("X-RateLimit-Limit")
+		h.Del("X-RateLimit-Remaining")
+		h.Del("X-RateLimit-Reset")
+		s.stripped = true
+	}
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *rateLimitHeaderStripper) Write(b []byte) (int, error) {
+	if !s.stripped {
+		s.WriteHeader(http.StatusOK)
+	}
+	return s.ResponseWriter.Write(b)
+}
+
+// Flush forwards to the underlying writer so SSE / chunked streaming
+// keeps working — chi's WrapResponseWriter does the same dance.
+func (s *rateLimitHeaderStripper) Flush() {
+	if !s.stripped {
+		s.WriteHeader(http.StatusOK)
+	}
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 // discoverOIDC runs OIDC auto-discovery with bounded retry. A transient IdP

@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"regexp"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
@@ -199,6 +200,50 @@ func TestZapMiddleware_RPCMetrics_GateAndFanOut(t *testing.T) {
 				t.Errorf("batch invocations = %d, want %d", gotBatches, tc.wantBatches)
 			}
 		})
+	}
+}
+
+// TestRateLimiter_StripsXRateLimitHeaders verifies the wrapper around
+// httprate suppresses the X-RateLimit-Limit / -Remaining / -Reset
+// headers on both the success and the 429 paths. Production MCP
+// servers don't surface these; we match that posture so an attacker
+// cannot pace just-under-the-limit floods.
+func TestRateLimiter_StripsXRateLimitHeaders(t *testing.T) {
+	mw := rateLimiter(2, time.Minute, "test")
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	h := mw(next)
+
+	probe := func(req *http.Request) *httptest.ResponseRecorder {
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		return rr
+	}
+
+	// First request: should be allowed (200).
+	first := probe(httptest.NewRequest(http.MethodGet, "/x", nil))
+	if first.Code != http.StatusOK {
+		t.Fatalf("first request: want 200, got %d", first.Code)
+	}
+	for _, k := range []string{"X-Ratelimit-Limit", "X-Ratelimit-Remaining", "X-Ratelimit-Reset"} {
+		if v := first.Header().Get(k); v != "" {
+			t.Errorf("first response leaked %s = %q", k, v)
+		}
+	}
+	// Trip the limit: second + third requests, third should 429.
+	for range 2 {
+		probe(httptest.NewRequest(http.MethodGet, "/x", nil))
+	}
+	throttled := probe(httptest.NewRequest(http.MethodGet, "/x", nil))
+	if throttled.Code != http.StatusTooManyRequests {
+		t.Fatalf("throttled request: want 429, got %d", throttled.Code)
+	}
+	for _, k := range []string{"X-Ratelimit-Limit", "X-Ratelimit-Remaining", "X-Ratelimit-Reset"} {
+		if v := throttled.Header().Get(k); v != "" {
+			t.Errorf("429 response leaked %s = %q", k, v)
+		}
 	}
 }
 
