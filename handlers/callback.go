@@ -129,7 +129,7 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 				idpSession.Typ == token.PurposeSession &&
 				idpSession.Audience == audience &&
 				time.Now().Before(idpSession.ExpiresAt) {
-				redirectIdPError(w, r, idpSession.RedirectURI, idpSession.OriginalState, safeError, desc, audience)
+				redirectAuthzError(w, r, idpSession.RedirectURI, idpSession.OriginalState, safeError, desc, audience)
 				return
 			}
 			writeOAuthError(w, http.StatusBadRequest, safeError, desc)
@@ -380,19 +380,24 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 	}
 }
 
-// redirectIdPError forwards an RFC 6749 §4.1.2.1 error back to the
-// client's registered redirect_uri, carrying OriginalState so the
+// redirectAuthzError forwards an RFC 6749 §4.1.2.1 error back to the
+// client's registered redirect_uri, carrying the original state so the
 // client can correlate, and stripping any fragment (defense-in-depth;
-// DCR already rejects fragment-bearing URIs). The `iss` parameter is
-// emitted on error redirects too (RFC 9207 §2 / RFC 9700 §2.1.4): a
-// strict client gates its mix-up defense on `iss` being present on
-// EVERY authorization response, not just success — omitting it on the
-// error path defeats the defense exactly when an attacker would want
-// to inject a forged error from a different AS. On a parse failure we
-// fall back to a proxy-hosted JSON body — the registered URI went
-// through exact-match validation at /authorize, so a parse error here
-// is an invariant violation rather than attacker-controlled input.
-func redirectIdPError(w http.ResponseWriter, r *http.Request, redirectURI, state, errCode, errDesc, audience string) {
+// DCR already rejects fragment-bearing URIs). Used by both the /callback
+// IdP-error path AND every /authorize failure that occurs after
+// client_id + redirect_uri have been validated — §4.1.2.1 mandates
+// redirect (not AS-rendered error) once the redirect target is trusted.
+//
+// The `iss` parameter is emitted on error redirects too (RFC 9207 §2
+// / RFC 9700 §2.1.4): a strict client gates its mix-up defense on
+// `iss` being present on EVERY authorization response, not just
+// success — omitting it on the error path defeats the defense exactly
+// when an attacker would want to inject a forged error from a
+// different AS. On a parse failure we fall back to a proxy-hosted
+// JSON body — the registered URI went through exact-match validation
+// upstream, so a parse error here is an invariant violation rather
+// than attacker-controlled input.
+func redirectAuthzError(w http.ResponseWriter, r *http.Request, redirectURI, state, errCode, errDesc, audience string) {
 	u, err := url.Parse(redirectURI)
 	if err != nil {
 		writeOAuthError(w, http.StatusBadRequest, errCode, errDesc)

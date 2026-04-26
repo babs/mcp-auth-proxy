@@ -131,6 +131,14 @@ All configuration is via environment variables.
 | `COMPAT_ALLOW_STATELESS` | When `true`, `/authorize` synthesizes a `state` server-side if the client omits it (legacy MCP Inspector / Cursor). Default `false` — strict mode refuses with 400 `invalid_request` because a silent server-synth hides client-side CSRF bugs. `mcp_auth_access_denied_total{reason="state_missing"}` is incremented either way so operators can see how many clients still rely on the compat path | `false` (default) |
 | `MCP_LOG_BODY_MAX` | Max bytes buffered per authenticated request for JSON-RPC method extraction into access logs (default `65536`). `0` disables buffering — no `rpc_method`/`rpc_tool`/`rpc_id` fields are emitted. Only triggered when `Content-Type: application/json` and `Content-Length` is set and within the limit; SSE / chunked uploads pass through untouched | `65536` (default) |
 | `ACCESS_LOG_SKIP_RE` | Go RE2 regexp matched against `r.URL.Path` on the public listener only. Matching paths are dropped from the access log; handler response, Prometheus counters, and panic recovery are unaffected. Compiled once at startup; invalid pattern is fatal. RE2 is linear-time — no ReDoS surface. Whitespace-only values are treated as unset. `/readyz` and `/metrics` live on `METRICS_ADDR` and never reach this middleware. Always anchor with `^…$`; unanchored substrings can match unrelated upstream paths and `.*` silences the entire access log | `^/healthz$` |
+| `PROD_MODE` | Strict-posture gate. Default `true` — fails startup if any compatibility flag that weakens a security control is set (`PKCE_REQUIRED=false`, `COMPAT_ALLOW_STATELESS=true`, `REDIS_REQUIRED=false`, `REDIS_URL` empty, or legacy `TRUST_PROXY_HEADERS=true` without `TRUSTED_PROXY_CIDRS`). Set `PROD_MODE=false` explicitly for dev / single-replica work that needs one of the relaxation toggles | `true` (default) |
+| `TRUSTED_PROXY_CIDRS` | Comma-separated CIDRs of peers whose `X-Forwarded-For`/`X-Real-IP`/`True-Client-IP` headers are honored for rate-limit keying. Other peers fall back to `RemoteAddr`. Preferred over `TRUST_PROXY_HEADERS`; takes precedence when both are set | `10.0.0.0/8,172.16.0.0/12,192.168.0.0/16` |
+| `MCP_RESOURCE_NAME` | Optional human-readable display name advertised under `resource_name` in the RFC 9728 PRM. Used by MCP clients for consent / UI display. Field is omitted when unset | `ACME MCP` |
+| `UPSTREAM_AUTHORIZATION_HEADER` | When non-empty, sent verbatim as the `Authorization` header on every request to the upstream MCP backend (full value incl. scheme, e.g. `Bearer s3cr3t`). Treat as a secret — mount from a Secret, not a ConfigMap | `Bearer xyz` |
+| `TOKEN_SIGNING_SECRETS_PREVIOUS` | Whitespace-separated retired signing secrets accepted on Open during a rolling rotation. New seals always use `TOKEN_SIGNING_SECRET` (primary); Open tries primary first, then each previous entry. Each entry must be ≥32 bytes | `<old1> <old2>` |
+| `LOG_LEVEL` | Zap log level (`debug` / `info` / `warn` / `error`) | `info` (default) |
+| `GROUPS_CLAIM` | Flat claim name in id_token that carries user group memberships | `groups` (default) |
+| `ALLOWED_GROUPS` | Comma-separated allowlist; empty = allow all authenticated users | `admin,mcp-users` |
 
 ---
 
@@ -170,24 +178,7 @@ mcp-auth-proxy/
 
 ## Go dependencies
 
-```go
-// go.mod
-module github.com/babs/mcp-auth-proxy
-
-go 1.26
-
-require (
-    github.com/coreos/go-oidc/v3             // OIDC discovery + id_token verification (any IdP)
-    golang.org/x/oauth2                      // OAuth2 flow
-    github.com/go-chi/chi/v5                 // HTTP router
-    github.com/go-chi/httprate               // per-IP rate limiter
-    github.com/google/uuid                   // ID generation
-    github.com/prometheus/client_golang      // Prometheus metrics
-    github.com/redis/go-redis/v9             // optional replay store
-    go.uber.org/zap                          // structured logging
-    golang.org/x/term                        // TTY detection for log format
-)
-```
+See [`go.mod`](./go.mod) — kept inline previously, now the source of truth lives next to the code.
 
 ---
 
@@ -507,52 +498,14 @@ Origin-only URLs (no path / lone `/`), query, fragment, userinfo, and paths that
 
 ---
 
-## Routing (chi)
+## Routing
 
-```go
-r := chi.NewRouter()
+The router is built in [`main.go`](./main.go) (`func main`) — see that file rather than a copy here, since this block historically rotted. High level:
 
-// Global middlewares
-r.Use(chimw.RequestID)
-r.Use(zapMiddleware(logger))
-r.Use(chimw.Recoverer)
-
-// OAuth endpoints (no auth). /register, /authorize, /callback, /token are
-// wrapped in per-IP rate limiters (httprate.LimitByIP) when
-// cfg.RateLimitEnabled is true — otherwise a passthrough middleware is used
-// so the router composition stays identical in both modes. replayStore is
-// optional (nil when REDIS_URL is unset); when non-nil, /token enforces
-// single-use authorization codes and refresh rotation with reuse detection.
-registerDiscoveryRoutes(r, cfg.ProxyBaseURL, cfg.UpstreamMCPMountPath, cfg.ResourceName) // PRM + AS metadata (root & mount) + 404 carve-outs
-r.With(registerLimit).Post("/register", handlers.Register(tm, logger, cfg.ProxyBaseURL))
-r.With(authorizeLimit).Get("/authorize", handlers.Authorize(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, handlers.AuthorizeConfig{
-    PKCERequired: cfg.PKCERequired,
-    ResourceURIs: []string{cfg.ProxyBaseURL + cfg.UpstreamMCPMountPath},
-}))
-r.With(callbackLimit).Get("/callback", handlers.Callback(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, idTokenVerifier, handlers.CallbackConfig{
-    AllowedGroups: cfg.AllowedGroups,
-    GroupsClaim:   cfg.GroupsClaim,
-}))
-r.With(tokenLimit).Post("/token", handlers.Token(tm, logger, cfg.ProxyBaseURL, cfg.RevokeBefore, replayStore, cfg.ProxyBaseURL+cfg.UpstreamMCPMountPath))
-
-// Liveness: 200 as long as the process is up.
-r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
-    w.WriteHeader(http.StatusOK)
-})
-
-// Readiness: probes Redis (1s timeout) when REDIS_URL is set, so a
-// degraded pod drops out of a K8s Service until Redis recovers.
-r.Get("/readyz", readyzHandler(replayStore, logger))
-
-// MCP proxy (auth required). Mount is the path from UPSTREAM_MCP_URL
-// (cfg.UpstreamMCPMountPath). Any request outside the mount returns
-// 404. Client path == upstream path, verbatim both sides.
-r.Group(func(r chi.Router) {
-    r.Use(authMW.Validate)
-    r.Handle(cfg.UpstreamMCPMountPath, proxyHandler)
-    r.Handle(cfg.UpstreamMCPMountPath+"/*", proxyHandler)
-})
-```
+- Global middlewares: in-flight WaitGroup → strip inbound `X-Request-Id` → `chimw.RequestID` → `zapMiddleware` → `chimw.Recoverer` → per-IP rate limiter.
+- OAuth endpoints (`/register`, `/authorize`, `/callback`, `/token`) carry per-endpoint rate limiters when `RATE_LIMIT_ENABLED=true` (passthrough otherwise). `replayStore` is wired only when `REDIS_URL` is set.
+- Liveness `/healthz` (always 200) on the public listener; readiness `/readyz` lives ONLY on the metrics listener (an unauthenticated `/readyz` on the public port is a Redis-DoS amplifier — see comment at `main.go:304`).
+- MCP proxy mounts at `cfg.UpstreamMCPMountPath` (path from `UPSTREAM_MCP_URL`) under `authMW.Validate` → `RPCPeek` → per-subject concurrency limiter. Client path == upstream path, verbatim, no rewrite.
 
 ---
 
@@ -596,49 +549,7 @@ stripped of non-ASCII-printable bytes to defeat log / header injection.
 
 ## Dockerfile
 
-```dockerfile
-FROM golang:1.26-alpine AS builder
-
-ARG VERSION="v0.0.0"
-ARG COMMIT_HASH="00000000-dirty"
-ARG BUILD_TIMESTAMP="1970-01-01T00:00:00+00:00"
-ARG BUILDER="unknown"
-ARG PROJECT_URL="https://github.com/babs/mcp-auth-proxy"
-
-WORKDIR /app
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build \
-    -ldflags="-s -w \
-      -X 'main.Version=${VERSION}' \
-      -X 'main.CommitHash=${COMMIT_HASH}' \
-      -X 'main.BuildTimestamp=${BUILD_TIMESTAMP}' \
-      -X 'main.Builder=${BUILDER}' \
-      -X 'main.ProjectURL=${PROJECT_URL}'" \
-    -o mcp-auth-proxy ./
-
-# distroless/static-debian13:nonroot ships ca-certificates and runs as UID
-# 65532 by default — no shell, no apt, minimal attack surface. The static
-# Go binary (CGO_ENABLED=0) needs nothing else.
-FROM gcr.io/distroless/static-debian13:nonroot
-
-ARG BUILD_TIMESTAMP="1970-01-01T00:00:00+00:00"
-ARG COMMIT_HASH="00000000-dirty"
-ARG PROJECT_URL="https://github.com/babs/mcp-auth-proxy"
-ARG VERSION="v0.0.0"
-
-LABEL org.opencontainers.image.source=${PROJECT_URL}
-LABEL org.opencontainers.image.created=${BUILD_TIMESTAMP}
-LABEL org.opencontainers.image.version=${VERSION}
-LABEL org.opencontainers.image.revision=${COMMIT_HASH}
-
-COPY --from=builder /app/mcp-auth-proxy /usr/local/bin/mcp-auth-proxy
-
-USER nonroot:nonroot
-EXPOSE 8080 9090
-ENTRYPOINT ["/usr/local/bin/mcp-auth-proxy"]
-```
+See [`Dockerfile`](./Dockerfile). Static Go binary on `gcr.io/distroless/static-debian13:nonroot` (UID 65532, no shell, no apt). Build args inject build-time metadata via `-ldflags -X`; OCI labels carry source/created/version/revision.
 
 ---
 

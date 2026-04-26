@@ -246,34 +246,6 @@ suitable for `TOKEN_SIGNING_SECRET`.
 
 ---
 
-## Security hardening history
-
-This codebase has been walked through four hardening phases. The
-high-level summary of each:
-
-- **Phase 1** — AEAD purpose binding to close sealed-type confusion,
-  proxy header allowlist, upstream PKCE + OIDC nonce on the callback
-  path, scheme-downgrade refusal on proxy redirects.
-- **Phase 2** — stateless-mode blast-radius reduction: `REDIS_REQUIRED`
-  default true, strict `state` on `/authorize` via
-  `COMPAT_ALLOW_STATELESS=false`, single-use authorization codes, and
-  refresh-rotation reuse detection with per-family revocation.
-- **Phase 3** — main / middleware / proxy hardening: loopback-only
-  `METRICS_ADDR`, cached `/readyz` on the metrics port, in-flight
-  WaitGroup drain before `rs.Close()`, `TRUST_PROXY_HEADERS` opt-in,
-  per-subject concurrency cap, 16 MiB upstream-body cap +
-  response-header timeout, stricter loopback IP parse, redirect-host
-  normalization.
-- **Phase 4** — long-tail cleanup: `TOKEN_SIGNING_SECRET` low-entropy
-  warning, `SHUTDOWN_TIMEOUT` 15-minute cap, `REDIS_KEY_PREFIX`
-  ASCII-printable validation, IdP error allowlist + description
-  truncation at `/callback`, empty-`sub` rejection, AES-GCM seal
-  counter + 2^28 one-shot rotation warning, ctx-aware OIDC discovery
-  retry, `PROXY_BASE_URL` structural validation (scheme, path,
-  userinfo, fragment), and 502 synthesis on proxy redirect exhaustion.
-
----
-
 ## Building
 
 ```bash

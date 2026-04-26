@@ -453,10 +453,14 @@ func TestAuthorize_MissingParams(t *testing.T) {
 	encClientID, _ := registerClient(t, tm, []string{redirectURI})
 	challenge := pkceChallenge("test-verifier")
 
+	// Per RFC 6749 §4.1.2.1:
+	// - errors BEFORE client_id + redirect_uri are validated → JSON 400
+	// - errors AFTER both are validated → 302 to redirect_uri with `error=…`
 	tests := []struct {
-		name      string
-		params    url.Values
-		wantError string
+		name       string
+		params     url.Values
+		wantError  string
+		wantStatus int // 400 (JSON) or 302 (redirect)
 	}{
 		{
 			name: "missing response_type",
@@ -466,7 +470,8 @@ func TestAuthorize_MissingParams(t *testing.T) {
 				"code_challenge":        {challenge},
 				"code_challenge_method": {"S256"},
 			},
-			wantError: "unsupported_response_type",
+			wantError:  "unsupported_response_type",
+			wantStatus: http.StatusFound,
 		},
 		{
 			name: "wrong response_type",
@@ -477,7 +482,8 @@ func TestAuthorize_MissingParams(t *testing.T) {
 				"code_challenge":        {challenge},
 				"code_challenge_method": {"S256"},
 			},
-			wantError: "unsupported_response_type",
+			wantError:  "unsupported_response_type",
+			wantStatus: http.StatusFound,
 		},
 		{
 			name: "missing client_id",
@@ -487,7 +493,8 @@ func TestAuthorize_MissingParams(t *testing.T) {
 				"code_challenge":        {challenge},
 				"code_challenge_method": {"S256"},
 			},
-			wantError: "invalid_request",
+			wantError:  "invalid_request",
+			wantStatus: http.StatusBadRequest,
 		},
 		{
 			name: "missing redirect_uri",
@@ -497,7 +504,8 @@ func TestAuthorize_MissingParams(t *testing.T) {
 				"code_challenge":        {challenge},
 				"code_challenge_method": {"S256"},
 			},
-			wantError: "invalid_request",
+			wantError:  "invalid_request",
+			wantStatus: http.StatusBadRequest,
 		},
 		{
 			name: "missing code_challenge",
@@ -507,7 +515,8 @@ func TestAuthorize_MissingParams(t *testing.T) {
 				"redirect_uri":          {redirectURI},
 				"code_challenge_method": {"S256"},
 			},
-			wantError: "invalid_request",
+			wantError:  "invalid_request",
+			wantStatus: http.StatusFound,
 		},
 		{
 			name: "wrong code_challenge_method",
@@ -518,7 +527,8 @@ func TestAuthorize_MissingParams(t *testing.T) {
 				"code_challenge":        {challenge},
 				"code_challenge_method": {"plain"},
 			},
-			wantError: "invalid_request",
+			wantError:  "invalid_request",
+			wantStatus: http.StatusFound,
 		},
 	}
 
@@ -529,19 +539,48 @@ func TestAuthorize_MissingParams(t *testing.T) {
 
 			Authorize(tm, logger, testBaseURL, testOAuth2Config(), AuthorizeConfig{PKCERequired: true})(rr, req)
 
-			if rr.Code != http.StatusBadRequest {
-				t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
+			if rr.Code != tc.wantStatus {
+				t.Fatalf("expected status %d, got %d: %s", tc.wantStatus, rr.Code, rr.Body.String())
 			}
-
-			var oauthErr OAuthError
-			if err := json.NewDecoder(rr.Body).Decode(&oauthErr); err != nil {
-				t.Fatalf("decode: %v", err)
-			}
-			if oauthErr.Error != tc.wantError {
-				t.Errorf("expected error %q, got %q", tc.wantError, oauthErr.Error)
+			gotError := extractAuthzError(t, rr, redirectURI)
+			if gotError != tc.wantError {
+				t.Errorf("expected error %q, got %q", tc.wantError, gotError)
 			}
 		})
 	}
+}
+
+// extractAuthzError pulls the `error` field from either a JSON 400 body
+// (RFC 6749 §4.1.2.1: client/redirect not yet trusted) or the redirect
+// `Location` query string (§4.1.2.1: redirect target is trusted).
+// Centralizes the test-side dispatch so each /authorize test stays
+// concise.
+func extractAuthzError(t *testing.T, rr *httptest.ResponseRecorder, expectedRedirectURI string) string {
+	t.Helper()
+	if rr.Code == http.StatusFound {
+		loc := rr.Header().Get("Location")
+		u, err := url.Parse(loc)
+		if err != nil {
+			t.Fatalf("parse Location %q: %v", loc, err)
+		}
+		if expectedRedirectURI != "" {
+			if got := u.Scheme + "://" + u.Host + u.Path; got != expectedRedirectURI {
+				t.Errorf("redirect target = %q, want %q", got, expectedRedirectURI)
+			}
+		}
+		// RFC 9207 §2: `iss` MUST be on every authorization response,
+		// success and error alike. Lock it here so a future regression
+		// drops the param silently.
+		if iss := u.Query().Get("iss"); iss == "" {
+			t.Errorf("redirect missing iss param: %s", loc)
+		}
+		return u.Query().Get("error")
+	}
+	var oe OAuthError
+	if err := json.NewDecoder(rr.Body).Decode(&oe); err != nil {
+		t.Fatalf("decode JSON error: %v (body=%q)", err, rr.Body.String())
+	}
+	return oe.Error
 }
 
 func TestAuthorize_InvalidClient(t *testing.T) {
@@ -593,15 +632,13 @@ func TestAuthorize_RejectsMalformedCodeChallenge(t *testing.T) {
 	rr := httptest.NewRecorder()
 	Authorize(tm, logger, testBaseURL, testOAuth2Config(), AuthorizeConfig{PKCERequired: true})(rr, req)
 
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
+	// RFC 6749 §4.1.2.1: redirect_uri is validated, so the malformed-
+	// challenge error must redirect (302) rather than render JSON.
+	if rr.Code != http.StatusFound {
+		t.Fatalf("expected 302, got %d: %s", rr.Code, rr.Body.String())
 	}
-	var oauthErr OAuthError
-	if err := json.NewDecoder(rr.Body).Decode(&oauthErr); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if oauthErr.Error != "invalid_request" {
-		t.Errorf("expected invalid_request, got %q", oauthErr.Error)
+	if got := extractAuthzError(t, rr, redirectURI); got != "invalid_request" {
+		t.Errorf("expected invalid_request, got %q", got)
 	}
 }
 
@@ -2012,8 +2049,12 @@ func TestAuthorize_PKCERequired_NoPKCE(t *testing.T) {
 
 	Authorize(tm, logger, testBaseURL, testOAuth2Config(), AuthorizeConfig{PKCERequired: true})(rr, req)
 
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 with PKCE required, got %d", rr.Code)
+	// RFC 6749 §4.1.2.1: PKCE-required without challenge → redirect.
+	if rr.Code != http.StatusFound {
+		t.Fatalf("expected 302 with PKCE required, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if got := extractAuthzError(t, rr, redirectURI); got != "invalid_request" {
+		t.Errorf("expected invalid_request, got %q", got)
 	}
 }
 
@@ -2036,8 +2077,11 @@ func TestAuthorize_PKCEOptional_RejectsPlain(t *testing.T) {
 
 	Authorize(tm, logger, testBaseURL, testOAuth2Config(), AuthorizeConfig{PKCERequired: false})(rr, req)
 
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for plain method even in relaxed mode, got %d", rr.Code)
+	if rr.Code != http.StatusFound {
+		t.Fatalf("expected 302 for plain method even in relaxed mode, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if got := extractAuthzError(t, rr, redirectURI); got != "invalid_request" {
+		t.Errorf("expected invalid_request, got %q", got)
 	}
 }
 
@@ -2060,8 +2104,11 @@ func TestAuthorize_PKCEOptional_RejectsChallengeWithoutMethod(t *testing.T) {
 
 	Authorize(tm, logger, testBaseURL, testOAuth2Config(), AuthorizeConfig{PKCERequired: false})(rr, req)
 
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for code_challenge without method, got %d", rr.Code)
+	if rr.Code != http.StatusFound {
+		t.Fatalf("expected 302 for code_challenge without method, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if got := extractAuthzError(t, rr, redirectURI); got != "invalid_request" {
+		t.Errorf("expected invalid_request, got %q", got)
 	}
 }
 
@@ -2092,13 +2139,14 @@ func TestAuthorize_RefusesStatelessByDefault(t *testing.T) {
 
 	Authorize(tm, logger, testBaseURL, testOAuth2Config(), AuthorizeConfig{PKCERequired: true})(rr, req)
 
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 state_missing in strict mode, got %d: %s", rr.Code, rr.Body.String())
+	// RFC 6749 §4.1.2.1: state_missing comes after redirect_uri is
+	// validated → redirect with `error=invalid_request`. The redirect
+	// carries no state (the client never sent one), but DOES carry iss.
+	if rr.Code != http.StatusFound {
+		t.Fatalf("expected 302 state_missing in strict mode, got %d: %s", rr.Code, rr.Body.String())
 	}
-	var oe OAuthError
-	_ = json.NewDecoder(rr.Body).Decode(&oe)
-	if oe.Error != "invalid_request" {
-		t.Errorf("expected invalid_request, got %q", oe.Error)
+	if got := extractAuthzError(t, rr, redirectURI); got != "invalid_request" {
+		t.Errorf("expected invalid_request, got %q", got)
 	}
 }
 
@@ -3148,13 +3196,11 @@ func TestAuthorize_RejectsMismatchedResource(t *testing.T) {
 
 	Authorize(tm, logger, testBaseURL, testOAuth2Config(), AuthorizeConfig{PKCERequired: true})(rr, req)
 
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("want 400, got %d: %s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusFound {
+		t.Fatalf("want 302, got %d: %s", rr.Code, rr.Body.String())
 	}
-	var e OAuthError
-	_ = json.Unmarshal(rr.Body.Bytes(), &e)
-	if e.Error != "invalid_target" {
-		t.Errorf("want error=invalid_target, got %q", e.Error)
+	if got := extractAuthzError(t, rr, redirectURI); got != "invalid_target" {
+		t.Errorf("want error=invalid_target, got %q", got)
 	}
 }
 
@@ -3178,8 +3224,59 @@ func TestAuthorize_MultipleResource_AllMustMatch(t *testing.T) {
 
 	Authorize(tm, logger, testBaseURL, testOAuth2Config(), AuthorizeConfig{PKCERequired: true})(rr, req)
 
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("want 400 (one bad resource in list), got %d", rr.Code)
+	if rr.Code != http.StatusFound {
+		t.Fatalf("want 302 (one bad resource in list), got %d: %s", rr.Code, rr.Body.String())
+	}
+	if got := extractAuthzError(t, rr, redirectURI); got != "invalid_target" {
+		t.Errorf("want error=invalid_target, got %q", got)
+	}
+}
+
+// TestAuthorize_RedirectError_PreservesStateAndIss locks the RFC 6749
+// §4.1.2.1 contract: errors that occur after redirect_uri is validated
+// must redirect to redirect_uri with `error=…&state=…&iss=…`. Test
+// covers the full chain by sending an invalid_target with a real
+// client-supplied state and asserting all three parameters land on the
+// redirect.
+func TestAuthorize_RedirectError_PreservesStateAndIss(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+
+	redirectURI := "https://app.example.com/callback"
+	encClientID, _ := registerClient(t, tm, []string{redirectURI})
+	clientState := "client-correlation-token-xyz"
+
+	target := "/authorize?response_type=code&client_id=" + url.QueryEscape(encClientID) +
+		"&redirect_uri=" + url.QueryEscape(redirectURI) +
+		"&code_challenge=" + pkceChallenge("v") +
+		"&code_challenge_method=S256" +
+		"&state=" + url.QueryEscape(clientState) +
+		"&resource=" + url.QueryEscape("https://evil.example.com")
+
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	rr := httptest.NewRecorder()
+	Authorize(tm, logger, testBaseURL, testOAuth2Config(), AuthorizeConfig{PKCERequired: true})(rr, req)
+
+	if rr.Code != http.StatusFound {
+		t.Fatalf("want 302, got %d: %s", rr.Code, rr.Body.String())
+	}
+	loc := rr.Header().Get("Location")
+	u, err := url.Parse(loc)
+	if err != nil {
+		t.Fatalf("parse Location: %v", err)
+	}
+	if u.Scheme+"://"+u.Host+u.Path != redirectURI {
+		t.Errorf("redirect target = %q, want %q", u.Scheme+"://"+u.Host+u.Path, redirectURI)
+	}
+	q := u.Query()
+	if q.Get("error") != "invalid_target" {
+		t.Errorf("error = %q, want invalid_target", q.Get("error"))
+	}
+	if q.Get("state") != clientState {
+		t.Errorf("state = %q, want %q (client correlation MUST round-trip)", q.Get("state"), clientState)
+	}
+	if q.Get("iss") != testBaseURL {
+		t.Errorf("iss = %q, want %q", q.Get("iss"), testBaseURL)
 	}
 }
 
