@@ -240,6 +240,17 @@ func main() {
 	r.Use(chimw.RequestID)
 	r.Use(zapMiddleware(logger, cfg.AccessLogSkipRE, buildRPCMetrics(cfg, logger)))
 	r.Use(chimw.Recoverer)
+	// Security-headers baseline applied to every response on the
+	// public listener. Set BEFORE the handler runs so the headers
+	// land on every status code (including upstream 5xx pass-through
+	// from the MCP proxy and the rate-limiter's 429s). Headers chosen
+	// per RFC 9700 §4.2.4 (Referrer-Policy: no-referrer is RECOMMENDED
+	// for OAuth ASes), RFC 6797 (HSTS), and production-MCP parity
+	// (GitHub Copilot / Atlassian / Notion / Sentry all carry HSTS;
+	// surveyed in the red-team plan). Not applied to the metrics
+	// listener — Prometheus scrape is in-cluster only and HSTS over
+	// loopback is meaningless.
+	r.Use(securityHeaders)
 
 	// Per-IP rate limits. By default the limiter keys on the stripped
 	// r.RemoteAddr (httprate.KeyByIP) so a client behind an untrusted
@@ -649,6 +660,39 @@ func buildRPCMetrics(cfg *config.Config, logger *zap.Logger) *rpcMetrics {
 			}
 		},
 	}
+}
+
+// securityHeaders applies the public-listener-baseline response headers.
+// Set before the handler runs so they land on every status code,
+// including upstream pass-through 5xx and rate-limiter 429s.
+//
+// Header rationale:
+//   - Strict-Transport-Security: RFC 6797 SHOULD; production MCP
+//     servers (GitHub Copilot, Atlassian, Notion, Sentry) all carry
+//     it. 2-year max-age + includeSubDomains assumes the operator's
+//     parent zone is all-HTTPS — flag in deployment docs.
+//   - X-Content-Type-Options: nosniff — defense-in-depth against
+//     MIME-sniffing of JSON error bodies.
+//   - X-Frame-Options: DENY — supplements CSP frame-ancestors for
+//     pre-CSP-2 browsers.
+//   - Referrer-Policy: no-referrer — RFC 9700 §4.2.4 RECOMMENDED for
+//     OAuth ASes (defends against authorization-code leakage via
+//     Referer header to a downstream resource).
+//   - Content-Security-Policy: default-src 'none'; frame-ancestors 'none'
+//     — JSON / redirect responses do not need any subresource; the
+//     stricter CSP is honest about that. /authorize ends in a 302 to
+//     the IdP whose own CSP applies on the IdP page; the redirect
+//     response itself has no body to which CSP applies.
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+		next.ServeHTTP(w, r)
+	})
 }
 
 func zapMiddleware(logger *zap.Logger, skipRE *regexp.Regexp, rpcObs *rpcMetrics) func(http.Handler) http.Handler {
