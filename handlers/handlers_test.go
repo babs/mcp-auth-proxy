@@ -3046,16 +3046,17 @@ func TestTokenAuthCode_Replay_RevokesRotatedRefresh(t *testing.T) {
 		t.Fatalf("rotation did not return a new refresh_token (got %q vs prior %q)", rotated.RefreshToken, firstTok.RefreshToken)
 	}
 
-	// 3. Attacker replays the original code.
-	replay := postForm(url.Values{
+	// 3. Attacker replays the original code. (Local var deliberately
+	// not named `replay` — would shadow the imported replay package.)
+	replayResp := postForm(url.Values{
 		"grant_type":    {"authorization_code"},
 		"code":          {authCode},
 		"redirect_uri":  {redirectURI},
 		"client_id":     {encClientID},
 		"code_verifier": {codeVerifier},
 	})
-	if replay.Code != http.StatusBadRequest {
-		t.Fatalf("code replay: want 400, got %d: %s", replay.Code, replay.Body.String())
+	if replayResp.Code != http.StatusBadRequest {
+		t.Fatalf("code replay: want 400, got %d: %s", replayResp.Code, replayResp.Body.String())
 	}
 
 	// 4. Rotation of refresh-B (the LIVE descendant) must now be
