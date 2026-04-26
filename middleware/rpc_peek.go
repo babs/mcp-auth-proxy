@@ -25,8 +25,25 @@ type RPCPeekConfig struct {
 // handler chain; RPCPeek writes into it; zapMiddleware reads it back after
 // ServeHTTP returns. A pointer is used so the reference survives all
 // r.WithContext hops across middleware layers.
+// RPCCall captures one entry inside a JSON-RPC batch (or, by way of a
+// degenerate single-element view, a single-call request) with the
+// per-call method and the extracted tool name when the method is
+// "tools/call". Used by the metrics observer to fan a batch out into
+// one Prometheus increment per tool invocation rather than collapsing
+// the whole batch into a single label.
+type RPCCall struct {
+	Method, Tool string
+}
+
 type RequestLogRecord struct {
 	Sub, Email, RPCMethod, RPCTool, RPCID string
+	// RPCBatch is non-nil ONLY for JSON-RPC batch requests. Each entry
+	// is one call inside the batch with its method + extracted tool
+	// name (or empty Tool when the method is not tools/call or
+	// params.name was absent / unparseable). RPCMethod still carries
+	// the comma-joined methods for log convenience; RPCBatch is the
+	// structured form for metrics fan-out.
+	RPCBatch []RPCCall
 }
 
 const contextLogRecord contextKey = "log_record"
@@ -52,6 +69,16 @@ const contextLogRecord contextKey = "log_record"
 func InjectLogRecord(ctx context.Context) (context.Context, *RequestLogRecord) {
 	rec := &RequestLogRecord{}
 	return context.WithValue(ctx, contextLogRecord, rec), rec
+}
+
+// LogRecordFromContext returns the per-request RequestLogRecord
+// pointer if one was injected by InjectLogRecord, or nil if the
+// context never carried one. Exported so handlers and tests can
+// observe / mutate the record by the same key the enricher uses,
+// without having to re-export the contextKey itself.
+func LogRecordFromContext(ctx context.Context) *RequestLogRecord {
+	rec, _ := ctx.Value(contextLogRecord).(*RequestLogRecord)
+	return rec
 }
 
 // RPCPeek returns middleware that buffers small JSON-RPC request bodies,
@@ -105,19 +132,33 @@ func RPCPeek(cfg RPCPeekConfig) func(http.Handler) http.Handler {
 			ctx := r.Context()
 			trim := bytes.TrimLeft(buf, " \t\r\n")
 			if len(trim) > 0 && trim[0] == '[' {
-				// Batch request: collect all method names.
+				// Batch request: collect both the joined method list
+				// (log line shape, unchanged) AND the structured per-
+				// call view (metrics fan-out). Each batch entry's
+				// params.name is captured at the SAME time we see its
+				// method — losing it here would be the bug the metrics
+				// observer just papered over by skipping batches.
 				var batch []peek
 				if json.Unmarshal(buf, &batch) == nil {
 					methods := make([]string, 0, len(batch))
+					calls := make([]RPCCall, 0, len(batch))
 					for _, p := range batch {
-						if p.Method != "" {
-							methods = append(methods, sanitize(p.Method, 128))
+						if p.Method == "" {
+							continue
 						}
+						method := sanitize(p.Method, 128)
+						methods = append(methods, method)
+						call := RPCCall{Method: method}
+						if method == "tools/call" && p.Params.Name != "" {
+							call.Tool = sanitize(p.Params.Name, 128)
+						}
+						calls = append(calls, call)
 					}
 					if len(methods) > 0 {
 						joined := strings.Join(methods, ",")
 						if rec != nil {
 							rec.RPCMethod = joined
+							rec.RPCBatch = calls
 						}
 						ctx = context.WithValue(ctx, ContextRPCMethod, joined)
 					}

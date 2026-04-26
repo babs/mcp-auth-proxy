@@ -144,7 +144,7 @@ All configuration via **environment variables**. Bold = required.
 | `COMPAT_ALLOW_STATELESS` | `false` | Synthesize a server-side `state` on `/authorize` when the client omits it (legacy Cursor / MCP Inspector). Strict mode refuses the request; counter `mcp_auth_access_denied_total{reason="state_missing"}` fires either way |
 | `MCP_LOG_BODY_MAX` | `65536` | Max bytes buffered per request for JSON-RPC method extraction into access logs. `0` disables buffering (no `rpc_method`/`rpc_tool`/`rpc_id` fields). Raise for large batches; lower or zero when tool names must stay out of logs |
 | `ACCESS_LOG_SKIP_RE` | _(empty)_ | **Go [RE2](https://pkg.go.dev/regexp/syntax) regexp** matched against `r.URL.Path` on the **public listener only**. When a request path matches, the access-log line is suppressed; the handler response, Prometheus counters, and panic recovery are unaffected. Invalid pattern fails startup. RE2 is linear-time — no ReDoS. Typical value: `ACCESS_LOG_SKIP_RE=^/healthz$` (liveness-probe noise). **Always anchor with `^…$`** unless you intentionally want substring matching — `healthz` (no anchors) also matches `/mcp/healthz-tool` if an upstream tool carries that substring; `.*` silences the entire access log. `/readyz` and `/metrics` live on `METRICS_ADDR` by default and do not reach this middleware — no need to match them unless you've deliberately moved them onto the public listener |
-| `MCP_TOOL_METRICS` | `false` | When `true`, emits per-tool Prometheus counters: `mcp_auth_rpc_calls_total{tool}`, `mcp_auth_rpc_calls_failed_total{tool}` (status ≥ 400), `mcp_auth_rpc_request_bytes_total{tool}`, `mcp_auth_rpc_response_bytes_total{tool}`. Tool name is sourced from RPCPeek's `params.name` extraction; non-RPC requests don't contribute. Disabled by default — the `tool` label both increases series cardinality and reveals which workflows tenants invoke; flip on when the visibility is worth the trade |
+| `MCP_TOOL_METRICS` | `false` | When `true`, emits per-tool Prometheus counters: `mcp_auth_rpc_calls_total{tool}`, `mcp_auth_rpc_calls_failed_total{tool}` (status ≥ 400), `mcp_auth_rpc_request_bytes_total{tool}`, `mcp_auth_rpc_response_bytes_total{tool}`. Counters fire only on JSON-RPC `tools/call` requests; protocol-level methods (`initialize`, `notifications/*`, `tools/list`, `prompts/*`, …) do not contribute. Tool name comes from `params.name`; calls with unparseable params land in `_unknown`. Disabled by default — the `tool` label increases series cardinality and reveals workflow patterns; flip on when the visibility is worth the trade |
 | `MCP_TOOL_METRICS_MAX_CARDINALITY` | `256` | Cap on distinct `tool` label values. Names past the cap collapse into the `_overflow` bucket, so an adversarial client probing fictional tool names cannot inflate Prometheus memory. Empty / unparsed tool names land in `_unknown`. Set to `0` to disable the cap (only safe when the upstream enforces a tool allowlist). Only meaningful when `MCP_TOOL_METRICS=true` |
 
 ---
@@ -243,10 +243,27 @@ rollout notes, and K8s deployment shape.
     `mcp_auth_rpc_response_bytes_total{tool}` — per-tool RPC traffic
     visibility. **Opt-in via `MCP_TOOL_METRICS=true`** because the
     `tool` label increases cardinality and reveals workflow patterns.
-    Cap distinct labels via `MCP_TOOL_METRICS_MAX_CARDINALITY`
-    (default 256); over-cap names fold into `_overflow`, unknown tool
-    names into `_unknown`. Only requests that exercised RPCPeek
-    contribute — non-MCP traffic doesn't pollute the series
+    Counters fire only on JSON-RPC `tools/call` requests — protocol-
+    level methods (`initialize`, `notifications/*`, `tools/list`,
+    `prompts/*`, …) do not contribute, so an alert on `_unknown`
+    flags malformed `tools/call` payloads, not background chatter.
+    JSON-RPC batches fan out into one `rpc_calls_total` increment per
+    `tools/call` entry, each carrying its own tool label; the byte
+    counters stay scoped to single-call requests because per-call
+    Content-Length / response bytes cannot be honestly attributed
+    inside a batch. Cap distinct labels via
+    `MCP_TOOL_METRICS_MAX_CARDINALITY` (default 256); over-cap names
+    fold into `_overflow`, unparseable tool names into `_unknown`
+  - `mcp_auth_rpc_batches_total`, `mcp_auth_rpc_batches_failed_total`,
+    `mcp_auth_rpc_batch_bytes_total{direction}` — batch-shape
+    counters, disjoint from the per-tool family above so the `tool`
+    label stays clean. One increment per JSON-RPC HTTP request whose
+    body decoded as a top-level array AND contained at least one
+    `tools/call` entry. Use `rate(rpc_batches_total) / sum(rate(rpc_calls_total{tool!~"^_.*"}))`
+    for "fraction of tool calls that came via batch", and
+    `rate(rpc_batch_bytes_total{direction="request"})` /
+    `…{direction="response"}` for batch bandwidth. Same opt-in toggle
+    as the per-tool family
 - **Health** — `GET /healthz` (liveness, public router) and
   `GET /readyz` (on the metrics port; reflects Redis reachability when
   `REDIS_URL` is set, cached ~1s to resist probe-flood amplification).

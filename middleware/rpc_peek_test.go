@@ -95,6 +95,67 @@ func TestRPCPeek_Batch(t *testing.T) {
 	if rec.RPCMethod != "a,b" {
 		t.Errorf("rec.RPCMethod = %q, want %q", rec.RPCMethod, "a,b")
 	}
+	if len(rec.RPCBatch) != 2 {
+		t.Fatalf("rec.RPCBatch len = %d, want 2", len(rec.RPCBatch))
+	}
+	if rec.RPCBatch[0].Method != "a" || rec.RPCBatch[0].Tool != "" {
+		t.Errorf("RPCBatch[0] = %+v, want {Method:a, Tool:}", rec.RPCBatch[0])
+	}
+	if rec.RPCBatch[1].Method != "b" || rec.RPCBatch[1].Tool != "" {
+		t.Errorf("RPCBatch[1] = %+v, want {Method:b, Tool:}", rec.RPCBatch[1])
+	}
+}
+
+// TestRPCPeek_Batch_ToolsCall_ExtractsTool verifies that a batch
+// entry with method=="tools/call" preserves its params.name as the
+// per-call Tool field — the metrics observer relies on this to fan
+// out per-tool counts inside a batch. Non-tools/call entries leave
+// Tool empty (params.name only matters for tool-call shape).
+func TestRPCPeek_Batch_ToolsCall_ExtractsTool(t *testing.T) {
+	body := `[
+		{"method":"tools/call","params":{"name":"weather"}},
+		{"method":"initialize"},
+		{"method":"tools/call","params":{"name":"search"}},
+		{"method":"prompts/get","params":{"name":"shouldnt-be-extracted"}}
+	]`
+	r := makeJSONRequest(body)
+	r, rec := withLogRec(r)
+
+	mw := RPCPeek(defaultCfg())(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	mw.ServeHTTP(httptest.NewRecorder(), r)
+
+	if rec.RPCMethod != "tools/call,initialize,tools/call,prompts/get" {
+		t.Errorf("rec.RPCMethod = %q", rec.RPCMethod)
+	}
+	want := []RPCCall{
+		{Method: "tools/call", Tool: "weather"},
+		{Method: "initialize", Tool: ""},
+		{Method: "tools/call", Tool: "search"},
+		{Method: "prompts/get", Tool: ""}, // params.name MUST NOT leak here
+	}
+	if len(rec.RPCBatch) != len(want) {
+		t.Fatalf("RPCBatch len = %d, want %d (%v)", len(rec.RPCBatch), len(want), rec.RPCBatch)
+	}
+	for i, w := range want {
+		if rec.RPCBatch[i] != w {
+			t.Errorf("RPCBatch[%d] = %+v, want %+v", i, rec.RPCBatch[i], w)
+		}
+	}
+}
+
+// TestLogRecordFromContext covers the exported accessor: returns the
+// injected pointer for a context that carries one, nil otherwise.
+func TestLogRecordFromContext(t *testing.T) {
+	ctx := context.Background()
+	if got := LogRecordFromContext(ctx); got != nil {
+		t.Errorf("uninjected ctx: got %+v, want nil", got)
+	}
+	ctx, want := InjectLogRecord(ctx)
+	if got := LogRecordFromContext(ctx); got != want {
+		t.Errorf("injected ctx: got %p, want %p", got, want)
+	}
 }
 
 // Test 3: non-JSON content type is a passthrough — no rpc fields set.

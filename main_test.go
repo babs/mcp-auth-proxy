@@ -9,6 +9,8 @@ import (
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
+
+	"github.com/babs/mcp-auth-proxy/middleware"
 )
 
 // TestCIDRAwareKey covers P1c: only peers inside a trusted CIDR get
@@ -87,7 +89,7 @@ func TestZapMiddleware_SkipRE(t *testing.T) {
 				w.WriteHeader(http.StatusOK)
 			})
 			core, logs := observer.New(zap.InfoLevel)
-			h := zapMiddleware(zap.New(core), tc.re, nil)(next)
+			h := zapMiddleware(zap.New(core), tc.re, nil)(next) // nil rpcMetrics — RPC observer not under test here
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.path, nil))
 			if !called {
@@ -98,6 +100,103 @@ func TestZapMiddleware_SkipRE(t *testing.T) {
 			}
 			if got := logs.FilterMessage("request").Len(); got != tc.wantLogs {
 				t.Errorf("access-log count = %d, want %d", got, tc.wantLogs)
+			}
+		})
+	}
+}
+
+// TestZapMiddleware_RPCMetrics_GateAndFanOut pins both axes of the
+// rpc-metrics observer:
+//
+//   - per-tool counter: invoked once per tools/call entry (single
+//     request OR per-entry inside a batch). Tool name passes through
+//     verbatim (downstream cardinality guard maps "" / overflow).
+//   - batch counter: invoked exactly once per HTTP request that
+//     decoded as a batch with at least one tools/call entry, AFTER
+//     all per-tool fan-outs land. Carries the request's actual bytes.
+//
+// Skipped cases (no per-tool, no batch invocation): protocol-level
+// methods (initialize / notifications/* / tools/list / prompts/*),
+// empty requests, batches with zero tools/call entries.
+func TestZapMiddleware_RPCMetrics_GateAndFanOut(t *testing.T) {
+	cases := []struct {
+		name        string
+		method      string
+		tool        string
+		batch       []middleware.RPCCall
+		wantTools   []string // perTool invocations in order
+		wantBatches int      // batch invocations
+	}{
+		{name: "tools_call_invokes", method: "tools/call", tool: "weather", wantTools: []string{"weather"}},
+		{name: "tools_call_unknown_tool", method: "tools/call", tool: "", wantTools: []string{""}},
+		{name: "initialize_skipped", method: "initialize"},
+		{name: "notifications_skipped", method: "notifications/initialized"},
+		{name: "tools_list_skipped", method: "tools/list"},
+		{name: "empty_skipped"},
+		{
+			name:   "batch_two_tools_calls_fans_out_and_counts_batch",
+			method: "tools/call,tools/call",
+			batch: []middleware.RPCCall{
+				{Method: "tools/call", Tool: "weather"},
+				{Method: "tools/call", Tool: "search"},
+			},
+			wantTools:   []string{"weather", "search"},
+			wantBatches: 1,
+		},
+		{
+			name:   "batch_mixed_only_tools_call_counts_and_batch_fires_once",
+			method: "tools/call,initialize,tools/call",
+			batch: []middleware.RPCCall{
+				{Method: "tools/call", Tool: "weather"},
+				{Method: "initialize"},
+				{Method: "tools/call", Tool: "search"},
+			},
+			wantTools:   []string{"weather", "search"},
+			wantBatches: 1,
+		},
+		{
+			name:   "batch_no_tools_calls_skipped_entirely",
+			method: "initialize,tools/list",
+			batch: []middleware.RPCCall{
+				{Method: "initialize"},
+				{Method: "tools/list"},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotTools []string
+			var gotBatches int
+			obs := &rpcMetrics{
+				perTool: func(tool string, _ int, _ int64, _ int) {
+					gotTools = append(gotTools, tool)
+				},
+				batch: func(_ int, _ int64, _ int) {
+					gotBatches++
+				},
+			}
+			next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if rec := middleware.LogRecordFromContext(r.Context()); rec != nil {
+					rec.RPCMethod = tc.method
+					rec.RPCTool = tc.tool
+					rec.RPCBatch = tc.batch
+				}
+				w.WriteHeader(http.StatusOK)
+			})
+			h := zapMiddleware(zap.NewNop(), nil, obs)(next)
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/mcp", nil))
+
+			if len(gotTools) != len(tc.wantTools) {
+				t.Fatalf("perTool count = %d (%v), want %d (%v)", len(gotTools), gotTools, len(tc.wantTools), tc.wantTools)
+			}
+			for i, w := range tc.wantTools {
+				if gotTools[i] != w {
+					t.Errorf("perTool call %d: got tool=%q, want %q", i, gotTools[i], w)
+				}
+			}
+			if gotBatches != tc.wantBatches {
+				t.Errorf("batch invocations = %d, want %d", gotBatches, tc.wantBatches)
 			}
 		})
 	}
