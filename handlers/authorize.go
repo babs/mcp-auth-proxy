@@ -28,6 +28,16 @@ type AuthorizeConfig struct {
 
 // Authorize handles GET /authorize (OAuth 2.1 PKCE authorization request).
 // Session state is encrypted into the IdP state parameter for stateless operation.
+//
+// Error-delivery follows RFC 6749 §4.1.2.1: errors that occur BEFORE
+// client_id + redirect_uri are validated render on the AS as JSON
+// (the redirect target is not yet trusted, so we cannot bounce to it).
+// Once both are validated, every subsequent failure redirects 302 to
+// the registered redirect_uri with `error=…&state=…&iss=…` so the
+// client never sees a JSON body it can't correlate. The function flow
+// reflects this split: client/redirect validation is deliberately
+// front-loaded above the response_type / resource / PKCE / state
+// checks.
 func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg *oauth2.Config, authzCfg AuthorizeConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
@@ -49,11 +59,11 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 		codeChallengeMethod := q.Get("code_challenge_method")
 		state := q.Get("state")
 
-		if responseType != "code" {
-			writeOAuthError(w, http.StatusBadRequest, "unsupported_response_type", "response_type must be 'code'")
-			return
-		}
-
+		// === Phase 1: validate client_id + redirect_uri (JSON on failure). ===
+		// Per RFC 6749 §4.1.2.1, an unauthenticated redirect target must
+		// not receive an `error=` redirect — we'd be forwarding to whatever
+		// host an attacker chose. JSON 400 keeps these errors visible to
+		// the resource owner instead.
 		if clientIDStr == "" {
 			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "client_id is required")
 			return
@@ -102,21 +112,27 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 			return
 		}
 
+		// === Phase 2: redirect-uri is trusted. RFC 6749 §4.1.2.1 ===
+		// requires §4.1.2.1 redirect-style errors from here on. The
+		// `state` we forward is whatever the client sent (possibly "");
+		// we MUST NOT synthesize one for the error path because doing so
+		// would lie to the client about CSRF binding.
+
+		if responseType != "code" {
+			redirectAuthzError(w, r, redirectURI, state, "unsupported_response_type", "response_type must be 'code'", baseURL)
+			return
+		}
+
 		// RFC 8707 §2/§4: if `resource` is present it must identify a
-		// resource this AS serves. We are both AS and RS, so the only
-		// valid value is our own baseURL (trailing-slash + default-port
-		// insensitive via matchResource). Multiple `resource` values
-		// are permitted per RFC 8707 §2; every one must match. Absent
-		// `resource` is accepted — not every MCP client sends it.
-		//
-		// Checked AFTER client_id + redirect_uri so that RFC 6749
-		// §4.1.2.1 "redirect errors where the client is known" holds:
-		// probing `?resource=…` cannot reveal anything a client doesn't
-		// already learn from /.well-known/oauth-authorization-server.
+		// resource this AS serves. We are both AS and RS, so valid
+		// values are our baseURL (trailing-slash + default-port
+		// insensitive via matchResource) and the per-mount resource
+		// URI. Multiple `resource` values are permitted per §2; every
+		// one must match.
 		if resources, ok := q["resource"]; ok {
 			for _, res := range resources {
 				if !matchAnyResource(res, append([]string{baseURL}, authzCfg.ResourceURIs...)) {
-					writeOAuthError(w, http.StatusBadRequest, "invalid_target", "resource does not identify this authorization server")
+					redirectAuthzError(w, r, redirectURI, state, "invalid_target", "resource does not identify this authorization server", baseURL)
 					return
 				}
 			}
@@ -124,15 +140,15 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 
 		if codeChallenge != "" {
 			if codeChallengeMethod != "S256" {
-				writeOAuthError(w, http.StatusBadRequest, "invalid_request", "code_challenge_method must be S256")
+				redirectAuthzError(w, r, redirectURI, state, "invalid_request", "code_challenge_method must be S256", baseURL)
 				return
 			}
 			if !validPKCEValue(codeChallenge) {
-				writeOAuthError(w, http.StatusBadRequest, "invalid_request", "code_challenge must be 43-128 unreserved characters")
+				redirectAuthzError(w, r, redirectURI, state, "invalid_request", "code_challenge must be 43-128 unreserved characters", baseURL)
 				return
 			}
 		} else if authzCfg.PKCERequired {
-			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "code_challenge is required")
+			redirectAuthzError(w, r, redirectURI, state, "invalid_request", "code_challenge is required", baseURL)
 			return
 		}
 
@@ -147,12 +163,15 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 				logger.Warn("access_denied_state_missing",
 					zap.String("client_id", client.ID),
 				)
-				writeOAuthError(w, http.StatusBadRequest, "invalid_request", "state is required")
+				// state was already empty; redirect carries error+iss
+				// without state so the strict-mode rejection is still
+				// visible to the registered redirect_uri.
+				redirectAuthzError(w, r, redirectURI, "", "invalid_request", "state is required", baseURL)
 				return
 			}
 			b := make([]byte, 16)
 			if _, err := rand.Read(b); err != nil {
-				writeOAuthError(w, http.StatusInternalServerError, "server_error", "internal error")
+				redirectAuthzError(w, r, redirectURI, "", "server_error", "internal error", baseURL)
 				return
 			}
 			state = hex.EncodeToString(b)
@@ -163,7 +182,7 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 		// code-injection with a leaked upstream code.
 		nonceBytes := make([]byte, 16)
 		if _, err := rand.Read(nonceBytes); err != nil {
-			writeOAuthError(w, http.StatusInternalServerError, "server_error", "internal error")
+			redirectAuthzError(w, r, redirectURI, state, "server_error", "internal error", baseURL)
 			return
 		}
 		nonce := hex.EncodeToString(nonceBytes)
@@ -206,7 +225,7 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 		internalState, err := tm.SealJSON(session, token.PurposeSession)
 		if err != nil {
 			logger.Error("session_seal_failed", zap.Error(err))
-			writeOAuthError(w, http.StatusInternalServerError, "server_error", "internal error")
+			redirectAuthzError(w, r, redirectURI, state, "server_error", "internal error", baseURL)
 			return
 		}
 
