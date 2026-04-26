@@ -92,6 +92,14 @@ func CallbackWithVerifyFunc(tm *token.Manager, logger *zap.Logger, audience stri
 func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oauth2Cfg *oauth2.Config, verify verifyIDTokenFunc, cbCfg CallbackConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
+		if rejectRepeatedParams(w, q,
+			"code",
+			"state",
+			"error",
+			"error_description",
+		) {
+			return
+		}
 
 		// RFC 6749 §4.1.2.1: the IdP may redirect with error instead of
 		// code. When the session is still decodable, we forward the
@@ -307,7 +315,12 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 		// only when /authorize minted the pair (PKCE_REQUIRED=false AND
 		// client omitted code_challenge).
 		sc := sealedCode{
-			TokenID:       uuid.New().String(),
+			TokenID: uuid.New().String(),
+			// FamilyID is the refresh-rotation lineage seed. Minted
+			// here so a detected code replay can revoke the entire
+			// family of refresh tokens that derived from the first
+			// (legitimate) redemption — RFC 6749 §4.1.2 MUST.
+			FamilyID:      uuid.New().String(),
 			ClientID:      session.ClientID,
 			RedirectURI:   session.RedirectURI,
 			CodeChallenge: session.CodeChallenge,
@@ -340,6 +353,12 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 		if session.OriginalState != "" {
 			q2.Set("state", session.OriginalState)
 		}
+		// RFC 9700 §2.1.4 (mix-up defense): include the AS issuer
+		// identifier on the authorization response so a client that
+		// talks to multiple ASes can verify the response came from the
+		// AS it actually sent the request to. Value matches the
+		// `issuer` field published in RFC 8414 AS metadata.
+		q2.Set("iss", audience)
 		redirectParsed.RawQuery = q2.Encode()
 		// Fragment scrub: DCR already rejects fragment-bearing URIs at
 		// registration time, but clear here too so a future regression

@@ -106,7 +106,8 @@ func TestValidate_WWWAuthenticateHeader(t *testing.T) {
 		t.Fatal("expected WWW-Authenticate header on 401 response")
 	}
 
-	expected := `Bearer error="invalid_request", resource_metadata="` + testBaseURL + `/.well-known/oauth-protected-resource"`
+	// RFC 6750 §3: challenge carries error + error_description + resource_metadata.
+	expected := `Bearer error="invalid_request", error_description="bearer credential is missing or malformed", resource_metadata="` + testBaseURL + `/.well-known/oauth-protected-resource"`
 	if wwwAuth != expected {
 		t.Errorf("WWW-Authenticate header mismatch\ngot:  %q\nwant: %q", wwwAuth, expected)
 	}

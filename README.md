@@ -88,7 +88,7 @@ docker run --rm -p 8080:8080 -p 9090:9090 \
   -e OIDC_CLIENT_ID=mcp-proxy \
   -e OIDC_CLIENT_SECRET=**** \
   -e PROXY_BASE_URL=https://mcp.example.com \
-  -e UPSTREAM_MCP_URL=http://mcp-server:8080 \
+  -e UPSTREAM_MCP_URL=http://mcp-server:8080/mcp \
   -e TOKEN_SIGNING_SECRET=$(openssl rand -hex 32) \
   ghcr.io/babs/mcp-auth-proxy:latest
 ```
@@ -117,7 +117,7 @@ All configuration via **environment variables**. Bold = required.
 | **`OIDC_CLIENT_ID`** | — | Client registered on the IdP |
 | **`OIDC_CLIENT_SECRET`** | — | IdP client secret |
 | **`PROXY_BASE_URL`** | — | Public URL of this proxy (audience-bound into every sealed token) |
-| **`UPSTREAM_MCP_URL`** | — | Origin of the upstream MCP server (scheme+host+port, no path), e.g. `http://mcp:8000`. Proxy forwards the client request path (`/mcp`) verbatim; if the upstream serves MCP elsewhere (e.g. `/api/v1/mcp`), add a rewrite layer in front of it and point this URL at the rewrite layer. Path, query, fragment, userinfo rejected at startup. |
+| **`UPSTREAM_MCP_URL`** | — | Upstream MCP URL. Must include an explicit path — origin-only (`http://backend`) and lone-`/` (`http://backend/`) are rejected at startup. The path is used verbatim on both sides: it's the proxy's public mount *and* the path forwarded to the upstream. `http://mcp:8000/api/v1/mcp` → proxy exposes `/api/v1/mcp`, upstream sees `/api/v1/mcp`, client points at `{PROXY_BASE_URL}/api/v1/mcp`. Query, fragment, userinfo, and paths that collide with a control-plane route (`/healthz`, `/register`, `/authorize`, `/callback`, `/token`, `/.well-known`) are rejected too. |
 | **`TOKEN_SIGNING_SECRET`** | — | ≥ 32 bytes, AES-GCM key; must be byte-identical across replicas |
 | `LISTEN_ADDR` | `:8080` | Public bind address |
 | `METRICS_ADDR` | `127.0.0.1:9090` | Prometheus bind address (separate listener). Loopback-only by default so `/metrics` and `/readyz` are never exposed on the public interface; override to `:9090` or an explicit interface when a scraper must reach the pod |
@@ -125,6 +125,7 @@ All configuration via **environment variables**. Bold = required.
 | `GROUPS_CLAIM` | `groups` | Flat claim holding user groups |
 | `ALLOWED_GROUPS` | (empty) | CSV allowlist; empty = allow all authenticated users |
 | `REVOKE_BEFORE` | (empty) | RFC3339 cutoff for bulk revocation (applies to access *and* refresh tokens) |
+| `MCP_RESOURCE_NAME` | (empty) | Human-readable name advertised under `resource_name` in the RFC 9728 PRM (e.g. `"ACME MCP"`). Used by MCP clients for display/consent UI. Optional; field is omitted when unset |
 | `PKCE_REQUIRED` | `true` | Set `false` for clients that omit PKCE (Cursor, MCP Inspector, ChatGPT) |
 | `SHUTDOWN_TIMEOUT` | `120s` | Graceful shutdown; must be ≥ longest expected SSE stream |
 | `REDIS_URL` | (empty) | Enables single-use authz codes + refresh-rotation reuse detection. `rediss://` for TLS |
@@ -134,11 +135,12 @@ All configuration via **environment variables**. Bold = required.
 | `TOKEN_SIGNING_SECRETS_PREVIOUS` | _(empty)_ | Whitespace-separated retired signing secrets accepted on Open during a rolling rotation. New seals always use `TOKEN_SIGNING_SECRET` (primary); Open tries primary first, then each previous. See [`docs/runbooks/key-rotation.md`](./docs/runbooks/key-rotation.md) |
 | `TRUSTED_PROXY_CIDRS` | _(empty)_ | Comma-separated CIDRs of peers whose `X-Forwarded-For` / `X-Real-IP` / `True-Client-IP` headers are honored for rate-limit keying. Other peers fall back to RemoteAddr. Preferred over the legacy `TRUST_PROXY_HEADERS` bool |
 | `TRUST_PROXY_HEADERS` | `false` | **Legacy.** Blanket trust of every peer's forwarded headers. Superseded by `TRUSTED_PROXY_CIDRS` when both are set; kept for backward compatibility |
-| `PROD_MODE` | `false` | When `true`, fails startup if any unsafe compatibility flag is set (`PKCE_REQUIRED=false`, `COMPAT_ALLOW_STATELESS=true`, `REDIS_REQUIRED=false`, or `REDIS_URL` empty). Turns a dev-config paste-error into a visible crash |
+| `PROD_MODE` | `true` | Fails startup if any compatibility flag that weakens a security control is set (`PKCE_REQUIRED=false`, `COMPAT_ALLOW_STATELESS=true`, `REDIS_REQUIRED=false`, `REDIS_URL` empty, or legacy `TRUST_PROXY_HEADERS=true` without `TRUSTED_PROXY_CIDRS`). Default **on** so the runtime posture matches the OAuth 2.1 / MCP guarantees the published metadata advertises. Set `PROD_MODE=false` explicitly for dev / single-replica work that needs one of the relaxation toggles |
 | `UPSTREAM_AUTHORIZATION_HEADER` | _(empty)_ | When set, sent verbatim as the `Authorization` header on every request to the upstream MCP backend. Full header value incl. scheme, e.g. `Bearer xyz`. Treat as a secret |
 | `MCP_PER_SUBJECT_CONCURRENCY` | `16` | Per-subject in-flight cap on the authenticated MCP route. Excess requests get 503 `temporarily_unavailable` + `Retry-After: 1`. Idle subjects (no in-flight work for ≥5 min) are reclaimed by a background pruner so map memory stays proportional to active principals. `0` disables |
 | `COMPAT_ALLOW_STATELESS` | `false` | Synthesize a server-side `state` on `/authorize` when the client omits it (legacy Cursor / MCP Inspector). Strict mode refuses the request; counter `mcp_auth_access_denied_total{reason="state_missing"}` fires either way |
 | `MCP_LOG_BODY_MAX` | `65536` | Max bytes buffered per request for JSON-RPC method extraction into access logs. `0` disables buffering (no `rpc_method`/`rpc_tool`/`rpc_id` fields). Raise for large batches; lower or zero when tool names must stay out of logs |
+| `ACCESS_LOG_SKIP_RE` | _(empty)_ | **Go [RE2](https://pkg.go.dev/regexp/syntax) regexp** matched against `r.URL.Path` on the **public listener only**. When a request path matches, the access-log line is suppressed; the handler response, Prometheus counters, and panic recovery are unaffected. Invalid pattern fails startup. RE2 is linear-time — no ReDoS. Typical value: `ACCESS_LOG_SKIP_RE=^/healthz$` (liveness-probe noise). **Always anchor with `^…$`** unless you intentionally want substring matching — `healthz` (no anchors) also matches `/mcp/healthz-tool` if an upstream tool carries that substring; `.*` silences the entire access log. `/readyz` and `/metrics` live on `METRICS_ADDR` by default and do not reach this middleware — no need to match them unless you've deliberately moved them onto the public listener |
 
 ---
 
@@ -177,16 +179,16 @@ rollout notes, and K8s deployment shape.
 | Path | Purpose |
 |---|---|
 | `GET /.well-known/oauth-protected-resource` | RFC 9728 resource metadata (`resource` is `/`-terminated for RFC 8707 / Claude.ai compat) |
-| `GET /.well-known/oauth-protected-resource/mcp` | RFC 9728 §3.1 per-resource variant (`resource` = `{PROXY_BASE_URL}/mcp`) |
+| `GET /.well-known/oauth-protected-resource<mount>` | RFC 9728 §3.1 per-resource variant (`resource` = `{PROXY_BASE_URL}<mount>`, where `<mount>` is the path from `UPSTREAM_MCP_URL`) |
 | `GET /.well-known/oauth-authorization-server` | RFC 8414 AS metadata |
-| `GET /.well-known/oauth-authorization-server/mcp` | Same document as above — non-spec compat for MCP clients that probe the per-resource suffix |
+| `GET /.well-known/oauth-authorization-server<mount>` | Same document as above — non-spec compat for MCP clients that probe the per-resource suffix |
 | `POST /register` | RFC 7591 dynamic client registration |
 | `GET  /authorize` | PKCE authorization endpoint |
 | `GET  /callback` | OIDC callback from the IdP |
 | `POST /token` | `authorization_code` + `refresh_token` grants |
 | `GET  /healthz` | Liveness probe (always 200 while the process is up) |
 | `GET  /readyz` | Readiness probe (503 when Redis is configured but unreachable) |
-| `/mcp` and sub-paths | Reverse-proxied to `UPSTREAM_MCP_URL` after Bearer check. The client request path is forwarded verbatim (no strip, no rewrite). Any path outside `/mcp` returns 404. |
+| MCP mount (path from `UPSTREAM_MCP_URL`) and sub-paths | Reverse-proxied to `UPSTREAM_MCP_URL` after Bearer check, path forwarded verbatim. Any request outside the mount returns 404. |
 | `GET /metrics` (port 9090) | Prometheus metrics |
 
 ---

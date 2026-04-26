@@ -70,8 +70,16 @@ type sealedSession struct {
 // enforcement when a replay store is wired (RFC 6749 §4.1.2: codes MUST NOT
 // be reusable). Without a store, the code is still unique but replayable
 // within its TTL.
+//
+// FamilyID seeds the refresh-rotation lineage minted from this code.
+// On RFC 6749 §4.1.2 "revoke previously issued tokens on code reuse",
+// detecting a replay of this code is sufficient to revoke the whole
+// family of refresh tokens that derived from the first redemption —
+// the family marker in the replay store blocks the thief's already-
+// issued refresh chain from rotating further.
 type sealedCode struct {
 	TokenID       string   `json:"tid"`
+	FamilyID      string   `json:"fam"`
 	ClientID      string   `json:"cid"`
 	RedirectURI   string   `json:"ru"`
 	CodeChallenge string   `json:"cc"`
@@ -133,6 +141,25 @@ func writeOAuthError(w http.ResponseWriter, status int, code, desc string, error
 	writeJSON(w, status, oauthErr)
 }
 
+func rejectRepeatedParams(w http.ResponseWriter, values url.Values, names ...string) bool {
+	for _, name := range names {
+		if len(values[name]) > 1 {
+			writeOAuthError(w, http.StatusBadRequest, "invalid_request", name+" must not be repeated")
+			return true
+		}
+	}
+	return false
+}
+
+func matchAnyResource(resource string, accepted []string) bool {
+	for _, candidate := range accepted {
+		if matchResource(resource, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
 // hasOverlap returns true if any element in userGroups matches an element in allowed.
 func hasOverlap(userGroups, allowed []string) bool {
 	for _, ug := range userGroups {
@@ -184,12 +211,31 @@ func openAndValidateClient(w http.ResponseWriter, tm *token.Manager, clientIDStr
 // /.well-known/oauth-protected-resource (Claude.ai compatibility).
 // Empty resource returns false so callers can distinguish "absent"
 // from "present but mismatched".
+//
+// RFC 8707 §2 also requires the resource value to be an absolute URI
+// and forbids a fragment component (MUST NOT) / discourages a query
+// (SHOULD NOT). Reject those up front rather than silently ignoring
+// them — otherwise `https://proxy#x` would match on host/scheme alone.
 func matchResource(resource, baseURL string) bool {
 	if resource == "" {
 		return false
 	}
 	ru, err := url.Parse(resource)
 	if err != nil {
+		return false
+	}
+	// RFC 8707 §2: resource MUST be an absolute URI (scheme+authority)
+	// — not a path-relative reference or an opaque form.
+	if !ru.IsAbs() || ru.Host == "" || ru.Opaque != "" {
+		return false
+	}
+	// RFC 8707 §2: MUST NOT include a fragment; SHOULD NOT include a
+	// query. Both would otherwise slip through the scheme/host/path
+	// comparison below.
+	if ru.Fragment != "" || ru.RawFragment != "" {
+		return false
+	}
+	if ru.RawQuery != "" || ru.ForceQuery {
 		return false
 	}
 	bu, err := url.Parse(baseURL)
@@ -228,6 +274,57 @@ func normalizePort(u *url.URL) string {
 		return "80"
 	}
 	return ""
+}
+
+// redirectURIMatches reports whether a client-supplied redirect_uri
+// matches a value registered via DCR. Default is strict string
+// equality (OAuth 2.1 §2.3.1, RFC 6749 §3.1.2). Exception for
+// loopback redirects per RFC 8252 §7.3: the AS MUST allow any port
+// so native apps that bind an ephemeral port at launch do not need
+// to re-register on every run. Scheme, host literal, and path still
+// have to match exactly — only the port may differ, and only when
+// both URIs are loopback.
+func redirectURIMatches(requested, registered string) bool {
+	if requested == registered {
+		return true
+	}
+	ru, err := url.Parse(requested)
+	if err != nil {
+		return false
+	}
+	re, err := url.Parse(registered)
+	if err != nil {
+		return false
+	}
+	// Port-agnostic relaxation applies ONLY when both URIs are
+	// loopback. A registered loopback URI cannot silently match a
+	// non-loopback requested URI (or vice versa).
+	if !isLoopback(ru) || !isLoopback(re) {
+		return false
+	}
+	if !strings.EqualFold(ru.Scheme, re.Scheme) {
+		return false
+	}
+	// Compare host literals after trailing-dot / case normalization.
+	// "127.0.0.1" ≠ "localhost" by design — RFC 8252 §7.3 asks
+	// clients to use the same loopback literal they registered.
+	if !strings.EqualFold(strings.TrimSuffix(ru.Hostname(), "."), strings.TrimSuffix(re.Hostname(), ".")) {
+		return false
+	}
+	if ru.User != nil || re.User != nil {
+		return false
+	}
+	if ru.EscapedPath() != re.EscapedPath() {
+		return false
+	}
+	if ru.RawQuery != re.RawQuery || ru.ForceQuery != re.ForceQuery {
+		return false
+	}
+	if ru.Fragment != "" || re.Fragment != "" || ru.RawFragment != "" || re.RawFragment != "" {
+		return false
+	}
+	// Port is free to differ; that's the whole point.
+	return true
 }
 
 // isLoopback returns true if the URL targets a loopback address, which

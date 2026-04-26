@@ -204,7 +204,7 @@ func buildTestProxy(t *testing.T, oidcProvider *mockOIDCProvider, mcpServer *moc
 	authMW := middleware.NewAuth(tm, zap.NewNop(), proxyBaseURL, time.Time{})
 
 	r := chi.NewRouter()
-	registerDiscoveryRoutes(r, proxyBaseURL)
+	registerDiscoveryRoutes(r, proxyBaseURL, "/mcp", "")
 	r.Post("/register", handlers.Register(tm, zap.NewNop(), proxyBaseURL))
 	r.Get("/authorize", handlers.Authorize(tm, zap.NewNop(), proxyBaseURL, oauth2Cfg, handlers.AuthorizeConfig{
 		PKCERequired: true,
@@ -407,6 +407,13 @@ func TestE2E_FullOAuthMCPFlow(t *testing.T) {
 		returnedState := u.Query().Get("state")
 		if returnedState != "client-state-abc" {
 			t.Errorf("original state not preserved: got %q", returnedState)
+		}
+		// RFC 9700 §2.1.4 mix-up defense: the authorization response
+		// MUST carry the `iss` parameter so a client talking to
+		// multiple ASes can verify the response came from the AS it
+		// sent the request to. Value matches `issuer` in AS metadata.
+		if iss := u.Query().Get("iss"); iss != "http://proxy.test" {
+			t.Errorf("iss param: want %q, got %q", "http://proxy.test", iss)
 		}
 	})
 

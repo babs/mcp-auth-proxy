@@ -89,13 +89,20 @@ Trade-offs:
 Set `REDIS_URL` (e.g. `redis://redis:6379/0`, or `rediss://` for TLS) to enable two layered protections backed by Redis `SET NX` / `EXISTS`. All Redis keys are namespaced with `REDIS_KEY_PREFIX` (default `mcp-auth-proxy:`) so multiple proxy deployments can safely share a single Redis DB without key collisions:
 
 - **Single-use authorization codes.** Each code carries a unique `tid` (UUID); `/token` claims the key atomically, so a second exchange attempt is rejected with `invalid_grant` + `error_code: code_replay`. Claim TTL matches the remaining code lifetime.
-- **Refresh rotation with reuse detection** (RFC 6749 §10.4 / OAuth 2.1 §6.1). Each refresh carries a unique `tid` and a `fam` (family ID shared by all rotations in the lineage). On rotation the old `tid` is claimed; replaying an already-rotated token is detected as reuse, revokes the whole family (`refresh_family_revoked:<fam>` marker, 7-day TTL), and any subsequent use of any sibling refresh is rejected with `error_code: refresh_family_revoked`. This kills the attacker and the legitimate holder simultaneously — both are forced back through `/authorize`, but the compromised lineage stops minting tokens.
+- **Refresh rotation with reuse detection** (RFC 6749 §10.4 / OAuth 2.1 §6.1). Each refresh carries a unique `tid` and a `fam` (family ID). The `fam` is seeded at `/callback` (on the sealed code) and inherited by every refresh that descends from it, so a replayed authorization code (per RFC 6749 §4.1.2) and a replayed refresh both target the same family marker — the legitimate holder and the attacker are revoked together. On rotation the old `tid` is claimed; replaying an already-rotated token is detected as reuse, revokes the whole family (`refresh_family_revoked:<fam>` marker, 7-day TTL), and any subsequent use of any sibling refresh is rejected with `error_code: refresh_family_revoked`. The compromised lineage stops minting tokens; both parties are forced back through `/authorize`.
 
 On Redis failure the handler fails closed (503 `server_error` / `error_code: replay_store_unavailable`) rather than issuing tokens against an unknown replay state. When `REDIS_URL` is unset the proxy stays fully stateless: codes remain replayable within the 60s TTL (mitigated by PKCE), and refresh tokens rotate without reuse detection.
 
 ---
 
 ## Configuration
+
+### Migration notes (breaking changes since the previous spec)
+
+Two defaults were flipped to enforce the strict OAuth 2.1 / MCP posture by default. An operator pulling a new image without re-reading the config table will hit a hard `Fatal` at startup if either applies.
+
+- **`UPSTREAM_MCP_URL` now requires an explicit path.** Origin-only URLs (`http://backend`, `http://backend/`) used to be the only legal shape; they are now rejected. The path is the proxy's public mount AND the path forwarded upstream — pick what your upstream actually serves (FastMCP default: `/mcp`). The path is also restricted to RFC 3986 unreserved characters plus `/`, so `:`, `*`, `{`, `}`, `@`, `+` etc. are rejected — they would otherwise silently register chi router patterns instead of literal segments.
+- **`PROD_MODE` now defaults to `true`.** Was `false`. Strict mode rejects every relaxation flag (`PKCE_REQUIRED=false`, `COMPAT_ALLOW_STATELESS=true`, `REDIS_REQUIRED=false`, `REDIS_URL` empty, legacy `TRUST_PROXY_HEADERS=true` without `TRUSTED_PROXY_CIDRS`). Existing dev / single-replica deployments that depended on those flags must set `PROD_MODE=false` explicitly.
 
 All configuration is via environment variables.
 
@@ -105,7 +112,7 @@ All configuration is via environment variables.
 | `OIDC_CLIENT_ID` | OIDC client ID registered with the IdP | `xxxxxxxx-...` |
 | `OIDC_CLIENT_SECRET` | OIDC client secret | `...` |
 | `PROXY_BASE_URL` | Public URL of this proxy | `https://mcp-proxy.example.com` |
-| `UPSTREAM_MCP_URL` | Origin of the upstream MCP server (scheme+host+port, no path). Proxy forwards the client `/mcp` path verbatim. If upstream mounts MCP elsewhere (`/api/v1/mcp`, `/sse`, …), put a rewrite layer in front and point this URL at the rewrite layer. Path, query, fragment, userinfo rejected at startup. | `http://mcp-server:8080` |
+| `UPSTREAM_MCP_URL` | Upstream MCP URL. Path is mandatory and is used verbatim as both the proxy's public mount AND the path forwarded upstream. Query, fragment, userinfo, origin-only URLs (no path / lone `/`), and paths that collide with a reserved control-plane route (`/healthz`, `/register`, `/authorize`, `/callback`, `/token`, `/.well-known`) are rejected at startup. | `http://mcp-server:8080/mcp` |
 | `LISTEN_ADDR` | Bind address | `:8080` |
 | `METRICS_ADDR` | Prometheus metrics bind address. Default `127.0.0.1:9090` — loopback only so `/metrics` and `/readyz` are never exposed on the public interface. Override to `:9090` or a specific interface when a Prometheus scraper must reach the pod over the network | `127.0.0.1:9090` (default) |
 | `TOKEN_SIGNING_SECRET` | Secret for AES-GCM opaque tokens (min 32 bytes, shared across all instances) | `...` |
@@ -119,10 +126,11 @@ All configuration is via environment variables.
 | `REDIS_REQUIRED` | Fail startup (`logger.Fatal`) when `REDIS_URL` is unset. Default `true` — stateless mode leaves authorization codes / refresh tokens replayable within their TTL (findings C3/C4). Set `false` only for dev or single-replica deployments that accept the trade-off | `true` (default) |
 | `REDIS_KEY_PREFIX` | Prefix applied to every Redis key (default `mcp-auth-proxy:`). Override when sharing a Redis DB between multiple proxy deployments to avoid key collisions. Set explicitly to empty (`REDIS_KEY_PREFIX=`) to opt out of namespacing | `prod-mcp:` |
 | `RATE_LIMIT_ENABLED` | Per-IP rate limiting on pre-auth endpoints and on the authenticated MCP route (default `true`). Keyed on the stripped `RemoteAddr` by default; set `TRUST_PROXY_HEADERS=true` to honor `X-Forwarded-For`/`X-Real-IP`/`True-Client-IP` behind a trusted frontend | `true` |
-| `TRUST_PROXY_HEADERS` | Honor `X-Forwarded-For`/`X-Real-IP`/`True-Client-IP` when keying the rate limiter (default `false`). Enable **only** behind a trusted L4/L7 that sanitizes these headers — otherwise a client can trivially mint its own rate-limit key and bypass the limiter | `false` (default) |
+| `TRUST_PROXY_HEADERS` | Legacy blanket trust of `X-Forwarded-For`/`X-Real-IP`/`True-Client-IP` when keying the rate limiter (default `false`). Prefer `TRUSTED_PROXY_CIDRS`; `PROD_MODE=true` rejects this flag unless CIDRs are configured, otherwise a direct client can trivially mint its own rate-limit key and bypass the limiter | `false` (default) |
 | `MCP_PER_SUBJECT_CONCURRENCY` | Per-subject in-flight request cap on the authenticated MCP route (default `16`). A runaway or compromised client identity cannot saturate the proxy / upstream pool at the expense of others. Entries for subjects with no in-flight work are reclaimed by a background pruner after ≥5 min idle so map memory stays proportional to active principals, not the lifetime set of ever-seen subjects. `0` disables the limit. Excess requests return 503 `temporarily_unavailable` with `Retry-After: 1` and increment `mcp_auth_access_denied_total{reason="subject_concurrency_exceeded"}` | `16` (default) |
 | `COMPAT_ALLOW_STATELESS` | When `true`, `/authorize` synthesizes a `state` server-side if the client omits it (legacy MCP Inspector / Cursor). Default `false` — strict mode refuses with 400 `invalid_request` because a silent server-synth hides client-side CSRF bugs. `mcp_auth_access_denied_total{reason="state_missing"}` is incremented either way so operators can see how many clients still rely on the compat path | `false` (default) |
 | `MCP_LOG_BODY_MAX` | Max bytes buffered per authenticated request for JSON-RPC method extraction into access logs (default `65536`). `0` disables buffering — no `rpc_method`/`rpc_tool`/`rpc_id` fields are emitted. Only triggered when `Content-Type: application/json` and `Content-Length` is set and within the limit; SSE / chunked uploads pass through untouched | `65536` (default) |
+| `ACCESS_LOG_SKIP_RE` | Go RE2 regexp matched against `r.URL.Path` on the public listener only. Matching paths are dropped from the access log; handler response, Prometheus counters, and panic recovery are unaffected. Compiled once at startup; invalid pattern is fatal. RE2 is linear-time — no ReDoS surface. Whitespace-only values are treated as unset. `/readyz` and `/metrics` live on `METRICS_ADDR` and never reach this middleware. Always anchor with `^…$`; unanchored substrings can match unrelated upstream paths and `.*` silences the entire access log | `^/healthz$` |
 
 ---
 
@@ -193,22 +201,29 @@ Response 200 JSON:
 {
   "resource": "{PROXY_BASE_URL}/",
   "authorization_servers": ["{PROXY_BASE_URL}"],
-  "bearer_methods_supported": ["header"]
+  "bearer_methods_supported": ["header"],
+  "scopes_supported": [],
+  "resource_name": "{MCP_RESOURCE_NAME if set}"
 }
 ```
 
-MCP clients use this endpoint to discover which authorization server protects this resource.
-No authentication required. The `resource` field is `"/"`-terminated so it matches the RFC 8707 canonicalisation Claude.ai applies to resource indicators.
+MCP clients use this endpoint to discover which authorization server protects this resource. No authentication required.
 
-### GET `/.well-known/oauth-protected-resource/mcp` — per-resource PRM (RFC 9728 §3.1)
+**Intentional deviation from RFC 9728 §3.** The spec reads the `resource` value at the origin-root PRM as the identifier into which the well-known suffix was inserted — i.e. `{PROXY_BASE_URL}` without the trailing slash. We instead advertise `{PROXY_BASE_URL}/` because Claude.ai canonicalizes RFC 8707 `resource` indicators with a trailing slash; stripping the slash here would cause `resource`-param equality checks on every `/authorize` and `/token` call from Claude.ai to fail. `matchResource` (`handlers/helpers.go`) is trailing-slash insensitive, so clients that send the spec-strict form without the slash still validate correctly. Strict-spec clients that want the canonical form should fetch the per-mount variant below, which advertises exactly `{PROXY_BASE_URL}<mount>` with no suffix.
 
-Same shape, `resource` = `{PROXY_BASE_URL}/mcp`. MCP clients that scope discovery to the `/mcp` resource path (per RFC 9728 §3.1) fetch this variant instead of the root one.
+`scopes_supported` is emitted as an empty array: the proxy has no scope model (scopes are not parsed at `/authorize`, not sealed into access tokens, not checked by the RS middleware). Publishing `[]` is more informative than omitting — least-privilege-aware clients see a concrete "no scopes" signal rather than having to probe.
+
+`resource_name` is advertised when `MCP_RESOURCE_NAME` is set; omitted otherwise. Clients use it for consent / UI display.
+
+### GET `/.well-known/oauth-protected-resource<mount>` — per-resource PRM (RFC 9728 §3.1)
+
+Where `<mount>` is the path component of `UPSTREAM_MCP_URL` (e.g. `/mcp`, `/api/v1/mcp`). Same shape, `resource` = `{PROXY_BASE_URL}<mount>`. This variant is spec-strict: the `resource` value matches the identifier into which the well-known suffix was inserted, no trailing slash. MCP clients that follow RFC 9728 §3.1 per-resource discovery fetch this path and get the canonical form.
 
 ---
 
 ### GET `/.well-known/oauth-authorization-server` — Authorization Server Metadata (RFC 8414)
 
-Also served at `/.well-known/oauth-authorization-server/mcp` (non-spec compat for MCP clients that probe the per-resource suffix). Both paths return the same document.
+Also served at `/.well-known/oauth-authorization-server<mount>` (non-spec compat for MCP clients that probe the per-resource suffix), where `<mount>` is the path component of `UPSTREAM_MCP_URL` (e.g. `/mcp`, `/api/v1/mcp`). Both paths return the same document.
 
 
 Response 200 JSON:
@@ -222,12 +237,12 @@ Response 200 JSON:
   "response_types_supported": ["code"],
   "grant_types_supported": ["authorization_code", "refresh_token"],
   "code_challenge_methods_supported": ["S256"],
-  "token_endpoint_auth_methods_supported": ["none"]
+  "token_endpoint_auth_methods_supported": ["none"],
+  "scopes_supported": []
 }
 ```
 
-PKCE-only proxy: no client secrets are validated.
-No authentication required on this endpoint.
+PKCE-only proxy: no client secrets are validated. `scopes_supported` is an explicit empty array — the proxy carries no scope model (see PRM note above). No authentication required on this endpoint.
 
 ---
 
@@ -244,6 +259,7 @@ No authentication required on this endpoint.
 
 **Behavior:**
 - Validate that `redirect_uris` is present and non-empty
+- Reject `client_name` longer than 512 bytes so unauthenticated registrations cannot amplify into oversized logs or sealed `client_id` responses
 - OAuth 2.1 §2.3.1: each `redirect_uri` must use HTTPS, or HTTP when pointing at a loopback host. Loopback is recognized via `net.ParseIP().IsLoopback()` (covers the full 127/8 range, `::1`, `::ffff:127.0.0.1`, `::0.0.0.1`) plus the literal `localhost` / `localhost.`. Non-http(s) schemes (e.g. `ftp://`, `ldap://`, `file://`, custom app schemes) are rejected unconditionally even when the host is loopback
 - Generate an internal UUID for the client
 - Encrypt the whole `{ id, redirect_uris, client_name, expires_at }` with AES-GCM → this is the returned `client_id`
@@ -251,14 +267,22 @@ No authentication required on this endpoint.
 - Request body limited to 1 MB (`MaxBytesReader`)
 
 **Response 201 JSON:**
+Headers: `Cache-Control: no-store`, `Pragma: no-cache`.
+
 ```json
 {
   "client_id": "<encrypted blob>",
   "client_id_issued_at": 1234567890,
+  "client_id_expires_at": 1234654290,
   "redirect_uris": ["..."],
+  "client_name": "<echoed if submitted>",
   "token_endpoint_auth_method": "none"
 }
 ```
+
+`client_id_expires_at` (RFC 7591 §3.2.1) is the UNIX timestamp at which the sealed `client_id` stops opening (default `client_id_issued_at + 24h`). Clients that cache the handle should re-register before this time to avoid a 400 on `/authorize`.
+
+Error responses use RFC 7591 §3.2.2 codes: `invalid_redirect_uri` for any redirect_uri-shape defect (missing, over-count, over-length, malformed, opaque, hostless, fragment-bearing, userinfo-bearing, or non-https-non-loopback); `invalid_client_metadata` for unsupported `token_endpoint_auth_method` or over-length `client_name`; `invalid_request` only for structural problems (malformed JSON body).
 
 ---
 
@@ -268,13 +292,13 @@ No authentication required on this endpoint.
 - `response_type=code` (required, reject otherwise)
 - `client_id` (required, decrypt and validate not expired)
 - `redirect_uri` (required, must match a registered URI — exact match)
-- `code_challenge` (required if `PKCE_REQUIRED=true`, optional otherwise)
+- `code_challenge` (required if `PKCE_REQUIRED=true`, optional otherwise; 43-128 unreserved characters per RFC 7636)
 - `code_challenge_method=S256` (required if `code_challenge` present)
 - `state` (optional — if absent, a random state is generated server-side for Cursor/MCP Inspector compatibility)
-- `resource` (optional, RFC 8707 — accepted, identifies the target MCP server)
+- `resource` (optional, RFC 8707 — accepted when it matches either `{PROXY_BASE_URL}` / `{PROXY_BASE_URL}/` or the configured mount resource `{PROXY_BASE_URL}<mount>`)
 
 **Behavior:**
-1. Validate all params
+1. Validate all params; reject repeated singleton params (`resource` may appear more than once per RFC 8707); every `resource` value must match an accepted resource URI
 2. Decrypt the `client_id` → verify not expired, `redirect_uri` matched
 3. Encrypt the session with AES-GCM (10min TTL):
    ```
@@ -323,8 +347,9 @@ No authentication required on this endpoint.
      expires_at
    }
    ```
-10. Redirect 302 to `redirect_uri?code={encrypted_code}&state={original_state}`
+10. Redirect 302 to `redirect_uri?code={encrypted_code}&state={original_state}&iss={PROXY_BASE_URL}`
     - Built via `url.Parse` + merged query params (safe even if redirect_uri already contains query params)
+    - `iss` is emitted per RFC 9700 §2.1.4 (mix-up defense): a client that talks to multiple ASes can verify the response came from the AS it actually sent the request to. Value matches the `issuer` field in the RFC 8414 metadata document.
 
 ---
 
@@ -349,7 +374,7 @@ grant_type=refresh_token
 ```
 
 **Behavior — authorization_code:**
-1. Validate `code_verifier` length (43-128 chars, RFC 7636 §4.1)
+1. Reject repeated singleton params (`resource` may appear more than once per RFC 8707); every `resource` value must match an accepted resource URI; validate `code_verifier` shape (43-128 unreserved characters, RFC 7636 §4.1)
 2. Decrypt the code, verify not expired
 3. Decrypt the `client_id`, verify not expired
 4. Verify `client_id` (internal UUID) and `redirect_uri` match the code
@@ -439,9 +464,9 @@ All MCP routes (`/*` except OAuth endpoints):
 4. If `REVOKE_BEFORE` is configured, reject if `iat` < cutoff (bulk revocation)
 5. Inject into context: `sub`, `email`, `groups`
 6. On failure, return `401` per RFC 6750 §3.1:
-   - Missing or malformed `Authorization` header → `{ "error": "invalid_request" }`
-   - Token decrypt/expiry/audience/iat failures → `{ "error": "invalid_token" }`
-   Both responses include `WWW-Authenticate: Bearer error="<code>", resource_metadata="{PROXY_BASE_URL}/.well-known/oauth-protected-resource"` (RFC 9728 §5.1).
+   - Missing or malformed `Authorization` header → `{ "error": "invalid_request", "error_description": "bearer credential is missing or malformed" }`
+   - Token decrypt/expiry/audience/iat failures → `{ "error": "invalid_token", "error_description": "bearer token is invalid, expired, or not intended for this resource" }`
+   Both responses include `WWW-Authenticate: Bearer error="<code>", error_description="<text>", resource_metadata="{PROXY_BASE_URL}/.well-known/oauth-protected-resource"` (RFC 9728 §5.1 + RFC 6750 §3). The `error_description` is a closed allowlist of fixed strings — no caller-controlled data reaches the header.
 
 ---
 
@@ -451,7 +476,7 @@ After auth middleware passes:
 
 ```go
 // Forward to upstream MCP server
-// Client request path forwarded verbatim; UPSTREAM_MCP_URL is origin-only
+// Client request path forwarded verbatim; proxy mount == UPSTREAM_MCP_URL path
 // Added headers:
 r.Header.Set("X-User-Sub", claims.Subject)
 r.Header.Set("X-User-Email", claims.Email)
@@ -466,21 +491,19 @@ Use `httputil.ReverseProxy` with `FlushInterval: -1` (immediate flush) to suppor
 
 ### Upstream path handling
 
-`UPSTREAM_MCP_URL` is origin-only (scheme + host + port). The client request path is forwarded verbatim — no join, no strip, no rewrite. The proxy exposes `/mcp` on the client side, so the upstream receives `/mcp` on the same origin.
+`UPSTREAM_MCP_URL` must include a path component; that path is the proxy's public mount *and* the path forwarded upstream, verbatim both sides. No join, no strip, no rewrite. If the client hits `{PROXY_BASE_URL}<path>`, the upstream sees `<path>`.
 
-Real-world MCP endpoints use many paths:
+Real-world MCP endpoints use many paths — set `UPSTREAM_MCP_URL` accordingly:
 
-| Product | Path |
-|---|---|
-| FastMCP (Python) default | `/mcp` |
-| GitHub Copilot (`api.githubcopilot.com`) | `/mcp` |
-| Cloudflare (`mcp.cloudflare.com`) | `/mcp` |
-| Atlassian Rovo | `/v1/mcp` |
-| GitLab | `/api/v4/mcp` |
+| Product | Path | Example value |
+|---|---|---|
+| FastMCP (Python) default | `/mcp` | `http://fastmcp:8000/mcp` |
+| GitHub Copilot (`api.githubcopilot.com`) | `/mcp` | `https://api.githubcopilot.com/mcp` |
+| Cloudflare (`mcp.cloudflare.com`) | `/mcp` | `https://mcp.cloudflare.com/mcp` |
+| Atlassian Rovo | `/v1/mcp` | `https://rovo.atlassian.com/v1/mcp` |
+| GitLab | `/api/v4/mcp` | `https://gitlab.com/api/v4/mcp` |
 
-When the upstream mounts MCP anywhere other than `/mcp`, put a rewrite layer between this proxy and the upstream (Ingress rule, k8s Service middleware, nginx/envoy sidecar) and point `UPSTREAM_MCP_URL` at that layer. This proxy does not rewrite paths.
-
-Path, query, fragment, and userinfo on `UPSTREAM_MCP_URL` are rejected at startup.
+Origin-only URLs (no path / lone `/`), query, fragment, userinfo, and paths that collide with a reserved control-plane route (`/healthz`, `/register`, `/authorize`, `/callback`, `/token`, `/.well-known`) are rejected at startup.
 
 ---
 
@@ -500,16 +523,17 @@ r.Use(chimw.Recoverer)
 // so the router composition stays identical in both modes. replayStore is
 // optional (nil when REDIS_URL is unset); when non-nil, /token enforces
 // single-use authorization codes and refresh rotation with reuse detection.
-registerDiscoveryRoutes(r, cfg.ProxyBaseURL) // PRM + AS metadata (root & /mcp) + 404 carve-outs
+registerDiscoveryRoutes(r, cfg.ProxyBaseURL, cfg.UpstreamMCPMountPath, cfg.ResourceName) // PRM + AS metadata (root & mount) + 404 carve-outs
 r.With(registerLimit).Post("/register", handlers.Register(tm, logger, cfg.ProxyBaseURL))
 r.With(authorizeLimit).Get("/authorize", handlers.Authorize(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, handlers.AuthorizeConfig{
     PKCERequired: cfg.PKCERequired,
+    ResourceURIs: []string{cfg.ProxyBaseURL + cfg.UpstreamMCPMountPath},
 }))
 r.With(callbackLimit).Get("/callback", handlers.Callback(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, idTokenVerifier, handlers.CallbackConfig{
     AllowedGroups: cfg.AllowedGroups,
     GroupsClaim:   cfg.GroupsClaim,
 }))
-r.With(tokenLimit).Post("/token", handlers.Token(tm, logger, cfg.ProxyBaseURL, cfg.RevokeBefore, replayStore))
+r.With(tokenLimit).Post("/token", handlers.Token(tm, logger, cfg.ProxyBaseURL, cfg.RevokeBefore, replayStore, cfg.ProxyBaseURL+cfg.UpstreamMCPMountPath))
 
 // Liveness: 200 as long as the process is up.
 r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -520,15 +544,13 @@ r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 // degraded pod drops out of a K8s Service until Redis recovers.
 r.Get("/readyz", readyzHandler(replayStore, logger))
 
-// MCP proxy (auth required). Mounted at /mcp only — any non-/mcp
-// path on the proxy is 404 by the router. UPSTREAM_MCP_URL is
-// origin-only (scheme+host+port); the proxy forwards the client
-// request path verbatim so upstream and client share the same
-// namespace. Upstream must serve MCP at /mcp.
+// MCP proxy (auth required). Mount is the path from UPSTREAM_MCP_URL
+// (cfg.UpstreamMCPMountPath). Any request outside the mount returns
+// 404. Client path == upstream path, verbatim both sides.
 r.Group(func(r chi.Router) {
     r.Use(authMW.Validate)
-    r.Handle("/mcp", proxyHandler)
-    r.Handle("/mcp/*", proxyHandler)
+    r.Handle(cfg.UpstreamMCPMountPath, proxyHandler)
+    r.Handle(cfg.UpstreamMCPMountPath+"/*", proxyHandler)
 })
 ```
 
@@ -625,11 +647,11 @@ ENTRYPOINT ["/usr/local/bin/mcp-auth-proxy"]
 - **Stateless**: no shared store required — all transient state is encrypted in tokens/params
 - **Scalable**: any instance sharing the same `TOKEN_SIGNING_SECRET` can handle any request
 - **No client-side state**: no cookies, everything in query params / headers
-- **PKCE**: `S256` only (if provided). Strict by default (`PKCE_REQUIRED=true`). Set `false` for clients that omit PKCE (Cursor, MCP Inspector, ChatGPT). `code_verifier` must be 43-128 chars when present
+- **PKCE**: `S256` only (if provided). Strict by default (`PKCE_REQUIRED=true`). Set `false` for clients that omit PKCE (Cursor, MCP Inspector, ChatGPT). `code_challenge` and `code_verifier` must be 43-128 unreserved characters when present
 - **Audience binding**: every sealed payload (client_id, session, code, refresh, access token) carries `PROXY_BASE_URL` as `audience` and is rejected if a sibling instance with a different baseURL receives it. Defends against accidental cross-deployment secret reuse
 - **Refresh-token bulk revocation**: `REVOKE_BEFORE` applies to refresh tokens too — a leaked refresh cannot mint fresh access tokens past the cutoff. Refresh tokens carry their own `iat` for this check
 - **redirect_uri**: exact match; `http://` allowed only to a loopback host (full 127/8 range, `::1`, `::ffff:127.0.0.1`, `::0.0.0.1`, `localhost`, `localhost.`); non-http(s) schemes rejected even on loopback; fragments and userinfo rejected; length capped at 512 chars; at most 5 entries per client registration
-- **Structured logs**: zap, JSON format, include `request_id` in each log. Inbound `X-Request-Id` is stripped before chi mints one, to prevent log-forgery via client-controlled IDs. Authenticated requests additionally carry `sub` and `email` from the bearer token. JSON-RPC requests to the upstream MCP server also carry `rpc_method` (e.g. `tools/call`), `rpc_tool` (the `params.name` field), and `rpc_id`. `rpc_method` and `rpc_tool` are capped at 128 characters, `rpc_id` at 64; all three pass through a narrow allowlist (ASCII alphanumerics plus `._:/-+`), so arbitrary attacker-supplied strings cannot bloat or smuggle into log lines. Set `MCP_LOG_BODY_MAX=0` to suppress the `rpc_*` fields entirely
+- **Structured logs**: zap, JSON format, include `request_id` in each log. Inbound `X-Request-Id` is stripped before chi mints one, to prevent log-forgery via client-controlled IDs. Authenticated requests additionally carry `sub` and `email` from the bearer token. JSON-RPC requests to the upstream MCP server also carry `rpc_method` (e.g. `tools/call`), `rpc_tool` (the `params.name` field), and `rpc_id`. `rpc_method` and `rpc_tool` are capped at 128 characters, `rpc_id` at 64; all three pass through a narrow allowlist (ASCII alphanumerics plus `._:/-+`), so arbitrary attacker-supplied strings cannot bloat or smuggle into log lines. Set `MCP_LOG_BODY_MAX=0` to suppress the `rpc_*` fields entirely. Set `ACCESS_LOG_SKIP_RE` (Go RE2 regexp matched against `r.URL.Path`) to drop entire access-log lines for matching paths — typical use is `^/healthz$` to silence liveness-probe noise; the active pattern is echoed under `access_log_skip_re` in the `startup_config` audit line so an operator triaging "where did `/healthz` go?" can see it immediately
 - **Business metrics**: alongside the Prometheus Go runtime counters, the `metrics` package emits `mcp_auth_tokens_issued_total{grant_type}`, `mcp_auth_access_denied_total{reason}`, `mcp_auth_replay_detected_total{kind}`, `mcp_auth_rate_limited_total{endpoint}`, and `mcp_auth_clients_registered_total` so security-relevant events are alertable
 - **Graceful shutdown**: context with SIGINT/SIGTERM signals, deadline configurable via `SHUTDOWN_TIMEOUT` (default 120s) — calibrate to the expected SSE stream duration to avoid cutting ongoing MCP sessions during a rolling deploy. The K8s `terminationGracePeriodSeconds` must be ≥ `SHUTDOWN_TIMEOUT`
 - **Timeouts**: `ReadTimeout: 30s`, `WriteTimeout: 0` (SSE), `IdleTimeout: 120s`
@@ -714,6 +736,7 @@ The `manifests/` folder ships a turn-key demo: a Docker Compose stack (Keycloak 
 - `PROXY_BASE_URL` with a scheme other than `https://` (or `http://` to a loopback host), a non-empty userinfo, a fragment, or a path beyond `/` (L8).
 - `MCP_LOG_BODY_MAX` / `MCP_PER_SUBJECT_CONCURRENCY` not parseable as non-negative integers.
 - `SHUTDOWN_TIMEOUT` / `REVOKE_BEFORE` unparseable as duration / RFC3339.
+- `ACCESS_LOG_SKIP_RE` not compilable as a Go RE2 regexp.
 
 Non-fatal startup warnings:
 

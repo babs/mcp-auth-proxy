@@ -88,6 +88,7 @@ func sealCode(t *testing.T, tm *token.Manager, clientUUID, redirectURI, codeChal
 	t.Helper()
 	sc := sealedCode{
 		TokenID:       uuid.New().String(),
+		FamilyID:      uuid.New().String(),
 		ClientID:      clientUUID,
 		RedirectURI:   redirectURI,
 		CodeChallenge: codeChallenge,
@@ -249,6 +250,26 @@ func TestRegister_Success(t *testing.T) {
 	if resp.ClientIDIssuedAt == 0 {
 		t.Error("client_id_issued_at should be non-zero")
 	}
+	// RFC 7591 §3.2.1 OPTIONAL `client_id_expires_at` — surfaced so
+	// clients know when the sealed handle stops opening (default 24h).
+	if resp.ClientIDExpiresAt <= resp.ClientIDIssuedAt {
+		t.Errorf("client_id_expires_at=%d must be > client_id_issued_at=%d",
+			resp.ClientIDExpiresAt, resp.ClientIDIssuedAt)
+	}
+	// Must be ~clientTTL (24h) away from issued_at; allow ±1 min slop.
+	if delta := resp.ClientIDExpiresAt - resp.ClientIDIssuedAt; delta < int64(clientTTL.Seconds())-60 || delta > int64(clientTTL.Seconds())+60 {
+		t.Errorf("client_id_expires_at delta = %ds, want ~%ds", delta, int64(clientTTL.Seconds()))
+	}
+	// RFC 7591 §3.2.1: registered client_name must be echoed back.
+	if resp.ClientName != "my-app" {
+		t.Errorf("client_name should be echoed as %q, got %q", "my-app", resp.ClientName)
+	}
+	if cc := rr.Header().Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("expected Cache-Control: no-store, got %q", cc)
+	}
+	if pr := rr.Header().Get("Pragma"); pr != "no-cache" {
+		t.Errorf("expected Pragma: no-cache, got %q", pr)
+	}
 
 	// Verify the client_id is a valid encrypted payload
 	var sc sealedClient
@@ -325,8 +346,9 @@ func TestRegister_MissingRedirectURIs(t *testing.T) {
 	if err := json.NewDecoder(rr.Body).Decode(&oauthErr); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if oauthErr.Error != "invalid_request" {
-		t.Errorf("expected error 'invalid_request', got %q", oauthErr.Error)
+	// RFC 7591 §3.2.2: redirect_uri-shaped defects use the dedicated code.
+	if oauthErr.Error != "invalid_redirect_uri" {
+		t.Errorf("expected error 'invalid_redirect_uri', got %q", oauthErr.Error)
 	}
 }
 
@@ -343,6 +365,28 @@ func TestRegister_InvalidJSON(t *testing.T) {
 		t.Fatalf("expected 400, got %d", rr.Code)
 	}
 
+	var oauthErr OAuthError
+	if err := json.NewDecoder(rr.Body).Decode(&oauthErr); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if oauthErr.Error != "invalid_request" {
+		t.Errorf("expected error 'invalid_request', got %q", oauthErr.Error)
+	}
+}
+
+func TestRegister_RejectsTrailingJSON(t *testing.T) {
+	tm := newTestTokenManager(t)
+	body := `{"redirect_uris":["https://app.example.com/callback"]} {"redirect_uris":["https://evil.example.com/callback"]}`
+
+	req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+
+	Register(tm, zap.NewNop(), testBaseURL)(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
+	}
 	var oauthErr OAuthError
 	if err := json.NewDecoder(rr.Body).Decode(&oauthErr); err != nil {
 		t.Fatalf("decode: %v", err)
@@ -520,6 +564,68 @@ func TestAuthorize_InvalidClient(t *testing.T) {
 	}
 	if oauthErr.Error != "invalid_client" {
 		t.Errorf("expected error 'invalid_client', got %q", oauthErr.Error)
+	}
+}
+
+func TestAuthorize_RejectsMalformedCodeChallenge(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+	redirectURI := "https://app.example.com/callback"
+	encClientID, _ := registerClient(t, tm, []string{redirectURI})
+
+	params := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {encClientID},
+		"redirect_uri":          {redirectURI},
+		"code_challenge":        {strings.Repeat("!", 43)},
+		"code_challenge_method": {"S256"},
+		"state":                 {"s"},
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/authorize?"+params.Encode(), nil)
+	rr := httptest.NewRecorder()
+	Authorize(tm, logger, testBaseURL, testOAuth2Config(), AuthorizeConfig{PKCERequired: true})(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var oauthErr OAuthError
+	if err := json.NewDecoder(rr.Body).Decode(&oauthErr); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if oauthErr.Error != "invalid_request" {
+		t.Errorf("expected invalid_request, got %q", oauthErr.Error)
+	}
+}
+
+func TestAuthorize_RejectsRepeatedSingletonParam(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+	redirectURI := "https://app.example.com/callback"
+	encClientID, _ := registerClient(t, tm, []string{redirectURI})
+
+	params := url.Values{
+		"response_type":         {"code", "token"},
+		"client_id":             {encClientID},
+		"redirect_uri":          {redirectURI},
+		"code_challenge":        {pkceChallenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk")},
+		"code_challenge_method": {"S256"},
+		"state":                 {"s"},
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/authorize?"+params.Encode(), nil)
+	rr := httptest.NewRecorder()
+	Authorize(tm, logger, testBaseURL, testOAuth2Config(), AuthorizeConfig{PKCERequired: true})(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var oauthErr OAuthError
+	if err := json.NewDecoder(rr.Body).Decode(&oauthErr); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if oauthErr.Error != "invalid_request" {
+		t.Errorf("expected invalid_request, got %q", oauthErr.Error)
 	}
 }
 
@@ -722,6 +828,7 @@ func TestTokenAuthCode_ExpiredCode(t *testing.T) {
 	// Create an expired code
 	sc := sealedCode{
 		TokenID:       uuid.New().String(),
+		FamilyID:      uuid.New().String(),
 		ClientID:      internalID,
 		RedirectURI:   redirectURI,
 		CodeChallenge: pkceChallenge(expiredVerifier),
@@ -995,7 +1102,7 @@ func TestResourceMetadata(t *testing.T) {
 
 	// Root variant: "/"-suffixed resource for Claude.ai / RFC 8707.
 	t.Run("root_slash_resource", func(t *testing.T) {
-		handler := ResourceMetadata(baseURL+"/", baseURL)
+		handler := ResourceMetadata(baseURL+"/", baseURL, "")
 		req := httptest.NewRequest(http.MethodGet, "/.well-known/oauth-protected-resource", nil)
 		rr := httptest.NewRecorder()
 		handler(rr, req)
@@ -1022,7 +1129,7 @@ func TestResourceMetadata(t *testing.T) {
 
 	// Per-resource variant per RFC 9728 §3.1: /mcp-scoped document.
 	t.Run("mcp_scoped_resource", func(t *testing.T) {
-		handler := ResourceMetadata(baseURL+"/mcp", baseURL)
+		handler := ResourceMetadata(baseURL+"/mcp", baseURL, "")
 		req := httptest.NewRequest(http.MethodGet, "/.well-known/oauth-protected-resource/mcp", nil)
 		rr := httptest.NewRecorder()
 		handler(rr, req)
@@ -1040,6 +1147,44 @@ func TestResourceMetadata(t *testing.T) {
 		servers, ok := meta["authorization_servers"].([]any)
 		if !ok || len(servers) != 1 || servers[0] != baseURL {
 			t.Errorf("expected authorization_servers=[%q], got %v", baseURL, meta["authorization_servers"])
+		}
+	})
+}
+
+// TestResourceMetadata_ResourceName verifies the optional RFC 9728 §2
+// "resource_name" field: omitted from the JSON when the config value is
+// empty, and advertised verbatim when non-empty.
+func TestResourceMetadata_ResourceName(t *testing.T) {
+	baseURL := "https://mcp-proxy.example.com"
+
+	t.Run("omitted_when_empty", func(t *testing.T) {
+		handler := ResourceMetadata(baseURL+"/mcp", baseURL, "")
+		req := httptest.NewRequest(http.MethodGet, "/.well-known/oauth-protected-resource/mcp", nil)
+		rr := httptest.NewRecorder()
+		handler(rr, req)
+
+		var meta map[string]any
+		if err := json.NewDecoder(rr.Body).Decode(&meta); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if _, present := meta["resource_name"]; present {
+			t.Errorf("resource_name must be omitted when unset, got %v", meta["resource_name"])
+		}
+	})
+
+	t.Run("advertised_when_set", func(t *testing.T) {
+		name := "ACME MCP Server"
+		handler := ResourceMetadata(baseURL+"/mcp", baseURL, name)
+		req := httptest.NewRequest(http.MethodGet, "/.well-known/oauth-protected-resource/mcp", nil)
+		rr := httptest.NewRecorder()
+		handler(rr, req)
+
+		var meta map[string]any
+		if err := json.NewDecoder(rr.Body).Decode(&meta); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if meta["resource_name"] != name {
+			t.Errorf("resource_name: want %q, got %v", name, meta["resource_name"])
 		}
 	})
 }
@@ -1068,6 +1213,35 @@ func TestAuthorize_AcceptsResourceParam(t *testing.T) {
 
 	if rr.Code != http.StatusFound {
 		t.Fatalf("expected 302, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestAuthorize_AcceptsConfiguredMountResourceParam(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+
+	redirectURI := "https://claude.ai/api/mcp/auth_callback"
+	encClientID, _ := registerClient(t, tm, []string{redirectURI})
+
+	codeChallenge := pkceChallenge("test-verifier")
+	mountResource := testBaseURL + "/mcp"
+	target := "/authorize?response_type=code&client_id=" + url.QueryEscape(encClientID) +
+		"&redirect_uri=" + url.QueryEscape(redirectURI) +
+		"&code_challenge=" + codeChallenge +
+		"&code_challenge_method=S256" +
+		"&state=s" +
+		"&resource=" + url.QueryEscape(mountResource)
+
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	rr := httptest.NewRecorder()
+
+	Authorize(tm, logger, testBaseURL, testOAuth2Config(), AuthorizeConfig{
+		PKCERequired: true,
+		ResourceURIs: []string{mountResource},
+	})(rr, req)
+
+	if rr.Code != http.StatusFound {
+		t.Fatalf("expected 302 for mount resource, got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -1322,8 +1496,9 @@ func TestRegister_RejectsHTTPNonLoopback(t *testing.T) {
 	if err := json.NewDecoder(rr.Body).Decode(&oauthErr); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if oauthErr.Error != "invalid_request" {
-		t.Errorf("expected error 'invalid_request', got %q", oauthErr.Error)
+	// RFC 7591 §3.2.2: redirect_uri-shaped defects use the dedicated code.
+	if oauthErr.Error != "invalid_redirect_uri" {
+		t.Errorf("expected error 'invalid_redirect_uri', got %q", oauthErr.Error)
 	}
 	if !strings.Contains(oauthErr.ErrorDescription, "HTTPS") {
 		t.Errorf("error_description should mention HTTPS: %q", oauthErr.ErrorDescription)
@@ -1388,6 +1563,30 @@ func TestCallback_MissingCodeOrState(t *testing.T) {
 				t.Errorf("expected error 'invalid_request', got %q", oauthErr.Error)
 			}
 		})
+	}
+}
+
+func TestCallback_RejectsRepeatedSingletonParam(t *testing.T) {
+	tm := newTestTokenManager(t)
+	oauth2Cfg := testOAuth2Config()
+	verifyFunc := func(_ context.Context, _ string) (*oidc.IDToken, error) {
+		panic("must not be called")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/callback?code=a&code=b&state=s", nil)
+	rr := httptest.NewRecorder()
+
+	CallbackWithVerifyFunc(tm, zap.NewNop(), testBaseURL, oauth2Cfg, verifyFunc, CallbackConfig{})(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var oauthErr OAuthError
+	if err := json.NewDecoder(rr.Body).Decode(&oauthErr); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if oauthErr.Error != "invalid_request" {
+		t.Errorf("expected error 'invalid_request', got %q", oauthErr.Error)
 	}
 }
 
@@ -1580,6 +1779,41 @@ func TestTokenAuthCode_VerifierTooLong(t *testing.T) {
 	}
 }
 
+func TestTokenAuthCode_VerifierInvalidCharacters(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+
+	redirectURI := "https://app.example.com/callback"
+	encClientID, internalID := registerClient(t, tm, []string{redirectURI})
+
+	badVerifier := strings.Repeat("A", 42) + "!"
+	authCode := sealCode(t, tm, internalID, redirectURI, pkceChallenge(badVerifier), "user", "u@example.com")
+
+	form := url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {authCode},
+		"redirect_uri":  {redirectURI},
+		"client_id":     {encClientID},
+		"code_verifier": {badVerifier},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rr := httptest.NewRecorder()
+
+	Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var oauthErr OAuthError
+	json.NewDecoder(rr.Body).Decode(&oauthErr)
+	if oauthErr.Error != "invalid_request" {
+		t.Errorf("expected error 'invalid_request', got %q", oauthErr.Error)
+	}
+}
+
 // --- Token: groups preserved through exchange ---
 
 func TestTokenAuthCodeFlow_GroupsPreserved(t *testing.T) {
@@ -1594,6 +1828,7 @@ func TestTokenAuthCodeFlow_GroupsPreserved(t *testing.T) {
 
 	sc := sealedCode{
 		TokenID:       uuid.New().String(),
+		FamilyID:      uuid.New().String(),
 		ClientID:      internalID,
 		RedirectURI:   redirectURI,
 		CodeChallenge: codeChallenge,
@@ -1799,6 +2034,30 @@ func TestAuthorize_PKCEOptional_RejectsPlain(t *testing.T) {
 	}
 }
 
+func TestAuthorize_PKCEOptional_RejectsChallengeWithoutMethod(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+	redirectURI := "https://app.example.com/callback"
+	encClientID, _ := registerClient(t, tm, []string{redirectURI})
+
+	params := url.Values{
+		"response_type":  {"code"},
+		"client_id":      {encClientID},
+		"redirect_uri":   {redirectURI},
+		"code_challenge": {pkceChallenge("verifier")},
+		"state":          {"s"},
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/authorize?"+params.Encode(), nil)
+	rr := httptest.NewRecorder()
+
+	Authorize(tm, logger, testBaseURL, testOAuth2Config(), AuthorizeConfig{PKCERequired: false})(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for code_challenge without method, got %d", rr.Code)
+	}
+}
+
 // --- Authorize: state handling (H7) ---
 //
 // Default (strict) mode refuses /authorize when the client omits state —
@@ -1970,6 +2229,7 @@ func TestToken_ServerSidePKCE_ClientOmitsVerifier(t *testing.T) {
 
 	sc := sealedCode{
 		TokenID:       uuid.New().String(),
+		FamilyID:      uuid.New().String(),
 		ClientID:      internalID,
 		RedirectURI:   redirectURI,
 		CodeChallenge: svrChallenge,
@@ -2019,6 +2279,7 @@ func TestToken_ServerSidePKCE_RejectsWrongClientVerifier(t *testing.T) {
 	svrChallenge := ComputePKCEChallenge(svrVerifier)
 	sc := sealedCode{
 		TokenID:       uuid.New().String(),
+		FamilyID:      uuid.New().String(),
 		ClientID:      internalID,
 		RedirectURI:   redirectURI,
 		CodeChallenge: svrChallenge,
@@ -2154,6 +2415,7 @@ func TestTokenAuthCode_RejectsForeignCode(t *testing.T) {
 	// Code minted for a different proxy.
 	foreignCode := sealedCode{
 		TokenID:       uuid.New().String(),
+		FamilyID:      uuid.New().String(),
 		ClientID:      internalID,
 		RedirectURI:   redirectURI,
 		CodeChallenge: codeChallenge,
@@ -2399,6 +2661,7 @@ func TestTokenAuthCode_ReplayStore_RejectsSecondUse(t *testing.T) {
 
 	sc := sealedCode{
 		TokenID:       uuid.New().String(),
+		FamilyID:      uuid.New().String(),
 		ClientID:      internalID,
 		RedirectURI:   redirectURI,
 		CodeChallenge: codeChallenge,
@@ -2448,6 +2711,198 @@ func TestTokenAuthCode_ReplayStore_RejectsSecondUse(t *testing.T) {
 	}
 	if oauthErr.ErrorCode != "code_replay" {
 		t.Errorf("expected error_code=code_replay, got %q", oauthErr.ErrorCode)
+	}
+}
+
+// TestRedirectURIMatches_LoopbackPortAgnostic pins RFC 8252 §7.3: when both
+// URIs are loopback, any port on the requested URI is accepted. Every other
+// URI component must still match. Non-loopback URIs still require exact-string
+// equality (OAuth 2.1 §2.3.1).
+func TestRedirectURIMatches_LoopbackPortAgnostic(t *testing.T) {
+	cases := []struct {
+		name       string
+		registered string
+		requested  string
+		want       bool
+	}{
+		// Loopback, port varies → accept.
+		{"ipv4_port_differs", "http://127.0.0.1:8080/cb", "http://127.0.0.1:47521/cb", true},
+		{"ipv4_registered_no_port", "http://127.0.0.1/cb", "http://127.0.0.1:47521/cb", true},
+		{"ipv6_port_differs", "http://[::1]:8080/cb", "http://[::1]:47521/cb", true},
+		{"localhost_port_differs", "http://localhost:8080/cb", "http://localhost:47521/cb", true},
+		{"localhost_trailing_dot", "http://localhost./cb", "http://localhost:8080/cb", true},
+		{"query_matches", "http://127.0.0.1:8080/cb?client=a", "http://127.0.0.1:47521/cb?client=a", true},
+		// Loopback but non-port component differs → reject.
+		{"path_differs", "http://127.0.0.1:8080/cb", "http://127.0.0.1:8080/other", false},
+		{"path_encoding_differs", "http://127.0.0.1:8080/cb%2Fone", "http://127.0.0.1:47521/cb/one", false},
+		{"query_differs", "http://127.0.0.1:8080/cb?client=a", "http://127.0.0.1:47521/cb?client=b", false},
+		{"query_added", "http://127.0.0.1:8080/cb", "http://127.0.0.1:47521/cb?client=b", false},
+		{"userinfo_added", "http://127.0.0.1:8080/cb", "http://user@127.0.0.1:47521/cb", false},
+		{"host_literal_differs", "http://127.0.0.1:8080/cb", "http://localhost:8080/cb", false},
+		{"scheme_differs", "http://127.0.0.1:8080/cb", "https://127.0.0.1:8080/cb", false},
+		// Non-loopback → strict equality, port must match.
+		{"nonloopback_exact_match", "https://app.example.com/cb", "https://app.example.com/cb", true},
+		{"nonloopback_port_differs", "https://app.example.com:8080/cb", "https://app.example.com:9090/cb", false},
+		// One side loopback, other not → reject (no port relaxation).
+		{"loopback_vs_nonloopback", "http://127.0.0.1:8080/cb", "http://evil.example.com:8080/cb", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := redirectURIMatches(tc.requested, tc.registered)
+			if got != tc.want {
+				t.Errorf("redirectURIMatches(%q, %q) = %v, want %v", tc.requested, tc.registered, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTokenAuthCode_PKCEDowngradeReject pins RFC 9700 §4.8.2: a /token
+// request that supplies a code_verifier against a code minted with no
+// code_challenge must be rejected explicitly. This closes the silent-accept
+// path that would otherwise exist when PKCE_REQUIRED=false let a code
+// through without a challenge.
+func TestTokenAuthCode_PKCEDowngradeReject(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+
+	redirectURI := "https://app.example.com/callback"
+	encClientID, internalID := registerClient(t, tm, []string{redirectURI})
+
+	// Code minted WITHOUT a code_challenge — e.g. relaxed mode with
+	// server-side PKCE disabled (hypothetical; current server-PKCE
+	// code path always sets CodeChallenge).
+	sc := sealedCode{
+		TokenID:     uuid.New().String(),
+		FamilyID:    uuid.New().String(),
+		ClientID:    internalID,
+		RedirectURI: redirectURI,
+		Subject:     "user-sub",
+		Email:       "user@example.com",
+		Typ:         token.PurposeCode,
+		Audience:    testBaseURL,
+		ExpiresAt:   time.Now().Add(60 * time.Second),
+	}
+	authCode, err := tm.SealJSON(sc, token.PurposeCode)
+	if err != nil {
+		t.Fatalf("SealJSON: %v", err)
+	}
+
+	// Client supplies code_verifier anyway — attempt to paper over a
+	// downgrade. Must be rejected.
+	form := url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {authCode},
+		"redirect_uri":  {redirectURI},
+		"client_id":     {encClientID},
+		"code_verifier": {"dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"},
+	}
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rr := httptest.NewRecorder()
+	Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var oe OAuthError
+	if err := json.NewDecoder(rr.Body).Decode(&oe); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if oe.Error != "invalid_request" {
+		t.Errorf("want error=invalid_request, got %q", oe.Error)
+	}
+}
+
+// TestTokenAuthCode_Replay_RevokesRefreshFamily verifies RFC 6749 §4.1.2
+// "SHOULD revoke previously issued tokens on code reuse". After a legitimate
+// code redemption returns a refresh token, a replay of the same code must
+// (a) be rejected AND (b) mark the refresh family as revoked so the refresh
+// token minted from the first redemption can no longer rotate.
+func TestTokenAuthCode_Replay_RevokesRefreshFamily(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+	store := replay.NewMemoryStore()
+
+	redirectURI := "https://app.example.com/callback"
+	encClientID, internalID := registerClient(t, tm, []string{redirectURI})
+
+	codeVerifier := "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+
+	sc := sealedCode{
+		TokenID:       uuid.New().String(),
+		FamilyID:      uuid.New().String(),
+		ClientID:      internalID,
+		RedirectURI:   redirectURI,
+		CodeChallenge: pkceChallenge(codeVerifier),
+		Subject:       "user-sub",
+		Email:         "user@example.com",
+		Typ:           token.PurposeCode,
+		Audience:      testBaseURL,
+		ExpiresAt:     time.Now().Add(60 * time.Second),
+	}
+	authCode, err := tm.SealJSON(sc, token.PurposeCode)
+	if err != nil {
+		t.Fatalf("SealJSON: %v", err)
+	}
+
+	exchangeCode := func() *httptest.ResponseRecorder {
+		form := url.Values{
+			"grant_type":    {"authorization_code"},
+			"code":          {authCode},
+			"redirect_uri":  {redirectURI},
+			"client_id":     {encClientID},
+			"code_verifier": {codeVerifier},
+		}
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/token", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rr := httptest.NewRecorder()
+		Token(tm, logger, testBaseURL, time.Time{}, store)(rr, req)
+		return rr
+	}
+
+	// 1. First redemption succeeds and returns a refresh token.
+	first := exchangeCode()
+	if first.Code != http.StatusOK {
+		t.Fatalf("first exchange: want 200, got %d: %s", first.Code, first.Body.String())
+	}
+	var firstTok struct {
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := json.NewDecoder(first.Body).Decode(&firstTok); err != nil {
+		t.Fatalf("decode first: %v", err)
+	}
+	if firstTok.RefreshToken == "" {
+		t.Fatalf("first exchange did not return a refresh_token")
+	}
+
+	// 2. Replay the SAME code. Must reject with code_replay.
+	second := exchangeCode()
+	if second.Code != http.StatusBadRequest {
+		t.Fatalf("replay: want 400, got %d: %s", second.Code, second.Body.String())
+	}
+
+	// 3. Now attempt to rotate the refresh token issued in step 1. The
+	//    family must be revoked (marker set by the replay detector),
+	//    so rotation must be rejected with refresh_family_revoked.
+	rotateForm := url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {firstTok.RefreshToken},
+		"client_id":     {encClientID},
+	}
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/token", strings.NewReader(rotateForm.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rr := httptest.NewRecorder()
+	Token(tm, logger, testBaseURL, time.Time{}, store)(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("rotation after code replay: want 400, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var oe OAuthError
+	if err := json.NewDecoder(rr.Body).Decode(&oe); err != nil {
+		t.Fatalf("decode rotation: %v", err)
+	}
+	if oe.ErrorCode != "refresh_family_revoked" {
+		t.Errorf("want error_code=refresh_family_revoked, got %q (description=%q)", oe.ErrorCode, oe.ErrorDescription)
 	}
 }
 
@@ -2593,6 +3048,7 @@ func TestTokenAuthCode_ReplayStore_PKCEFailureDoesNotBurnCode(t *testing.T) {
 
 	sc := sealedCode{
 		TokenID:       uuid.New().String(),
+		FamilyID:      uuid.New().String(),
 		ClientID:      internalID,
 		RedirectURI:   redirectURI,
 		CodeChallenge: codeChallenge,
@@ -3043,6 +3499,33 @@ func TestToken_RejectsURLQueryParams(t *testing.T) {
 	}
 }
 
+func TestToken_RejectsRepeatedSingletonParam(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+
+	form := url.Values{
+		"grant_type":    {"authorization_code", "refresh_token"},
+		"code":          {"code"},
+		"redirect_uri":  {"https://app.example.com/callback"},
+		"client_id":     {"client"},
+		"code_verifier": {"dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rr := httptest.NewRecorder()
+
+	Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("want 400 rejection for duplicate singleton param, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var e OAuthError
+	_ = json.Unmarshal(rr.Body.Bytes(), &e)
+	if e.Error != "invalid_request" {
+		t.Errorf("want error=invalid_request, got %q", e.Error)
+	}
+}
+
 func TestToken_ResourceMatchesAudience_Accepted(t *testing.T) {
 	tm := newTestTokenManager(t)
 	logger := zap.NewNop()
@@ -3069,5 +3552,35 @@ func TestToken_ResourceMatchesAudience_Accepted(t *testing.T) {
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestToken_ResourceMatchesConfiguredMount_Accepted(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+
+	redirectURI := "https://app.example.com/callback"
+	encClientID, internalID := registerClient(t, tm, []string{redirectURI})
+
+	verifier := "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+	authCode := sealCode(t, tm, internalID, redirectURI, pkceChallenge(verifier), "sub", "e@e")
+	mountResource := testBaseURL + "/mcp"
+
+	form := url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {authCode},
+		"redirect_uri":  {redirectURI},
+		"client_id":     {encClientID},
+		"code_verifier": {verifier},
+		"resource":      {mountResource},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rr := httptest.NewRecorder()
+
+	Token(tm, logger, testBaseURL, time.Time{}, nil, mountResource)(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200 for mount resource, got %d: %s", rr.Code, rr.Body.String())
 	}
 }

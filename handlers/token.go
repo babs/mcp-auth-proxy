@@ -28,7 +28,7 @@ const (
 // rotation with reuse detection across replicas; when nil, the handler
 // retains stateless behavior (codes/refresh tokens unique, audience-bound
 // and expiry-checked but not single-use).
-func Token(tm *token.Manager, logger *zap.Logger, audience string, revokeBefore time.Time, replayStore replay.Store) http.HandlerFunc {
+func Token(tm *token.Manager, logger *zap.Logger, audience string, revokeBefore time.Time, replayStore replay.Store, resourceURIs ...string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 
@@ -49,6 +49,16 @@ func Token(tm *token.Manager, logger *zap.Logger, audience string, revokeBefore 
 			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "malformed form body")
 			return
 		}
+		if rejectRepeatedParams(w, r.Form,
+			"grant_type",
+			"code",
+			"redirect_uri",
+			"client_id",
+			"code_verifier",
+			"refresh_token",
+		) {
+			return
+		}
 
 		// RFC 8707 §2.2: `resource` MAY appear on a /token request; if
 		// present it MUST be validated. We are both AS and RS, so the
@@ -57,7 +67,7 @@ func Token(tm *token.Manager, logger *zap.Logger, audience string, revokeBefore 
 		// refresh_token paths enforce it uniformly.
 		if resources, ok := r.Form["resource"]; ok {
 			for _, res := range resources {
-				if !matchResource(res, audience) {
+				if !matchAnyResource(res, append([]string{audience}, resourceURIs...)) {
 					writeOAuthError(w, http.StatusBadRequest, "invalid_target", "resource does not identify this authorization server")
 					return
 				}
@@ -88,9 +98,9 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 		return
 	}
 
-	// RFC 7636 §4.1: code_verifier must be 43-128 characters (if provided)
-	if codeVerifier != "" && (len(codeVerifier) < 43 || len(codeVerifier) > 128) {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "code_verifier must be 43-128 characters")
+	// RFC 7636 §4.1: code_verifier = 43*128unreserved.
+	if codeVerifier != "" && !validPKCEValue(codeVerifier) {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "code_verifier must be 43-128 unreserved characters")
 		return
 	}
 
@@ -130,12 +140,14 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 		return
 	}
 
-	// Every code must carry a TokenID (single-use key for the replay store).
-	// Mirrors the refresh-side invariant (C2): reject upfront so the replay
-	// guard below cannot silently no-op if a future code path forgets to
-	// populate the field at seal time.
-	if code.TokenID == "" {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "authorization code missing token id")
+	// Every code must carry a TokenID (single-use key for the replay store)
+	// AND a FamilyID (seed for the refresh-rotation lineage, used to
+	// revoke the whole family on code reuse per RFC 6749 §4.1.2).
+	// Mirrors the refresh-side invariant (C2): reject upfront so the
+	// replay / revocation guards below cannot silently no-op if a future
+	// code path forgets to populate either field at seal time.
+	if code.TokenID == "" || code.FamilyID == "" {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "authorization code missing token id or family id")
 		return
 	}
 
@@ -161,6 +173,13 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 			writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "PKCE verification failed")
 			return
 		}
+	} else if codeVerifier != "" {
+		// RFC 9700 §4.8.2 — PKCE downgrade defense in depth. A client that
+		// registered without a code_challenge but supplies a code_verifier
+		// at /token is either confused or attempting to paper over a
+		// downgrade. Refuse explicitly instead of silently accepting.
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "code_verifier supplied but code was issued without a code_challenge")
+		return
 	}
 
 	// Enforce single-use (RFC 6749 §4.1.2). The claim happens AFTER all other
@@ -176,9 +195,28 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 		key := replay.NamespacedKey("authz_code", code.TokenID)
 		if err := replayStore.ClaimOnce(r.Context(), key, remaining); err != nil {
 			if errors.Is(err, replay.ErrAlreadyClaimed) {
+				// RFC 6749 §4.1.2: "If an authorization code is used
+				// more than once, the authorization server MUST deny
+				// the request and SHOULD revoke (when possible) all
+				// tokens previously issued based on that authorization
+				// code." Revoke the refresh family seeded by this code
+				// so whoever redeemed it first cannot keep rotating.
+				// Family TTL = refresh TTL (the window in which a
+				// legitimate refresh could still be used).
+				familyKey := replay.NamespacedKey("refresh_family_revoked", code.FamilyID)
+				if mErr := replayStore.Mark(r.Context(), familyKey, refreshTokenTTL); mErr != nil {
+					// Log and continue — failing the code-replay
+					// rejection is strictly worse than proceeding
+					// without the family revocation.
+					logger.Error("refresh_family_revoke_failed",
+						zap.String("family_id", code.FamilyID),
+						zap.Error(mErr),
+					)
+				}
 				metrics.ReplayDetected.WithLabelValues("code").Inc()
 				logger.Warn("authorization_code_replay",
 					zap.String("token_id", code.TokenID),
+					zap.String("family_id", code.FamilyID),
 					zap.String("subject", code.Subject),
 					zap.String("client_id", client.ID),
 				)
@@ -202,8 +240,12 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 
 	now := time.Now()
 	refresh := sealedRefresh{
-		TokenID:   uuid.New().String(),
-		FamilyID:  uuid.New().String(),
+		TokenID: uuid.New().String(),
+		// Inherit the code's FamilyID so a later code-reuse detection
+		// can revoke every refresh descended from this redemption
+		// (RFC 6749 §4.1.2). A fresh UUID here would orphan the
+		// lineage from the code that spawned it.
+		FamilyID:  code.FamilyID,
 		Subject:   code.Subject,
 		Email:     code.Email,
 		Groups:    code.Groups,
@@ -408,4 +450,23 @@ func VerifyPKCE(verifier, challenge string) bool {
 func ComputePKCEChallenge(verifier string) string {
 	h := sha256.Sum256([]byte(verifier))
 	return base64.RawURLEncoding.EncodeToString(h[:])
+}
+
+func validPKCEValue(s string) bool {
+	if len(s) < 43 || len(s) > 128 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'A' && c <= 'Z',
+			c >= 'a' && c <= 'z',
+			c >= '0' && c <= '9',
+			c == '-', c == '.', c == '_', c == '~':
+			continue
+		default:
+			return false
+		}
+	}
+	return true
 }

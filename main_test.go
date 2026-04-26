@@ -4,7 +4,11 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"testing"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 // TestCIDRAwareKey covers P1c: only peers inside a trusted CIDR get
@@ -51,4 +55,50 @@ func TestCIDRAwareKey(t *testing.T) {
 			t.Errorf("fallback should not error, got %v", err)
 		}
 	})
+}
+
+// TestZapMiddleware_SkipRE verifies ACCESS_LOG_SKIP_RE suppresses the
+// access-log line for matching paths while leaving non-matching paths
+// and the handler response untouched. A nil regex is the
+// log-everything default. The handler MUST always run regardless of
+// match — skipping the log line must never skip the handler.
+func TestZapMiddleware_SkipRE(t *testing.T) {
+	healthz := regexp.MustCompile(`^/healthz$`)
+	probes := regexp.MustCompile(`^/(healthz|readyz)$`)
+
+	cases := []struct {
+		name     string
+		re       *regexp.Regexp
+		path     string
+		wantLogs int
+	}{
+		{"nil_logs_healthz", nil, "/healthz", 1},
+		{"healthz_re_skips_healthz", healthz, "/healthz", 0},
+		{"healthz_re_skips_with_query", healthz, "/healthz?verbose=1", 0},
+		{"healthz_re_logs_other", healthz, "/mcp", 1},
+		{"healthz_re_logs_trailing_slash", healthz, "/healthz/", 1},
+		{"probes_re_skips_readyz", probes, "/readyz", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var called bool
+			next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				called = true
+				w.WriteHeader(http.StatusOK)
+			})
+			core, logs := observer.New(zap.InfoLevel)
+			h := zapMiddleware(zap.New(core), tc.re)(next)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.path, nil))
+			if !called {
+				t.Fatal("next handler was not invoked — skip branch must always call next")
+			}
+			if rec.Code != http.StatusOK {
+				t.Errorf("status = %d, want 200", rec.Code)
+			}
+			if got := logs.FilterMessage("request").Len(); got != tc.wantLogs {
+				t.Errorf("access-log count = %d, want %d", got, tc.wantLogs)
+			}
+		})
+	}
 }

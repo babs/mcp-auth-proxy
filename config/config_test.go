@@ -7,14 +7,17 @@ import (
 )
 
 // setAllRequired sets every mandatory env var to a valid value.
+// REDIS_URL is set too so the default PROD_MODE=true posture does
+// not reject these test loads on the "no replay store" check.
 func setAllRequired(t *testing.T) {
 	t.Helper()
 	t.Setenv("OIDC_ISSUER_URL", "https://issuer.example.com")
 	t.Setenv("OIDC_CLIENT_ID", "client-id")
 	t.Setenv("OIDC_CLIENT_SECRET", "client-secret")
 	t.Setenv("PROXY_BASE_URL", "https://proxy.example.com")
-	t.Setenv("UPSTREAM_MCP_URL", "http://localhost:3000")
+	t.Setenv("UPSTREAM_MCP_URL", "http://localhost:3000/mcp")
 	t.Setenv("TOKEN_SIGNING_SECRET", "this-secret-is-at-least-32-bytes!")
+	t.Setenv("REDIS_URL", "redis://localhost:6379/0")
 }
 
 func TestLoad_AllVarsSet(t *testing.T) {
@@ -37,8 +40,8 @@ func TestLoad_AllVarsSet(t *testing.T) {
 	if cfg.ProxyBaseURL != "https://proxy.example.com" {
 		t.Errorf("ProxyBaseURL = %q, want %q", cfg.ProxyBaseURL, "https://proxy.example.com")
 	}
-	if cfg.UpstreamMCPURL != "http://localhost:3000" {
-		t.Errorf("UpstreamMCPURL = %q, want %q", cfg.UpstreamMCPURL, "http://localhost:3000")
+	if cfg.UpstreamMCPURL != "http://localhost:3000/mcp" {
+		t.Errorf("UpstreamMCPURL = %q, want %q", cfg.UpstreamMCPURL, "http://localhost:3000/mcp")
 	}
 	if string(cfg.TokenSigningSecret) != "this-secret-is-at-least-32-bytes!" {
 		t.Errorf("TokenSigningSecret = %q, want %q", cfg.TokenSigningSecret, "this-secret-is-at-least-32-bytes!")
@@ -247,6 +250,7 @@ func TestLoad_PKCERequired_Default(t *testing.T) {
 
 func TestLoad_PKCERequired_False(t *testing.T) {
 	setAllRequired(t)
+	t.Setenv("PROD_MODE", "false") // toggle being tested is a prod-mode violation
 	t.Setenv("PKCE_REQUIRED", "false")
 	cfg, err := Load()
 	if err != nil {
@@ -358,6 +362,7 @@ func TestLoad_RedisRequired_Default(t *testing.T) {
 
 func TestLoad_RedisRequired_False(t *testing.T) {
 	setAllRequired(t)
+	t.Setenv("PROD_MODE", "false") // toggle being tested is a prod-mode violation
 	t.Setenv("REDIS_REQUIRED", "false")
 	cfg, err := Load()
 	if err != nil {
@@ -384,6 +389,7 @@ func TestLoad_CompatAllowStateless_Default(t *testing.T) {
 
 func TestLoad_CompatAllowStateless_True(t *testing.T) {
 	setAllRequired(t)
+	t.Setenv("PROD_MODE", "false") // toggle being tested is a prod-mode violation
 	t.Setenv("COMPAT_ALLOW_STATELESS", "true")
 	cfg, err := Load()
 	if err != nil {
@@ -441,6 +447,66 @@ func TestLoad_MCPLogBodyMax_Invalid(t *testing.T) {
 	}
 }
 
+func TestLoad_AccessLogSkipRE_Default(t *testing.T) {
+	setAllRequired(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.AccessLogSkipRE != nil {
+		t.Errorf("AccessLogSkipRE should default to nil, got %q", cfg.AccessLogSkipRE.String())
+	}
+}
+
+func TestLoad_AccessLogSkipRE_Compiled(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("ACCESS_LOG_SKIP_RE", `^/healthz$|^/readyz$`)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.AccessLogSkipRE == nil {
+		t.Fatal("AccessLogSkipRE should be compiled when ACCESS_LOG_SKIP_RE is set")
+	}
+	for _, tc := range []struct {
+		path string
+		want bool
+	}{
+		{"/healthz", true},
+		{"/readyz", true},
+		{"/healthz/", false},
+		{"/mcp", false},
+	} {
+		if got := cfg.AccessLogSkipRE.MatchString(tc.path); got != tc.want {
+			t.Errorf("MatchString(%q) = %v, want %v", tc.path, got, tc.want)
+		}
+	}
+}
+
+func TestLoad_AccessLogSkipRE_Invalid(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("ACCESS_LOG_SKIP_RE", "(")
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected error for invalid ACCESS_LOG_SKIP_RE")
+	}
+	if !strings.Contains(err.Error(), "ACCESS_LOG_SKIP_RE") {
+		t.Errorf("error %q should mention ACCESS_LOG_SKIP_RE", err)
+	}
+}
+
+func TestLoad_AccessLogSkipRE_WhitespaceTreatedAsUnset(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("ACCESS_LOG_SKIP_RE", "  \n\t")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.AccessLogSkipRE != nil {
+		t.Errorf("whitespace-only ACCESS_LOG_SKIP_RE should be treated as unset, got %q", cfg.AccessLogSkipRE.String())
+	}
+}
+
 func TestLoad_MCPLogBodyMax_Negative(t *testing.T) {
 	setAllRequired(t)
 	t.Setenv("MCP_LOG_BODY_MAX", "-1")
@@ -468,6 +534,7 @@ func TestLoad_TrustProxyHeaders_Default(t *testing.T) {
 
 func TestLoad_TrustProxyHeaders_True(t *testing.T) {
 	setAllRequired(t)
+	t.Setenv("PROD_MODE", "false") // toggle being tested is a prod-mode violation
 	t.Setenv("TRUST_PROXY_HEADERS", "true")
 	cfg, err := Load()
 	if err != nil {
@@ -710,26 +777,30 @@ func TestLoad_ProxyBaseURL_RejectsOpaqueOrQuery(t *testing.T) {
 	}
 }
 
-// TestLoad_UpstreamMCPURL_Validation covers the strict validator:
-// same shape rules as PROXY_BASE_URL — origin-only (scheme + host +
-// port). A path is rejected because the proxy forwards the client
-// request path verbatim; an upstream path would either be ignored or
-// silently wrong.
+// TestLoad_UpstreamMCPURL_Validation covers the validator: absolute
+// http(s) URL with host, no userinfo/query/fragment/opaque. A path IS
+// allowed and becomes the proxy mount (verbatim both sides). A path
+// that collides with a control-plane route owned by the proxy is
+// rejected at startup.
 func TestLoad_UpstreamMCPURL_Validation(t *testing.T) {
 	cases := []struct {
 		url string
 		ok  bool
 	}{
-		{"http://mcp-backend:8080", true},
-		{"http://mcp-backend:8080/", true}, // root slash accepted as origin
-		{"http://mcp-backend:8080/api", false},
-		{"https://mcp.internal.example/mcp", false},
-		{"ftp://mcp-backend", false},
-		{"http:foo", false},             // opaque
-		{"http:///api", false},          // hostless
-		{"https://backend?x=1", false},  // query
-		{"https://u:p@backend", false},  // userinfo
-		{"https://backend#frag", false}, // fragment
+		{"http://mcp-backend:8080/mcp", true},
+		{"http://mcp-backend:8080/api", true},
+		{"https://mcp.internal.example/mcp", true},
+		{"https://mcp.internal.example/api/v1/mcp", true},
+		{"http://mcp-backend:8080", false},        // origin-only, no path
+		{"http://mcp-backend:8080/", false},       // lone "/" is not a mount
+		{"http://backend/token", false},           // collides with /token
+		{"http://backend/.well-known/foo", false}, // under reserved
+		{"ftp://mcp-backend/mcp", false},
+		{"http:foo", false},                 // opaque
+		{"http:///api", false},              // hostless
+		{"https://backend/mcp?x=1", false},  // query
+		{"https://u:p@backend/mcp", false},  // userinfo
+		{"https://backend/mcp#frag", false}, // fragment
 	}
 	for _, tc := range cases {
 		t.Run(tc.url, func(t *testing.T) {
@@ -741,6 +812,95 @@ func TestLoad_UpstreamMCPURL_Validation(t *testing.T) {
 			}
 			if !tc.ok && err == nil {
 				t.Fatalf("UPSTREAM_MCP_URL=%q should be rejected", tc.url)
+			}
+		})
+	}
+}
+
+// TestLoad_UpstreamMCPURL_OriginOnlyHint verifies the error message
+// on an origin-only URL includes a clean suggestion (no double slash
+// when the user supplied a trailing "/").
+func TestLoad_UpstreamMCPURL_OriginOnlyHint(t *testing.T) {
+	cases := []struct {
+		in         string
+		wantInHint string
+	}{
+		{"http://backend", `"http://backend/mcp"`},
+		{"http://backend/", `"http://backend/mcp"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			setAllRequired(t)
+			t.Setenv("UPSTREAM_MCP_URL", tc.in)
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("UPSTREAM_MCP_URL=%q should be rejected", tc.in)
+			}
+			if !strings.Contains(err.Error(), tc.wantInHint) {
+				t.Errorf("error hint should contain %s, got %q", tc.wantInHint, err)
+			}
+			if strings.Contains(err.Error(), "//mcp") {
+				t.Errorf("error hint contains double slash: %q", err)
+			}
+		})
+	}
+}
+
+// TestLoad_UpstreamMCPURL_MountPath verifies the derived MCP mount
+// path: the path component drives both the public proxy mount and the
+// per-resource discovery variants, with trailing-slash normalization.
+func TestLoad_UpstreamMCPURL_MountPath(t *testing.T) {
+	cases := []struct {
+		in        string
+		wantURL   string
+		wantMount string
+	}{
+		{"http://backend:8080/mcp", "http://backend:8080/mcp", "/mcp"},
+		{"http://backend:8080/mcp/", "http://backend:8080/mcp", "/mcp"},
+		{"http://backend:8080/api/v1/mcp", "http://backend:8080/api/v1/mcp", "/api/v1/mcp"},
+		{"http://backend:8080/api/v1/mcp/", "http://backend:8080/api/v1/mcp", "/api/v1/mcp"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			setAllRequired(t)
+			t.Setenv("UPSTREAM_MCP_URL", tc.in)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cfg.UpstreamMCPURL != tc.wantURL {
+				t.Errorf("UpstreamMCPURL = %q, want %q", cfg.UpstreamMCPURL, tc.wantURL)
+			}
+			if cfg.UpstreamMCPMountPath != tc.wantMount {
+				t.Errorf("UpstreamMCPMountPath = %q, want %q", cfg.UpstreamMCPMountPath, tc.wantMount)
+			}
+		})
+	}
+}
+
+// TestLoad_UpstreamMCPURL_RejectsRouterPatternChars pins the
+// chi-pattern guard: `:`, `*`, `{`, `}` in the mount path would
+// silently register router patterns instead of literal segments.
+// Reject at startup so an operator's typo doesn't turn /api/:v/mcp
+// into a path-parameter route.
+func TestLoad_UpstreamMCPURL_RejectsRouterPatternChars(t *testing.T) {
+	cases := []string{
+		"http://backend:8080/api/:v/mcp",
+		"http://backend:8080/api/*/mcp",
+		"http://backend:8080/api/{v}/mcp",
+		"http://backend:8080/mcp@1",
+		"http://backend:8080/mcp+sub",
+	}
+	for _, in := range cases {
+		t.Run(in, func(t *testing.T) {
+			setAllRequired(t)
+			t.Setenv("UPSTREAM_MCP_URL", in)
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("expected error for %q", in)
+			}
+			if !strings.Contains(err.Error(), "unreserved characters") {
+				t.Errorf("error %q should mention unreserved characters", err)
 			}
 		})
 	}
@@ -759,7 +919,12 @@ func TestLoad_ProdMode_BlocksUnsafeFlags(t *testing.T) {
 		{"compat_stateless", func(t *testing.T) { t.Setenv("COMPAT_ALLOW_STATELESS", "true") }},
 		{"redis_not_required", func(t *testing.T) { t.Setenv("REDIS_REQUIRED", "false") }},
 		{"redis_url_unset", func(t *testing.T) {
-			// REDIS_URL is empty by default; just ensure we don't set it.
+			// setAllRequired seeds a default REDIS_URL for PROD_MODE
+			// compatibility; clear it explicitly for this case.
+			t.Setenv("REDIS_URL", "")
+		}},
+		{"legacy_trust_proxy_headers", func(t *testing.T) {
+			t.Setenv("TRUST_PROXY_HEADERS", "true")
 		}},
 	}
 	for _, tc := range cases {
@@ -775,6 +940,25 @@ func TestLoad_ProdMode_BlocksUnsafeFlags(t *testing.T) {
 				t.Errorf("error should mention PROD_MODE, got %q", err)
 			}
 		})
+	}
+}
+
+func TestLoad_ProdMode_AllowsTrustProxyHeadersWithCIDRs(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("PROD_MODE", "true")
+	t.Setenv("REDIS_URL", "redis://localhost:6379/0")
+	t.Setenv("TRUST_PROXY_HEADERS", "true")
+	t.Setenv("TRUSTED_PROXY_CIDRS", "10.0.0.0/8")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("PROD_MODE with CIDR-scoped proxy trust should pass: %v", err)
+	}
+	if !cfg.TrustProxyHeaders {
+		t.Error("TrustProxyHeaders should still reflect the configured legacy flag")
+	}
+	if len(cfg.TrustedProxyCIDRs) != 1 {
+		t.Fatalf("TrustedProxyCIDRs len = %d, want 1", len(cfg.TrustedProxyCIDRs))
 	}
 }
 

@@ -18,7 +18,7 @@ func TestRegisterDiscoveryRoutes(t *testing.T) {
 	baseURL := "https://proxy.example.test"
 
 	r := chi.NewRouter()
-	registerDiscoveryRoutes(r, baseURL)
+	registerDiscoveryRoutes(r, baseURL, "/mcp", "")
 	// Simulate the production auth-gated catch-all. If any discovery
 	// path falls through to this, the assertion on the status will
 	// flag it (it writes 401 instead of the expected value).
@@ -66,12 +66,70 @@ func TestRegisterDiscoveryRoutes(t *testing.T) {
 	}
 }
 
+// TestRegisterDiscoveryRoutes_CustomMount exercises the full
+// parameterization for a non-default mount (e.g. /api/v1/mcp): the
+// per-resource PRM variant, the AS-meta compat variant, the openid
+// 404 variant, and the <mount>/.well-known/* under-resource carve-out
+// must all track the mount verbatim. The default "/mcp" paths must
+// NOT be served (they'd confuse clients about the canonical resource).
+func TestRegisterDiscoveryRoutes_CustomMount(t *testing.T) {
+	baseURL := "https://proxy.example.test"
+	mount := "/api/v1/mcp"
+	r := chi.NewRouter()
+	registerDiscoveryRoutes(r, baseURL, mount, "")
+	r.Group(func(r chi.Router) {
+		r.Use(func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusUnauthorized)
+			})
+		})
+		r.Handle("/*", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	})
+
+	cases := []struct {
+		name string
+		path string
+		want int
+	}{
+		{"prm_custom", "/.well-known/oauth-protected-resource/api/v1/mcp", http.StatusOK},
+		{"as_custom", "/.well-known/oauth-authorization-server/api/v1/mcp", http.StatusOK},
+		{"openid_custom_404", "/.well-known/openid-configuration/api/v1/mcp", http.StatusNotFound},
+		{"under_mount_wellknown_404", "/api/v1/mcp/.well-known/oauth-authorization-server", http.StatusNotFound},
+		// Default /mcp paths must NOT be served for a non-default
+		// mount — they fall through to the simulated auth catch-all.
+		{"prm_default_not_served", "/.well-known/oauth-protected-resource/mcp", http.StatusUnauthorized},
+		{"under_default_not_served", "/mcp/.well-known/oauth-authorization-server", http.StatusUnauthorized},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			rr := httptest.NewRecorder()
+			r.ServeHTTP(rr, req)
+			if rr.Code != tc.want {
+				t.Fatalf("%s: want %d, got %d (body=%q)", tc.path, tc.want, rr.Code, rr.Body.String())
+			}
+		})
+	}
+
+	// PRM "resource" field for the custom mount must be baseURL+mount.
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/oauth-protected-resource"+mount, nil)
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+	var meta map[string]any
+	if err := json.NewDecoder(rr.Body).Decode(&meta); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if want := baseURL + mount; meta["resource"] != want {
+		t.Errorf("resource: want %q, got %v", want, meta["resource"])
+	}
+}
+
 // TestWellKnownNotFound_JSONShape verifies the JSON-envelope 404 body
 // so clients that only parse JSON errors do not trip on a text/plain
 // "404 page not found" from net/http's default (M2).
 func TestWellKnownNotFound_JSONShape(t *testing.T) {
 	r := chi.NewRouter()
-	registerDiscoveryRoutes(r, "https://proxy.example.test")
+	registerDiscoveryRoutes(r, "https://proxy.example.test", "/mcp", "")
 
 	req := httptest.NewRequest(http.MethodGet, "/.well-known/openid-configuration", nil)
 	rr := httptest.NewRecorder()
@@ -99,7 +157,7 @@ func TestWellKnownNotFound_JSONShape(t *testing.T) {
 func TestRegisterDiscoveryRoutes_ResourceFields(t *testing.T) {
 	baseURL := "https://proxy.example.test"
 	r := chi.NewRouter()
-	registerDiscoveryRoutes(r, baseURL)
+	registerDiscoveryRoutes(r, baseURL, "/mcp", "")
 
 	cases := []struct {
 		path         string
