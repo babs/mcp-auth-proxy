@@ -1464,7 +1464,18 @@ func TestCallback_OIDCErrorResponse(t *testing.T) {
 // test seeds a real session, lets the IdP-error redirect-back path
 // fire, and asserts the sanitized description lands in the redirect
 // query string.
-func TestCallback_OIDCError_AllowlistAndSanitize(t *testing.T) {
+// TestCallback_OIDCError_AllowlistedErrorAndFixedDescription pins
+// two contracts on the validated-session IdP-error redirect:
+//
+//  1. The `error` code is allowlisted (RFC 6749 §4.1.2.1); anything
+//     outside the closed set collapses to `server_error`.
+//  2. The `error_description` is ALWAYS the fixed proxy-owned text,
+//     never the caller-supplied one — even after the sanitizer
+//     would have admitted it. C-M1: a phisher who can craft a
+//     /callback URL with arbitrary query params (and a fresh sealed
+//     state) must not be able to deliver attacker-controlled text
+//     into a legit MCP-client error UI under the proxy's branding.
+func TestCallback_OIDCError_AllowlistedErrorAndFixedDescription(t *testing.T) {
 	tm := newTestTokenManager(t)
 	oauth2Cfg := testOAuth2Config()
 	verifyFunc := func(_ context.Context, _ string) (*oidc.IDToken, error) {
@@ -1490,46 +1501,37 @@ func TestCallback_OIDCError_AllowlistAndSanitize(t *testing.T) {
 		return state
 	}
 
-	longDesc := strings.Repeat("A", 250) + "<will-be-trimmed>"
+	const fixedDesc = "authorization denied by identity provider"
 
 	tests := []struct {
 		name       string
 		errorParam string
 		descParam  string
 		wantErr    string
-		wantDescIs func(string) bool
 	}{
 		{
 			name:       "unknown_error_collapsed_to_server_error",
 			errorParam: "attacker-controlled_value",
 			descParam:  "hi",
 			wantErr:    "server_error",
-			wantDescIs: func(s string) bool { return s == "hi" },
 		},
 		{
-			name:       "description_truncated_to_200",
+			name:       "phishing_description_replaced",
 			errorParam: "access_denied",
-			descParam:  longDesc,
+			descParam:  "Visit https://attacker.example/login to recover your session",
 			wantErr:    "access_denied",
-			wantDescIs: func(s string) bool { return len(s) == 200 && strings.HasPrefix(s, "AAAA") },
 		},
 		{
-			name:       "crlf_stripped",
+			name:       "long_description_replaced",
+			errorParam: "access_denied",
+			descParam:  strings.Repeat("A", 250),
+			wantErr:    "access_denied",
+		},
+		{
+			name:       "crlf_description_replaced",
 			errorParam: "invalid_request",
 			descParam:  "line1\r\nline2",
 			wantErr:    "invalid_request",
-			wantDescIs: func(s string) bool {
-				return !strings.ContainsAny(s, "\r\n") && strings.Contains(s, "line1line2")
-			},
-		},
-		{
-			name:       "non_ascii_stripped",
-			errorParam: "access_denied",
-			descParam:  "café naïve",
-			wantErr:    "access_denied",
-			wantDescIs: func(s string) bool {
-				return strings.Contains(s, "caf") && !strings.ContainsRune(s, 'é')
-			},
 		},
 	}
 
@@ -1551,13 +1553,11 @@ func TestCallback_OIDCError_AllowlistAndSanitize(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parse Location: %v", err)
 			}
-			gotErr := loc.Query().Get("error")
-			gotDesc := loc.Query().Get("error_description")
-			if gotErr != tc.wantErr {
-				t.Errorf("error = %q, want %q", gotErr, tc.wantErr)
+			if got := loc.Query().Get("error"); got != tc.wantErr {
+				t.Errorf("error = %q, want %q", got, tc.wantErr)
 			}
-			if !tc.wantDescIs(gotDesc) {
-				t.Errorf("unexpected error_description %q", gotDesc)
+			if got := loc.Query().Get("error_description"); got != fixedDesc {
+				t.Errorf("error_description = %q, want fixed text %q", got, fixedDesc)
 			}
 		})
 	}
@@ -4069,7 +4069,17 @@ func TestCallback_IdPError_NoSession_DoesNotReflectAttackerDescription(t *testin
 // supplied (sanitized) error_description is forwarded to the
 // client — operators of legit clients want to see why the IdP
 // refused.
-func TestCallback_IdPError_WithSession_ForwardsDescription(t *testing.T) {
+// TestCallback_IdPError_WithSession_ReplacesAttackerDescription
+// pins C-M1: even when the sealed state opens cleanly, the
+// `error_description` from /callback is fully attacker-controlled
+// (anyone can craft the URL once they know or steal a state).
+// The handler MUST substitute a fixed description on the redirect
+// path so the registered redirect_uri never receives
+// caller-controlled phishing text under the proxy's branding.
+// The RFC 6749 §4.1.2.1 `error` code is still allowlisted and
+// forwarded verbatim — clients need it for machine-readable
+// branching.
+func TestCallback_IdPError_WithSession_ReplacesAttackerDescription(t *testing.T) {
 	tm := newTestTokenManager(t)
 	logger := zap.NewNop()
 
@@ -4087,8 +4097,9 @@ func TestCallback_IdPError_WithSession_ForwardsDescription(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seal session: %v", err)
 	}
+	const phishingPayload = "Visit https://attacker.example/login to recover your session"
 	target := "/callback?error=access_denied&error_description=" +
-		url.QueryEscape("user denied scope") +
+		url.QueryEscape(phishingPayload) +
 		"&state=" + url.QueryEscape(state)
 	req := httptest.NewRequest(http.MethodGet, target, nil)
 	rr := httptest.NewRecorder()
@@ -4101,8 +4112,18 @@ func TestCallback_IdPError_WithSession_ForwardsDescription(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse Location: %v", err)
 	}
-	if got := loc.Query().Get("error_description"); got != "user denied scope" {
-		t.Errorf("forwarded error_description = %q, want %q", got, "user denied scope")
+	got := loc.Query().Get("error_description")
+	if strings.Contains(got, "attacker.example") || strings.Contains(got, phishingPayload) {
+		t.Errorf("attacker-controlled text leaked into redirect: error_description=%q", got)
+	}
+	if got != "authorization denied by identity provider" {
+		t.Errorf("error_description = %q, want fixed text", got)
+	}
+	if errCode := loc.Query().Get("error"); errCode != "access_denied" {
+		t.Errorf("error code lost on redirect: got %q, want access_denied", errCode)
+	}
+	if st := loc.Query().Get("state"); st != "client-state" {
+		t.Errorf("state lost on redirect: got %q", st)
 	}
 }
 

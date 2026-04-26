@@ -119,31 +119,30 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 
 		if idpError != "" {
 			safeError := normalizeIdPError(idpError)
+			// `error_description` from a /callback hit is fully
+			// attacker-controlled — anyone can craft a /callback URL
+			// with arbitrary query params even after stealing or
+			// guessing a fresh sealed state. The sanitizer strips
+			// control bytes, but ASCII URLs / phishing instructions
+			// survive intact. Forwarding it to the client (in either
+			// the redirect or the JSON body) would let a phisher
+			// host attacker text on a legit-domain page or have it
+			// rendered inside a legit MCP-client error UI under the
+			// proxy's branding. Substitute a fixed description on
+			// both branches so neither response carries
+			// caller-controlled text. The RFC 6749 §4.1.2.1 `error`
+			// code is still allowlisted and forwarded so a client's
+			// machine-readable handling stays useful.
+			fixedDesc := "authorization denied by identity provider"
 			var idpSession sealedSession
 			if internalState != "" &&
 				tm.OpenJSON(internalState, &idpSession, token.PurposeSession) == nil &&
 				idpSession.Typ == token.PurposeSession &&
 				idpSession.Audience == audience &&
 				time.Now().Before(idpSession.ExpiresAt) {
-				// Session validated — the registered redirect_uri is
-				// trusted, so forward the IdP-supplied (sanitized)
-				// error_description to the client. Operators of legit
-				// clients want to see why the IdP refused.
-				desc := sanitizeErrorDescription(q.Get("error_description"))
-				if desc == "" {
-					desc = "authorization denied by identity provider"
-				}
-				redirectAuthzError(w, r, idpSession.RedirectURI, idpSession.OriginalState, safeError, desc, audience)
+				redirectAuthzError(w, r, idpSession.RedirectURI, idpSession.OriginalState, safeError, fixedDesc, audience)
 				return
 			}
-			// No-session fail-open: the IdP redirect's `error_description`
-			// is fully attacker-controlled (anyone can craft a /callback
-			// URL with arbitrary query params). Rendering it back inside a
-			// JSON 400 on the proxy's own origin would let a phisher
-			// host attacker text on a legit-domain page. The sanitizer
-			// strips control bytes but ASCII URLs / instructions survive.
-			// Substitute a fixed description so the response carries no
-			// caller-controlled text on this path.
 			writeOAuthError(w, http.StatusBadRequest, safeError, "authorization request could not be matched to a known session")
 			return
 		}
