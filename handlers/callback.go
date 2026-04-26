@@ -200,6 +200,7 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 		idToken, err := verify(r.Context(), rawIDToken)
 		if err != nil {
 			logger.Error("id_token_verification_failed", zap.Error(err))
+			metrics.AccessDenied.WithLabelValues("id_token_verification_failed").Inc()
 			writeOAuthError(w, http.StatusBadGateway, "server_error", "id token verification failed", "id_token_verification_failed")
 			return
 		}
@@ -220,6 +221,11 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 				zap.String("subject", idToken.Subject),
 				zap.String("reason", reason),
 			)
+			// Same denial reason as the verifier failure above:
+			// runbooks treat both as "id_token_verification_failed"
+			// for alerting because the operator response is the
+			// same (check the IdP signing keys, scope, audience).
+			metrics.AccessDenied.WithLabelValues("id_token_verification_failed").Inc()
 			writeOAuthError(w, http.StatusForbidden, "server_error", "id token nonce mismatch", "id_token_verification_failed")
 			return
 		}

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -12,10 +13,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/babs/mcp-auth-proxy/metrics"
 	"github.com/babs/mcp-auth-proxy/replay"
 	"github.com/babs/mcp-auth-proxy/token"
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 	"golang.org/x/oauth2"
 )
@@ -2911,6 +2914,106 @@ func TestTokenRefresh_LegacyZeroFamilyIssuedAt_FallsBackToIssuedAt(t *testing.T)
 	Token(tm, logger, testBaseURL, cutoff, nil)(rr2, req2)
 	if rr2.Code != http.StatusBadRequest {
 		t.Fatalf("REVOKE_BEFORE on legacy refresh: want 400, got %d: %s", rr2.Code, rr2.Body.String())
+	}
+}
+
+// failingReplayStore is a Store that always fails. Used to drive the
+// replay-store-unavailable branch in /token without needing a real
+// Redis outage.
+type failingReplayStore struct{ err error }
+
+func (f *failingReplayStore) ClaimOnce(_ context.Context, _ string, _ time.Duration) error {
+	return f.err
+}
+func (f *failingReplayStore) Mark(_ context.Context, _ string, _ time.Duration) error {
+	return f.err
+}
+func (f *failingReplayStore) Exists(_ context.Context, _ string) (bool, error) {
+	return false, f.err
+}
+func (f *failingReplayStore) ClaimOrCheckFamily(_ context.Context, _, _ string, _, _ time.Duration) (bool, bool, error) {
+	return false, false, f.err
+}
+func (f *failingReplayStore) Close() error { return nil }
+
+// TestToken_ReplayStoreUnavailable_IncrementsAccessDenied pins R1-M2:
+// both grant paths must increment
+// mcp_auth_access_denied_total{reason="replay_store_unavailable"}
+// when the replay store fails, so the operator alert documented in
+// docs/runbooks/redis-outage.md actually fires.
+func TestToken_ReplayStoreUnavailable_IncrementsAccessDenied(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+	store := &failingReplayStore{err: errors.New("redis: connection refused")}
+
+	encClientID, internalID := registerClient(t, tm, []string{"https://app.example.com/callback"})
+
+	cases := []struct {
+		name     string
+		buildReq func() *http.Request
+	}{
+		{
+			name: "authorization_code_grant",
+			buildReq: func() *http.Request {
+				codeVerifier := "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+				codeChallenge := pkceChallenge(codeVerifier)
+				redirectURI := "https://app.example.com/callback"
+				sc := sealedCode{
+					TokenID:       uuid.New().String(),
+					FamilyID:      uuid.New().String(),
+					ClientID:      internalID,
+					RedirectURI:   redirectURI,
+					CodeChallenge: codeChallenge,
+					Subject:       "user-sub",
+					Email:         "user@example.com",
+					Typ:           token.PurposeCode,
+					Audience:      testBaseURL,
+					ExpiresAt:     time.Now().Add(60 * time.Second),
+				}
+				authCode, err := tm.SealJSON(sc, token.PurposeCode)
+				if err != nil {
+					t.Fatalf("SealJSON: %v", err)
+				}
+				form := url.Values{
+					"grant_type":    {"authorization_code"},
+					"code":          {authCode},
+					"redirect_uri":  {redirectURI},
+					"client_id":     {encClientID},
+					"code_verifier": {codeVerifier},
+				}
+				req := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(form.Encode()))
+				req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+				return req
+			},
+		},
+		{
+			name: "refresh_token_grant",
+			buildReq: func() *http.Request {
+				refreshTokenStr := sealRefresh(t, tm, "user-sub", "user@example.com", internalID)
+				form := url.Values{
+					"grant_type":    {"refresh_token"},
+					"refresh_token": {refreshTokenStr},
+					"client_id":     {encClientID},
+				}
+				req := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(form.Encode()))
+				req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+				return req
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			before := testutil.ToFloat64(metrics.AccessDenied.WithLabelValues("replay_store_unavailable"))
+			rr := httptest.NewRecorder()
+			Token(tm, logger, testBaseURL, time.Time{}, store)(rr, tc.buildReq())
+			if rr.Code != http.StatusServiceUnavailable {
+				t.Fatalf("want 503, got %d: %s", rr.Code, rr.Body.String())
+			}
+			after := testutil.ToFloat64(metrics.AccessDenied.WithLabelValues("replay_store_unavailable"))
+			if after-before != 1 {
+				t.Errorf("AccessDenied{replay_store_unavailable} delta = %v, want 1", after-before)
+			}
+		})
 	}
 }
 
