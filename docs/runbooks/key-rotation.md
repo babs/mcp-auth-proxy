@@ -8,9 +8,15 @@ secondary keys accept existing ones for the bleed-in window.
 
 ## When
 
-- **Scheduled:** every 12 months. Seal counter approaches 2^32 (AES-GCM
-  random-nonce collision bound); the proxy already emits
-  `token_seal_rotation_threshold` at 2^28 as a heads-up.
+- **Scheduled:** every 12 months OR when fleet-wide cumulative seals
+  approach 2^28. The in-process `token_seal_rotation_threshold` log
+  fires at 2^28 per replica only — a frequently-rolled pod never
+  reaches it. Use the Prometheus counter for the cross-replica view:
+  ```
+  sum(increase(mcp_auth_token_seals_total[7d])) > 2**28
+  ```
+  Crossing this means rotate now — AES-GCM with random 96-bit nonces
+  approaches collision risk around 2^32 messages per key.
 - **Incident:** any credible suspicion the secret leaked (shared-secret
   store incident, accidental commit, compromised operator workstation).
   Treat as emergency — see _Emergency path_ below.

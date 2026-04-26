@@ -228,6 +228,13 @@ rollout notes, and K8s deployment shape.
     groups. Distinct from `access_denied` because no denial occurs —
     surfaces an IdP schema regression before it cascades into a
     `group` denial spike
+  - `mcp_auth_token_seals_total{purpose}` — successful AES-GCM seal
+    operations, labelled by purpose (`client` / `session` / `code` /
+    `access` / `refresh`). Aggregate across replicas to track
+    cumulative seals per signing key — alert on
+    `sum(increase(mcp_auth_token_seals_total[7d])) > 2**28` and rotate
+    `TOKEN_SIGNING_SECRET` before the per-key 2^32 nonce-collision
+    bound becomes a concern
 - **Health** — `GET /healthz` (liveness, public router) and
   `GET /readyz` (on the metrics port; reflects Redis reachability when
   `REDIS_URL` is set, cached ~1s to resist probe-flood amplification).

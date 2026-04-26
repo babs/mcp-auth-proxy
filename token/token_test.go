@@ -1,6 +1,7 @@
 package token
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -250,6 +251,61 @@ func TestSealCount_IncrementsOnEverySeal(t *testing.T) {
 	}
 	if got := m.SealCount(); got != 6 {
 		t.Errorf("SealCount after Issue = %d, want 6", got)
+	}
+}
+
+// TestSealMetric_InvokedPerPurpose pins the cross-replica
+// observability hook for the AES-GCM seal-rotation budget. The
+// in-process sealCount resets on every pod restart, so a frequently-
+// rolled deployment never reaches the 2^28 warning. The metric
+// callback fires on every seal labelled by purpose, letting Prometheus
+// aggregate fleet-wide via increase(metric[window]).
+func TestSealMetric_InvokedPerPurpose(t *testing.T) {
+	m := mustNewManager(t, make([]byte, 32))
+
+	var mu sync.Mutex
+	got := map[string]int{}
+	m.SetSealMetric(func(purpose string) {
+		mu.Lock()
+		got[purpose]++
+		mu.Unlock()
+	})
+
+	if _, err := m.SealJSON(map[string]int{"x": 1}, PurposeClient); err != nil {
+		t.Fatalf("SealJSON client: %v", err)
+	}
+	if _, err := m.SealJSON(map[string]int{"x": 2}, PurposeSession); err != nil {
+		t.Fatalf("SealJSON session: %v", err)
+	}
+	if _, err := m.SealJSON(map[string]int{"x": 3}, PurposeSession); err != nil {
+		t.Fatalf("SealJSON session 2: %v", err)
+	}
+	// Issue seals an access token too.
+	if _, _, err := m.Issue("aud", "sub", "e@e", "cid", nil, time.Minute); err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := map[string]int{
+		PurposeClient:  1,
+		PurposeSession: 2,
+		PurposeAccess:  1,
+	}
+	for p, w := range want {
+		if got[p] != w {
+			t.Errorf("seal metric purpose=%q: got %d, want %d", p, got[p], w)
+		}
+	}
+}
+
+// TestSealMetric_NilCallback is a no-op (the hot path must not panic
+// when SetSealMetric is never called — the default state for tests
+// and for callers that don't wire metrics).
+func TestSealMetric_NilCallback(t *testing.T) {
+	m := mustNewManager(t, make([]byte, 32))
+	if _, err := m.SealJSON(map[string]int{"x": 1}, PurposeClient); err != nil {
+		t.Fatalf("SealJSON without metric: %v", err)
 	}
 }
 

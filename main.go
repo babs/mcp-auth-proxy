@@ -124,8 +124,15 @@ func main() {
 		)
 	}
 	// Attach a logger so the one-shot seal-rotation threshold warning
-	// fires at 2^28 seals (L6).
+	// fires at 2^28 seals (L6). The Prometheus seal-counter (M2)
+	// observes every seal across replicas — the in-process counter
+	// resets on restart, so a frequently-rolled pod would never reach
+	// the warning even when fleet-wide cumulative seals do; the metric
+	// closes that gap via increase(metric[window]).
 	tm.SetLogger(logger)
+	tm.SetSealMetric(func(purpose string) {
+		metrics.TokenSeals.WithLabelValues(purpose).Inc()
+	})
 
 	// Optional replay protection: when REDIS_URL is set, authorization codes
 	// become single-use across all replicas. When unset, behavior is stateless

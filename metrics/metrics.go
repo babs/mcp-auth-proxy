@@ -55,4 +55,20 @@ var (
 		Name: "mcp_auth_groups_claim_shape_mismatch_total",
 		Help: "ID-token groups claim failed to decode as []string; user was admitted with empty groups.",
 	})
+
+	// TokenSeals counts successful AES-GCM seal operations, labelled by
+	// purpose (client / session / code / access / refresh). Aggregating
+	// across replicas via Prometheus solves the per-process seal-counter
+	// blind spot: the in-process counter resets on every restart, so a
+	// pod that rolls daily never approaches its 2^28 one-replica
+	// threshold even when fleet-wide cumulative seals do. Alert example:
+	//   sum(increase(mcp_auth_token_seals_total[7d])) > 2^28
+	// Crossing this is the operator signal to rotate
+	// TOKEN_SIGNING_SECRET via the rolling-rotation runbook —
+	// AES-GCM with random 96-bit nonces approaches collision risk
+	// around 2^32 messages per key.
+	TokenSeals = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "mcp_auth_token_seals_total",
+		Help: "AES-GCM seal operations on the primary signing secret, by purpose. Aggregate across replicas to track cumulative seals per key.",
+	}, []string{"purpose"})
 )

@@ -91,6 +91,12 @@ type Manager struct {
 	// logger is optional; when nil no warning is emitted (tests). Set via
 	// SetLogger after construction so existing callers stay ABI-compatible.
 	logger *zap.Logger
+	// sealMetric is an optional per-seal observer used to feed the
+	// Prometheus mcp_auth_token_seals_total counter. Stored as a
+	// callback (rather than a *prometheus.CounterVec) so the token
+	// package keeps zero dependency on the metrics package — the
+	// startup wiring in main.go provides the closure.
+	sealMetric func(purpose string)
 }
 
 // NewManager creates a token manager from a single signing secret
@@ -146,6 +152,15 @@ func (m *Manager) SetLogger(l *zap.Logger) {
 	m.logger = l
 }
 
+// SetSealMetric attaches a per-seal observer (typically a Prometheus
+// CounterVec.WithLabelValues call) that the Manager invokes on every
+// successful seal, labelled by purpose. Decouples the token package
+// from the metrics package; main.go wires the actual counter at
+// startup. Passing nil disables observation (tests).
+func (m *Manager) SetSealMetric(fn func(purpose string)) {
+	m.sealMetric = fn
+}
+
 // SealCount returns the current number of successful seals. Exposed for
 // tests and operator introspection; not part of the OAuth flow.
 func (m *Manager) SealCount() uint64 {
@@ -162,11 +177,20 @@ func (m *Manager) seal(data []byte, purpose string) (string, error) {
 	}
 	ciphertext := m.primary.Seal(nonce, nonce, data, []byte(purpose))
 
-	// L6: count successful seals per Manager. When the count crosses the
-	// rotation threshold we fire a single warning — AES-GCM with 96-bit
-	// random nonces starts to accumulate nontrivial collision risk in the
-	// 2^32 range; 2^28 gives the operator headroom to rotate before the
-	// bound is approached.
+	// L6: count successful seals per Manager. When the in-process count
+	// crosses the rotation threshold we fire a single warning — AES-GCM
+	// with 96-bit random nonces starts to accumulate nontrivial collision
+	// risk in the 2^32 range; 2^28 gives the operator headroom to rotate
+	// before the bound is approached.
+	//
+	// The in-process counter is per-replica and resets on restart, so a
+	// pod that rolls frequently never reaches the warning even when
+	// fleet-wide cumulative seals would. The mcp_auth_token_seals_total
+	// Prometheus counter (labelled by purpose) fixes that gap: scraped
+	// across replicas, it gives the operator a true cumulative-per-key
+	// view via increase(metric[window]). The in-process warning stays
+	// as a belt-and-braces signal for single-replica or unscraped
+	// deployments.
 	if n := m.sealCount.Add(1); n == sealRotationThreshold {
 		if m.logger != nil && m.warnedOnce.CompareAndSwap(false, true) {
 			m.logger.Warn("token_seal_rotation_threshold",
@@ -175,6 +199,9 @@ func (m *Manager) seal(data []byte, purpose string) (string, error) {
 				zap.String("hint", "rotate TOKEN_SIGNING_SECRET; AES-GCM nonce safety bound approaches"),
 			)
 		}
+	}
+	if m.sealMetric != nil {
+		m.sealMetric(purpose)
 	}
 	return base64.RawURLEncoding.EncodeToString(ciphertext), nil
 }
