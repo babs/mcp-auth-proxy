@@ -90,8 +90,11 @@ docker run --rm -p 8080:8080 -p 9090:9090 \
   -e PROXY_BASE_URL=https://mcp.example.com \
   -e UPSTREAM_MCP_URL=http://mcp-server:8080/mcp \
   -e TOKEN_SIGNING_SECRET=$(openssl rand -hex 32) \
+  -e REDIS_URL=redis://redis:6379/0 \
   ghcr.io/babs/mcp-auth-proxy:latest
 ```
+
+`PROD_MODE` defaults to `true` — the proxy fails startup unless `REDIS_URL` is set (single-use codes + refresh-rotation reuse detection). For a single-replica dev run without Redis, add `-e PROD_MODE=false -e REDIS_REQUIRED=false` instead.
 
 ### From source
 
@@ -211,13 +214,20 @@ rollout notes, and K8s deployment shape.
   exposed through the public router). Alongside the default Go runtime
   counters, the proxy emits:
   - `mcp_auth_tokens_issued_total{grant_type}` — access tokens minted
-  - `mcp_auth_access_denied_total{reason}` — group / `email_unverified`
-    / `refresh_family_revoked` / `state_missing` / `subject_missing` /
-    `subject_concurrency_exceeded` rejections
+  - `mcp_auth_access_denied_total{reason}` — `group` / `group_invalid` /
+    `email_unverified` / `refresh_family_revoked` / `state_missing` /
+    `subject_missing` / `subject_concurrency_exceeded` /
+    `invalid_token` / `audience_mismatch` / `token_revoked_iat_cutoff`
+    rejections
   - `mcp_auth_replay_detected_total{kind}` — `code` or `refresh` replays
     caught by the Redis-backed store
   - `mcp_auth_rate_limited_total{endpoint}` — httprate 429s by endpoint
   - `mcp_auth_clients_registered_total` — RFC 7591 registrations
+  - `mcp_auth_groups_claim_shape_mismatch_total` — id_token `groups`
+    claim failed to decode as `[]string`; user is admitted with empty
+    groups. Distinct from `access_denied` because no denial occurs —
+    surfaces an IdP schema regression before it cascades into a
+    `group` denial spike
 - **Health** — `GET /healthz` (liveness, public router) and
   `GET /readyz` (on the metrics port; reflects Redis reachability when
   `REDIS_URL` is set, cached ~1s to resist probe-flood amplification).

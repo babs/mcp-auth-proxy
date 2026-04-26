@@ -22,6 +22,12 @@ func Discovery(baseURL string) http.HandlerFunc {
 		// privilege requests sees a concrete "no scopes" answer rather
 		// than having to probe.
 		"scopes_supported": []string{},
+		// RFC 9207 §3 / RFC 9700 §2.1.4 (mix-up defense). The /callback
+		// redirect emits the `iss` parameter on every authorization
+		// response (success AND error). Strict clients gate the check
+		// on this metadata flag — if it's missing, they ignore `iss`
+		// and the defense is silently disabled. We always emit it.
+		"authorization_response_iss_parameter_supported": true,
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {

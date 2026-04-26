@@ -149,7 +149,15 @@ func (s *MemoryStore) ClaimOrCheckFamily(_ context.Context, familyKey, claimKey 
 		// invariant "alreadyClaimed ⇒ family revoked" holds without
 		// relying on a second handler-driven write.
 		if _, exists := s.entries[familyKey]; !exists && !s.hasRoomLocked(now) {
-			return false, true, ErrStoreFull
+			// Cannot satisfy the alreadyClaimed-implies-family-
+			// revoked contract under cap pressure. Surface as an
+			// error and report alreadyClaimed=false so a future
+			// caller that reads the bools first (instead of err
+			// first) cannot conclude the family is revoked when it
+			// isn't. The handler treats err != nil as a 503 anyway,
+			// so no token is issued — the contract gap is the
+			// observable risk, not a token leak.
+			return false, false, ErrStoreFull
 		}
 		s.entries[familyKey] = now.Add(familyTTL)
 		return false, true, nil

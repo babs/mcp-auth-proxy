@@ -214,6 +214,13 @@ func TestDiscovery(t *testing.T) {
 			t.Errorf("missing field %s", k)
 		}
 	}
+
+	// RFC 9207 §3 / RFC 9700 §2.1.4: when the AS emits `iss` on
+	// authorization responses, it MUST advertise the metadata flag
+	// or strict clients will skip the check.
+	if got, ok := meta["authorization_response_iss_parameter_supported"].(bool); !ok || !got {
+		t.Errorf("authorization_response_iss_parameter_supported: want true, got %v", meta["authorization_response_iss_parameter_supported"])
+	}
 }
 
 // --- Register ---
@@ -3334,6 +3341,13 @@ func TestCallback_IdPError_ForwardsToRedirectURI(t *testing.T) {
 	}
 	if q.Get("error_description") == "" {
 		t.Error("want non-empty error_description")
+	}
+	// RFC 9207 §2 / RFC 9700 §2.1.4: `iss` MUST be on EVERY authorization
+	// response, including error redirects. Strict clients gate the mix-up
+	// defense on this — omitting it on the error path lets a forged error
+	// from a different AS pass undetected.
+	if iss := q.Get("iss"); iss != testBaseURL {
+		t.Errorf("want iss=%q on error redirect, got %q", testBaseURL, iss)
 	}
 }
 

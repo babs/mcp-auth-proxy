@@ -134,7 +134,13 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func writeOAuthError(w http.ResponseWriter, status int, code, desc string, errorCode ...string) {
-	oauthErr := OAuthError{Error: code, ErrorDescription: desc}
+	// Defense in depth: clamp + strip control bytes at the sink so a
+	// future caller piping caller-controlled data through (e.g. an
+	// upstream IdP message, a config-supplied prefix) cannot inject
+	// CR/LF into the JSON body — and, via writeAuthError, into the
+	// WWW-Authenticate header. Every current caller passes a static
+	// literal that's a no-op under this filter.
+	oauthErr := OAuthError{Error: code, ErrorDescription: sanitizeErrorDescription(desc)}
 	if len(errorCode) > 0 {
 		oauthErr.ErrorCode = errorCode[0]
 	}

@@ -129,7 +129,7 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 				idpSession.Typ == token.PurposeSession &&
 				idpSession.Audience == audience &&
 				time.Now().Before(idpSession.ExpiresAt) {
-				redirectIdPError(w, r, idpSession.RedirectURI, idpSession.OriginalState, safeError, desc)
+				redirectIdPError(w, r, idpSession.RedirectURI, idpSession.OriginalState, safeError, desc, audience)
 				return
 			}
 			writeOAuthError(w, http.StatusBadRequest, safeError, desc)
@@ -270,7 +270,13 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 			if err := idToken.Claims(&raw); err == nil {
 				if v, ok := raw[cbCfg.GroupsClaim]; ok {
 					if err := json.Unmarshal(v, &groups); err != nil {
-						metrics.AccessDenied.WithLabelValues("group_shape").Inc()
+						// Distinct counter: the user is admitted with
+						// empty groups — this is NOT a denial. Sharing
+						// the AccessDenied counter would conflate IdP
+						// shape drift with real auth-policy denials and
+						// double-count when the empty-groups admit later
+						// trips an AllowedGroups mismatch.
+						metrics.GroupsClaimShapeMismatch.Inc()
 						logger.Warn("groups_claim_shape_mismatch",
 							zap.String("claim", cbCfg.GroupsClaim),
 							zap.String("subject", claims.Sub),
@@ -377,11 +383,16 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 // redirectIdPError forwards an RFC 6749 §4.1.2.1 error back to the
 // client's registered redirect_uri, carrying OriginalState so the
 // client can correlate, and stripping any fragment (defense-in-depth;
-// DCR already rejects fragment-bearing URIs). On a parse failure we
+// DCR already rejects fragment-bearing URIs). The `iss` parameter is
+// emitted on error redirects too (RFC 9207 §2 / RFC 9700 §2.1.4): a
+// strict client gates its mix-up defense on `iss` being present on
+// EVERY authorization response, not just success — omitting it on the
+// error path defeats the defense exactly when an attacker would want
+// to inject a forged error from a different AS. On a parse failure we
 // fall back to a proxy-hosted JSON body — the registered URI went
 // through exact-match validation at /authorize, so a parse error here
 // is an invariant violation rather than attacker-controlled input.
-func redirectIdPError(w http.ResponseWriter, r *http.Request, redirectURI, state, errCode, errDesc string) {
+func redirectIdPError(w http.ResponseWriter, r *http.Request, redirectURI, state, errCode, errDesc, audience string) {
 	u, err := url.Parse(redirectURI)
 	if err != nil {
 		writeOAuthError(w, http.StatusBadRequest, errCode, errDesc)
@@ -395,6 +406,7 @@ func redirectIdPError(w http.ResponseWriter, r *http.Request, redirectURI, state
 	if state != "" {
 		q.Set("state", state)
 	}
+	q.Set("iss", audience)
 	u.RawQuery = q.Encode()
 	u.Fragment = ""
 	u.RawFragment = ""

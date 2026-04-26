@@ -44,4 +44,15 @@ var (
 		Name: "mcp_auth_rate_limited_total",
 		Help: "Requests rejected by the per-IP rate limiter, by endpoint.",
 	}, []string{"endpoint"})
+
+	// GroupsClaimShapeMismatch counts id_tokens whose `groups` claim
+	// did not decode as []string. Distinct from AccessDenied because
+	// the request is NOT denied on this path — the proxy admits with
+	// an empty groups list. Operators alert on this independently to
+	// catch IdP schema migrations / claim-shape regressions before
+	// they cascade into a real `group` denial spike.
+	GroupsClaimShapeMismatch = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "mcp_auth_groups_claim_shape_mismatch_total",
+		Help: "ID-token groups claim failed to decode as []string; user was admitted with empty groups.",
+	})
 )
