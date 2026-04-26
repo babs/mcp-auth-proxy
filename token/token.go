@@ -206,7 +206,12 @@ func (m *Manager) seal(data []byte, purpose string) (string, error) {
 	// view via increase(metric[window]). The in-process warning stays
 	// as a belt-and-braces signal for single-replica or unscraped
 	// deployments.
-	if n := m.sealCount.Add(1); n == sealRotationThreshold {
+	// `>=` rather than `==`: under concurrent seals, two Add(1) calls
+	// can return n=threshold-1 and n=threshold+1 with no goroutine
+	// observing the exact value. The CompareAndSwap on warnedOnce
+	// still keeps the warning one-shot — this just guarantees the
+	// first crossing always trips it.
+	if n := m.sealCount.Add(1); n >= sealRotationThreshold {
 		if m.logger != nil && m.warnedOnce.CompareAndSwap(false, true) {
 			m.logger.Warn("token_seal_rotation_threshold",
 				zap.Uint64("seal_count", n),

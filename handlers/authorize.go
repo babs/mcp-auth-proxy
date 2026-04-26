@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/babs/mcp-auth-proxy/metrics"
@@ -67,6 +68,14 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 		codeChallenge := q.Get("code_challenge")
 		codeChallengeMethod := q.Get("code_challenge_method")
 		state := q.Get("state")
+
+		// OIDC params the proxy doesn't forward upstream are silently
+		// dropped. Log at debug so an operator who notices a client
+		// trying `prompt=none` (SSO-silent flow) or other forwarding-
+		// dependent params can decide whether to add explicit support
+		// before the client UX gets confused. Pure observability —
+		// no behaviour change.
+		logUnknownOIDCParams(logger, q)
 
 		// === Phase 1: validate client_id + redirect_uri (JSON on failure). ===
 		// Per RFC 6749 §4.1.2.1, an unauthenticated redirect target must
@@ -248,5 +257,57 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 
 		logger.Debug("idp_redirect", zap.String("internal_client_id", client.ID))
 		http.Redirect(w, r, authURL, http.StatusFound)
+	}
+}
+
+// knownOIDCAuthorizeParams enumerates query parameters this proxy
+// recognises on /authorize. Anything outside the set is silently
+// dropped (the proxy does not forward arbitrary OIDC params upstream
+// today). Listed by name so logUnknownOIDCParams emits one debug
+// line per drop — operators get a signal when a client tries
+// `prompt=none` or similar before the missing-forwarding bites them.
+var knownOIDCAuthorizeParams = map[string]struct{}{
+	"response_type":         {},
+	"client_id":             {},
+	"redirect_uri":          {},
+	"code_challenge":        {},
+	"code_challenge_method": {},
+	"state":                 {},
+	"resource":              {},
+	"scope":                 {},
+}
+
+// commonOIDCExtensionParams lists OIDC extension parameters the
+// proxy explicitly recognises as "known but not forwarded" so the
+// debug log distinguishes "client used a real OIDC param we
+// dropped" from "client sent a typo". Keeps the log line useful as
+// an operator signal rather than noise.
+var commonOIDCExtensionParams = map[string]struct{}{
+	"prompt":        {},
+	"id_token_hint": {},
+	"login_hint":    {},
+	"acr_values":    {},
+	"claims":        {},
+	"display":       {},
+	"ui_locales":    {},
+	"max_age":       {},
+	"request":       {},
+	"request_uri":   {},
+	"nonce":         {},
+}
+
+func logUnknownOIDCParams(logger *zap.Logger, q url.Values) {
+	for name := range q {
+		if _, known := knownOIDCAuthorizeParams[name]; known {
+			continue
+		}
+		category := "unknown"
+		if _, ext := commonOIDCExtensionParams[name]; ext {
+			category = "oidc_extension_not_forwarded"
+		}
+		logger.Debug("authorize_param_dropped",
+			zap.String("param", name),
+			zap.String("category", category),
+		)
 	}
 }

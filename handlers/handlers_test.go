@@ -4267,6 +4267,44 @@ func TestToken_RejectsURLQueryParams(t *testing.T) {
 	}
 }
 
+// TestToken_RejectsAuthorizationHeader pins R1-L1: discovery
+// advertises token_endpoint_auth_methods_supported=["none"] and DCR
+// only accepts "none". A client that sends Basic / Bearer credentials
+// in the Authorization header would otherwise be silently ignored —
+// the request might still succeed (PKCE + sealed client_id still
+// apply) and the client would walk away thinking the secret was
+// honoured. Reject with 401 + invalid_client + WWW-Authenticate so
+// the misconfiguration surfaces immediately.
+func TestToken_RejectsAuthorizationHeader(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+
+	cases := []struct{ name, header string }{
+		{"basic", "Basic dXNlcjpwYXNz"},
+		{"bearer", "Bearer some-token"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader("grant_type=refresh_token"))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req.Header.Set("Authorization", tc.header)
+			rr := httptest.NewRecorder()
+			Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
+			if rr.Code != http.StatusUnauthorized {
+				t.Fatalf("want 401, got %d: %s", rr.Code, rr.Body.String())
+			}
+			var e OAuthError
+			_ = json.Unmarshal(rr.Body.Bytes(), &e)
+			if e.Error != "invalid_client" {
+				t.Errorf("want error=invalid_client, got %q", e.Error)
+			}
+			if wa := rr.Header().Get("WWW-Authenticate"); wa == "" || !strings.Contains(wa, "invalid_client") {
+				t.Errorf("WWW-Authenticate missing invalid_client challenge: %q", wa)
+			}
+		})
+	}
+}
+
 func TestToken_RejectsRepeatedSingletonParam(t *testing.T) {
 	tm := newTestTokenManager(t)
 	logger := zap.NewNop()

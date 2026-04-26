@@ -45,6 +45,21 @@ func Token(tm *token.Manager, logger *zap.Logger, audience string, revokeBefore 
 			return
 		}
 
+		// RFC 6749 §5.2 / §3.2.1: this AS publishes
+		// token_endpoint_auth_methods_supported=["none"] and DCR
+		// only accepts "none" — there is no client-secret credential
+		// the bearer middleware would accept here. Silently ignoring
+		// an Authorization attempt would let a confused client
+		// believe its Basic / Bearer secret was honoured. Reject
+		// explicitly with `invalid_client` and a 401 challenge so
+		// the client can correct its wiring before relying on a
+		// non-authenticated path.
+		if r.Header.Get("Authorization") != "" {
+			w.Header().Set("WWW-Authenticate", `Basic realm="token", error="invalid_client", error_description="this token endpoint does not authenticate clients (token_endpoint_auth_method=none); remove the Authorization header"`)
+			writeOAuthError(w, http.StatusUnauthorized, "invalid_client", "this token endpoint does not authenticate clients (token_endpoint_auth_method=none); remove the Authorization header")
+			return
+		}
+
 		if err := r.ParseForm(); err != nil {
 			// Distinguish a body that exceeded MaxBodySize (1 MB
 			// cap) from a structurally-malformed body, so a client

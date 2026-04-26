@@ -675,6 +675,53 @@ func TestProxy_UpstreamAuthorization_EmptyStripsAuth(t *testing.T) {
 	}
 }
 
+// TestProxy_ClientBearerStrippedOnEveryHop pins R2-L3: the
+// MCP-client bearer credential must be removed on the first hop AND
+// every redirect hop, regardless of whether UPSTREAM_AUTHORIZATION
+// is set. The strip lives in sanitizeRequestHeaders so a future
+// change that adds per-request Authorization in the Director
+// (e.g. on-behalf-of token) cannot leak the credential across the
+// redirect by forgetting to mirror the strip on the cloned request.
+func TestProxy_ClientBearerStrippedOnEveryHop(t *testing.T) {
+	var gotAuth []string
+	var hops atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = append(gotAuth, r.Header.Get("Authorization"))
+		n := hops.Add(1)
+		if n == 1 {
+			w.Header().Set("Location", r.URL.Path+"/")
+			w.WriteHeader(http.StatusTemporaryRedirect)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	handler, err := Handler(upstream.URL, zap.NewNop(), Config{}) // no UpstreamAuthorization
+	if err != nil {
+		t.Fatalf("Handler: %v", err)
+	}
+	ctx := context.WithValue(context.Background(), middleware.ContextSubject, "u")
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/mcp", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer client-token-MUST-NOT-LEAK")
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200 after redirect follow, got %d", rr.Code)
+	}
+	if len(gotAuth) != 2 {
+		t.Fatalf("expected 2 upstream hops, got %d", len(gotAuth))
+	}
+	for i, a := range gotAuth {
+		if a != "" {
+			t.Errorf("hop %d leaked client Authorization: %q", i, a)
+		}
+	}
+}
+
 // TestProxy_UpstreamAuthorization_SurvivesRedirect verifies the
 // operator-configured Authorization is still present on the second
 // hop after a 307 redirect. Backends that emit 307 /mcp → /mcp/
