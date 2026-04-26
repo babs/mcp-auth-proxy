@@ -61,6 +61,16 @@ func Register(tm *token.Manager, logger *zap.Logger, audience string) http.Handl
 		var req registerRequest
 		dec := json.NewDecoder(r.Body)
 		if err := dec.Decode(&req); err != nil {
+			// Distinguish a body that exceeded MaxBodySize (1 MB
+			// cap) from a structurally-malformed body so a client
+			// log observer can tell "I posted too much" from "I
+			// posted garbage". Mirrors /token's branching at
+			// handlers/token.go.
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				writeOAuthError(w, http.StatusRequestEntityTooLarge, "invalid_request", "request body exceeds the 1 MB cap")
+				return
+			}
 			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body")
 			return
 		}
