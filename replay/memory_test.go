@@ -70,7 +70,7 @@ func TestMemoryStore_BackgroundTickerEvictsExpired(t *testing.T) {
 	defer func() { _ = s.Close() }()
 
 	ctx := context.Background()
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		if err := s.ClaimOnce(ctx, fmt.Sprintf("k%d", i), 2*time.Millisecond); err != nil {
 			t.Fatalf("claim %d: %v", i, err)
 		}
@@ -159,7 +159,7 @@ func TestMemoryStore_SizeCap_FailsClosed(t *testing.T) {
 	ctx := context.Background()
 
 	// Fill to cap with TTLs that cannot expire during the test.
-	for i := 0; i < memoryMaxEntries; i++ {
+	for i := range memoryMaxEntries {
 		if err := s.ClaimOnce(ctx, fmt.Sprintf("k%d", i), time.Hour); err != nil {
 			t.Fatalf("fill %d: %v", i, err)
 		}

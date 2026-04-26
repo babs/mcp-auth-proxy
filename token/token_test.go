@@ -237,7 +237,7 @@ func TestSealCount_IncrementsOnEverySeal(t *testing.T) {
 	if got := m.SealCount(); got != 0 {
 		t.Fatalf("initial SealCount = %d, want 0", got)
 	}
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		if _, err := m.SealJSON(map[string]int{"i": i}, PurposeClient); err != nil {
 			t.Fatalf("SealJSON: %v", err)
 		}

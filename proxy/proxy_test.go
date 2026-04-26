@@ -73,7 +73,7 @@ func TestProxy_SSEStreaming(t *testing.T) {
 			t.Fatal("upstream ResponseWriter does not implement http.Flusher")
 		}
 
-		for i := 0; i < 3; i++ {
+		for i := range 3 {
 			fmt.Fprintf(w, "data: event-%d\n\n", i)
 			flusher.Flush()
 		}
@@ -106,7 +106,7 @@ func TestProxy_SSEStreaming(t *testing.T) {
 		t.Fatalf("read body: %v", err)
 	}
 
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		expected := fmt.Sprintf("data: event-%d", i)
 		if !strings.Contains(string(body), expected) {
 			t.Fatalf("body missing %q; got:\n%s", expected, body)

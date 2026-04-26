@@ -118,7 +118,7 @@ func TestRedisStore_Mark_IsIdempotent(t *testing.T) {
 	s, _ := newTestRedis(t, "")
 	ctx := context.Background()
 
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if err := s.Mark(ctx, "k", time.Minute); err != nil {
 			t.Fatalf("Mark iteration %d: %v", i, err)
 		}

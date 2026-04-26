@@ -130,7 +130,7 @@ func (t *redirectFollowingTransport) RoundTrip(req *http.Request) (*http.Respons
 	}
 
 	var lastResp *http.Response
-	for i := 0; i < maxRedirects; i++ {
+	for i := range maxRedirects {
 		// Honor client cancellation between hops so a caller that gave
 		// up during a 307/308 chain doesn't cost one extra upstream RT
 		// per remaining hop. The first hop is covered by the base

@@ -422,7 +422,7 @@ func distinctByteCount(b []byte) int {
 // validateRedisKeyPrefix enforces ASCII-printable only (no cluster-hash
 // tags {}, no CR/LF, no control bytes). See L3 in PLAN notes.
 func validateRedisKeyPrefix(p string) error {
-	for i := 0; i < len(p); i++ {
+	for i := range len(p) {
 		b := p[i]
 		if b < 0x20 || b > 0x7E || b == '{' || b == '}' {
 			return fmt.Errorf("REDIS_KEY_PREFIX contains forbidden byte 0x%02x at offset %d; ASCII-printable only (no { } CR LF control)", b, i)
@@ -520,7 +520,7 @@ func validateUpstreamMCPURL(raw string) (string, string, error) {
 	// established use in MCP mounts. The conservative allowlist keeps
 	// the literal/pattern boundary unambiguous; expand only with a
 	// concrete operator need (none today).
-	for i := 0; i < len(u.Path); i++ {
+	for i := range len(u.Path) {
 		c := u.Path[i]
 		switch {
 		case c >= 'A' && c <= 'Z',

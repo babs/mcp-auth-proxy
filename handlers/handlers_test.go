@@ -3316,7 +3316,7 @@ func TestTokenRefresh_NoReplayStore_RotationStillWorks(t *testing.T) {
 
 	// Two consecutive exchanges of the SAME refresh must both succeed when
 	// no replay store is wired — that is the current stateless contract.
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/token", strings.NewReader(form.Encode()))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		rr := httptest.NewRecorder()
