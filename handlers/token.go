@@ -199,10 +199,7 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 	// record expires naturally once replay is no longer possible. TokenID is
 	// guaranteed non-empty by the upfront check above.
 	if replayStore != nil {
-		remaining := time.Until(code.ExpiresAt)
-		if remaining < time.Second {
-			remaining = time.Second
-		}
+		remaining := max(time.Until(code.ExpiresAt), time.Second)
 		key := replay.NamespacedKey("authz_code", code.TokenID)
 		if err := replayStore.ClaimOnce(r.Context(), key, remaining); err != nil {
 			if errors.Is(err, replay.ErrAlreadyClaimed) {
@@ -365,10 +362,7 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 	if replayStore != nil {
 		familyKey := replay.NamespacedKey("refresh_family_revoked", refresh.FamilyID)
 		claimKey := replay.NamespacedKey("refresh", refresh.TokenID)
-		claimTTL := time.Until(refresh.ExpiresAt)
-		if claimTTL < time.Second {
-			claimTTL = time.Second
-		}
+		claimTTL := max(time.Until(refresh.ExpiresAt), time.Second)
 		// ClaimOrCheckFamily runs check + claim + on-reuse-revocation
 		// as a single linearizable operation. When alreadyClaimed is
 		// true the family is ALREADY revoked atomically inside the
@@ -467,7 +461,7 @@ func validPKCEValue(s string) bool {
 	if len(s) < 43 || len(s) > 128 {
 		return false
 	}
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		c := s[i]
 		switch {
 		case c >= 'A' && c <= 'Z',

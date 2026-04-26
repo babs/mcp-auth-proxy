@@ -63,7 +63,7 @@ func sanitizeErrorDescription(s string) string {
 		s = s[:200]
 	}
 	b := make([]byte, 0, len(s))
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		c := s[i]
 		if c >= 0x20 && c <= 0x7E {
 			b = append(b, c)
