@@ -337,6 +337,45 @@ func TestRegister_RejectsOversizeClientName(t *testing.T) {
 	}
 }
 
+// TestRegister_RejectsClientNameControlBytes pins the control-byte
+// gate on client_name. The field is sealed into the returned
+// client_id and emitted to logs; control bytes (NUL/CR/LF/TAB) and
+// the X-User-Groups delimiter `,` would either smuggle past zap's
+// JSON-escaping when unsealed downstream or break log parsers.
+// RFC 7591 §3.2.2 prescribes invalid_client_metadata.
+func TestRegister_RejectsClientNameControlBytes(t *testing.T) {
+	cases := map[string]string{
+		"newline":     "foo\nbar",
+		"carriage":    "foo\rbar",
+		"tab":         "foo\tbar",
+		"null":        "foo\x00bar",
+		"vtab":        "foo\x0bbar",
+		"comma_delim": "team-a,team-b",
+	}
+	for name, value := range cases {
+		t.Run(name, func(t *testing.T) {
+			tm := newTestTokenManager(t)
+			body, _ := json.Marshal(map[string]any{
+				"redirect_uris": []string{"https://app.example.com/cb"},
+				"client_name":   value,
+			})
+			req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(string(body)))
+			req.Header.Set("Content-Type", "application/json")
+			rr := httptest.NewRecorder()
+			Register(tm, zap.NewNop(), testBaseURL)(rr, req)
+
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", rr.Code)
+			}
+			var oe OAuthError
+			_ = json.NewDecoder(rr.Body).Decode(&oe)
+			if oe.Error != "invalid_client_metadata" {
+				t.Errorf("error = %q, want invalid_client_metadata", oe.Error)
+			}
+		})
+	}
+}
+
 // --- M6 — redirect_uri fragment + userinfo rejection ---
 
 func TestRegister_RejectsFragmentAndUserinfo(t *testing.T) {

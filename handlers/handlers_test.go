@@ -1395,6 +1395,12 @@ func TestCallback_OIDCErrorResponse(t *testing.T) {
 		panic("verifyFunc must not be called when IdP returns error")
 	}
 
+	// State is gibberish here, so the no-session fail-open path
+	// fires — error_description is REPLACED with a fixed string,
+	// regardless of what the IdP redirect carried. The phishing-
+	// surface fix: caller-controlled text never reflects on the
+	// proxy's own origin.
+	const noSessionDesc = "authorization request could not be matched to a known session"
 	tests := []struct {
 		name     string
 		query    string
@@ -1407,14 +1413,14 @@ func TestCallback_OIDCErrorResponse(t *testing.T) {
 			query:    "/callback?error=access_denied&error_description=user+denied+access&state=some-state",
 			wantCode: http.StatusBadRequest,
 			wantErr:  "access_denied",
-			wantDesc: "user denied access",
+			wantDesc: noSessionDesc,
 		},
 		{
 			name:     "server_error without description",
 			query:    "/callback?error=server_error&state=some-state",
 			wantCode: http.StatusBadRequest,
 			wantErr:  "server_error",
-			wantDesc: "authorization denied by identity provider",
+			wantDesc: noSessionDesc,
 		},
 	}
 
@@ -1446,6 +1452,13 @@ func TestCallback_OIDCErrorResponse(t *testing.T) {
 // L4: IdP-supplied error strings outside the RFC 6749 §4.1.2.1 allowlist
 // are rewritten to server_error. error_description is truncated at 200
 // chars and stripped of non-ASCII-printable bytes.
+//
+// The sanitizer fires only on the redirect path (validated session)
+// — the no-session JSON path uses a fixed description to avoid
+// reflecting attacker-controlled text on the proxy origin. So this
+// test seeds a real session, lets the IdP-error redirect-back path
+// fire, and asserts the sanitized description lands in the redirect
+// query string.
 func TestCallback_OIDCError_AllowlistAndSanitize(t *testing.T) {
 	tm := newTestTokenManager(t)
 	oauth2Cfg := testOAuth2Config()
@@ -1453,44 +1466,63 @@ func TestCallback_OIDCError_AllowlistAndSanitize(t *testing.T) {
 		panic("verifyFunc must not be called when IdP returns error")
 	}
 
+	redirectURI := "https://app.example.com/cb"
+	mintState := func(t *testing.T) string {
+		t.Helper()
+		s := sealedSession{
+			ClientID:      uuid.New().String(),
+			RedirectURI:   redirectURI,
+			OriginalState: "client-state",
+			Nonce:         "n",
+			Typ:           token.PurposeSession,
+			Audience:      testBaseURL,
+			ExpiresAt:     time.Now().Add(5 * time.Minute),
+		}
+		state, err := tm.SealJSON(s, token.PurposeSession)
+		if err != nil {
+			t.Fatalf("seal session: %v", err)
+		}
+		return state
+	}
+
 	longDesc := strings.Repeat("A", 250) + "<will-be-trimmed>"
 
 	tests := []struct {
 		name       string
-		query      string
+		errorParam string
+		descParam  string
 		wantErr    string
 		wantDescIs func(string) bool
 	}{
 		{
-			name:    "unknown_error_collapsed_to_server_error",
-			query:   "/callback?error=attacker-controlled_value&error_description=hi&state=s",
-			wantErr: "server_error",
-			wantDescIs: func(s string) bool {
-				return s == "hi"
-			},
+			name:       "unknown_error_collapsed_to_server_error",
+			errorParam: "attacker-controlled_value",
+			descParam:  "hi",
+			wantErr:    "server_error",
+			wantDescIs: func(s string) bool { return s == "hi" },
 		},
 		{
-			name:    "description_truncated_to_200",
-			query:   "/callback?error=access_denied&error_description=" + url.QueryEscape(longDesc) + "&state=s",
-			wantErr: "access_denied",
-			wantDescIs: func(s string) bool {
-				return len(s) == 200 && strings.HasPrefix(s, "AAAA")
-			},
+			name:       "description_truncated_to_200",
+			errorParam: "access_denied",
+			descParam:  longDesc,
+			wantErr:    "access_denied",
+			wantDescIs: func(s string) bool { return len(s) == 200 && strings.HasPrefix(s, "AAAA") },
 		},
 		{
-			name:    "crlf_stripped",
-			query:   "/callback?error=invalid_request&error_description=" + url.QueryEscape("line1\r\nline2") + "&state=s",
-			wantErr: "invalid_request",
+			name:       "crlf_stripped",
+			errorParam: "invalid_request",
+			descParam:  "line1\r\nline2",
+			wantErr:    "invalid_request",
 			wantDescIs: func(s string) bool {
 				return !strings.ContainsAny(s, "\r\n") && strings.Contains(s, "line1line2")
 			},
 		},
 		{
-			name:    "non_ascii_stripped",
-			query:   "/callback?error=access_denied&error_description=" + url.QueryEscape("café naïve") + "&state=s",
-			wantErr: "access_denied",
+			name:       "non_ascii_stripped",
+			errorParam: "access_denied",
+			descParam:  "café naïve",
+			wantErr:    "access_denied",
 			wantDescIs: func(s string) bool {
-				// é and ï collapse to empty (> 0x7E), so we're left with "caf nave"
 				return strings.Contains(s, "caf") && !strings.ContainsRune(s, 'é')
 			},
 		},
@@ -1498,23 +1530,29 @@ func TestCallback_OIDCError_AllowlistAndSanitize(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, tc.query, nil)
+			state := mintState(t)
+			query := "/callback?error=" + url.QueryEscape(tc.errorParam) +
+				"&error_description=" + url.QueryEscape(tc.descParam) +
+				"&state=" + url.QueryEscape(state)
+			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, query, nil)
 			rr := httptest.NewRecorder()
 
 			CallbackWithVerifyFunc(tm, zap.NewNop(), testBaseURL, oauth2Cfg, verifyFunc, CallbackConfig{})(rr, req)
 
-			if rr.Code != http.StatusBadRequest {
-				t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
+			if rr.Code != http.StatusFound {
+				t.Fatalf("expected 302 redirect (session validated), got %d: %s", rr.Code, rr.Body.String())
 			}
-			var cbErr OAuthError
-			if err := json.NewDecoder(rr.Body).Decode(&cbErr); err != nil {
-				t.Fatalf("decode: %v", err)
+			loc, err := url.Parse(rr.Header().Get("Location"))
+			if err != nil {
+				t.Fatalf("parse Location: %v", err)
 			}
-			if cbErr.Error != tc.wantErr {
-				t.Errorf("error = %q, want %q", cbErr.Error, tc.wantErr)
+			gotErr := loc.Query().Get("error")
+			gotDesc := loc.Query().Get("error_description")
+			if gotErr != tc.wantErr {
+				t.Errorf("error = %q, want %q", gotErr, tc.wantErr)
 			}
-			if !tc.wantDescIs(cbErr.ErrorDescription) {
-				t.Errorf("unexpected error_description %q", cbErr.ErrorDescription)
+			if !tc.wantDescIs(gotDesc) {
+				t.Errorf("unexpected error_description %q", gotDesc)
 			}
 		})
 	}
@@ -3708,6 +3746,81 @@ func TestCallback_IdPError_BadState_FallsBackToJSON(t *testing.T) {
 	_ = json.Unmarshal(rr.Body.Bytes(), &e)
 	if e.Error != "access_denied" {
 		t.Errorf("want error=access_denied, got %q", e.Error)
+	}
+}
+
+// TestCallback_IdPError_NoSession_DoesNotReflectAttackerDescription
+// pins the phishing-surface fix: when no session decodes, the JSON
+// 400 body MUST carry a fixed description, not the attacker-supplied
+// `error_description`. Otherwise a phisher who lures a victim to
+// /callback?error=phishy&error_description=visit+http://evil renders
+// attacker text inside a legit-domain JSON page.
+func TestCallback_IdPError_NoSession_DoesNotReflectAttackerDescription(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+
+	target := "/callback?error=access_denied&error_description=" +
+		url.QueryEscape("please visit http://evil.example to recover your account") +
+		"&state=garbage-no-session"
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	rr := httptest.NewRecorder()
+	Callback(tm, logger, testBaseURL, testOAuth2Config(), nil, CallbackConfig{})(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var e OAuthError
+	if err := json.Unmarshal(rr.Body.Bytes(), &e); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if e.Error != "access_denied" {
+		t.Errorf("error code = %q, want access_denied", e.Error)
+	}
+	if strings.Contains(e.ErrorDescription, "evil.example") || strings.Contains(e.ErrorDescription, "visit") {
+		t.Errorf("error_description leaked attacker text: %q", e.ErrorDescription)
+	}
+}
+
+// TestCallback_IdPError_WithSession_ForwardsDescription pins the
+// other side of the dispatch: when the state DOES decode to a valid
+// session, the registered redirect_uri is trusted, so the IdP-
+// supplied (sanitized) error_description is forwarded to the
+// client — operators of legit clients want to see why the IdP
+// refused.
+func TestCallback_IdPError_WithSession_ForwardsDescription(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+
+	redirectURI := "https://app.example.com/cb"
+	session := sealedSession{
+		ClientID:      uuid.New().String(),
+		RedirectURI:   redirectURI,
+		OriginalState: "client-state",
+		Nonce:         "n",
+		Typ:           token.PurposeSession,
+		Audience:      testBaseURL,
+		ExpiresAt:     time.Now().Add(5 * time.Minute),
+	}
+	state, err := tm.SealJSON(session, token.PurposeSession)
+	if err != nil {
+		t.Fatalf("seal session: %v", err)
+	}
+	target := "/callback?error=access_denied&error_description=" +
+		url.QueryEscape("user denied scope") +
+		"&state=" + url.QueryEscape(state)
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	rr := httptest.NewRecorder()
+	Callback(tm, logger, testBaseURL, testOAuth2Config(), nil, CallbackConfig{})(rr, req)
+
+	if rr.Code != http.StatusFound {
+		t.Fatalf("want 302 redirect, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	loc, err := url.Parse(rr.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse Location: %v", err)
+	}
+	if got := loc.Query().Get("error_description"); got != "user denied scope" {
+		t.Errorf("forwarded error_description = %q, want %q", got, "user denied scope")
 	}
 }
 

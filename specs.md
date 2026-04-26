@@ -273,7 +273,7 @@ Headers: `Cache-Control: no-store`, `Pragma: no-cache`.
 
 `client_id_expires_at` (RFC 7591 §3.2.1) is the UNIX timestamp at which the sealed `client_id` stops opening (default `client_id_issued_at + 24h`). Clients that cache the handle should re-register before this time to avoid a 400 on `/authorize`.
 
-Error responses use RFC 7591 §3.2.2 codes: `invalid_redirect_uri` for any redirect_uri-shape defect (missing, over-count, over-length, malformed, opaque, hostless, fragment-bearing, userinfo-bearing, or non-https-non-loopback); `invalid_client_metadata` for unsupported `token_endpoint_auth_method` or over-length `client_name`; `invalid_request` only for structural problems (malformed JSON body).
+Error responses use RFC 7591 §3.2.2 codes: `invalid_redirect_uri` for any redirect_uri-shape defect (missing, over-count, over-length, malformed, opaque, hostless, fragment-bearing, userinfo-bearing, or non-https-non-loopback); `invalid_client_metadata` for unsupported `token_endpoint_auth_method`, over-length `client_name`, or `client_name` containing control bytes (NUL/CR/LF/TAB) or the X-User-Groups delimiter `,` (the field is sealed into the returned `client_id` and emitted to logs; raw control bytes would smuggle past zap's JSON-escaping when downstream code unsealed and parsed it); `invalid_request` only for structural problems (malformed JSON body).
 
 ---
 
