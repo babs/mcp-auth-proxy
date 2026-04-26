@@ -567,6 +567,7 @@ Operator-load-bearing invariants that are not surfaced by the env table or the e
   - `mcp_auth_clients_registered_total`
   - `mcp_auth_groups_claim_shape_mismatch_total` — IdP-schema-drift signal; user is admitted with empty groups, so it's NOT a denial
   - `mcp_auth_token_seals_total{purpose}` — cross-replica AES-GCM seal counter; alert on `sum(increase(metric[7d])) > 2**28` to drive `TOKEN_SIGNING_SECRET` rotation
+  - `mcp_auth_rpc_calls_total{tool}` / `mcp_auth_rpc_calls_failed_total{tool}` / `mcp_auth_rpc_request_bytes_total{tool}` / `mcp_auth_rpc_response_bytes_total{tool}` — per-tool RPC traffic. Disabled by default (cardinality + privacy trade); opt-in via `MCP_TOOL_METRICS=true`. Distinct labels capped by `MCP_TOOL_METRICS_MAX_CARDINALITY` (default 256) — overflow folds into `_overflow`, missing tool names into `_unknown`
 - **HTTP timeouts**: `ReadTimeout: 30s`, `WriteTimeout: 0` (SSE), `IdleTimeout: 120s`. SSE streams MUST flush; do not buffer `text/event-stream` responses.
 - **Body size limit**: POST endpoints capped at 1 MB via `MaxBytesReader`.
 - **307/308 redirect following**: proxy follows server-side for Python MCP backends that redirect `/mcp` → `/mcp/`. Same-host only, body replayed, max 10 hops, scheme downgrade rejected.

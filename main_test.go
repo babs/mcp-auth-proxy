@@ -87,7 +87,7 @@ func TestZapMiddleware_SkipRE(t *testing.T) {
 				w.WriteHeader(http.StatusOK)
 			})
 			core, logs := observer.New(zap.InfoLevel)
-			h := zapMiddleware(zap.New(core), tc.re)(next)
+			h := zapMiddleware(zap.New(core), tc.re, nil)(next)
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.path, nil))
 			if !called {
