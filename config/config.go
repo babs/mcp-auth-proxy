@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"regexp"
@@ -102,6 +103,19 @@ type Config struct {
 	// it takes precedence over TRUST_PROXY_HEADERS. env:
 	// TRUSTED_PROXY_CIDRS (comma-separated list of CIDRs).
 	TrustedProxyCIDRs []*net.IPNet
+	// TrustedProxyHeader names the forwarding header the rate-limit
+	// keying walks right-to-left when the immediate peer is inside
+	// TrustedProxyCIDRs. Default "X-Forwarded-For" — that is the
+	// only header most ingresses actually OVERWRITE rather than
+	// pass through verbatim. Operators whose ingress is known to
+	// emit a single trusted hop in `X-Real-IP` or `True-Client-IP`
+	// can pin those instead. The legacy
+	// `httprate.KeyByRealIP`-style behaviour (read True-Client-IP,
+	// X-Real-IP, leftmost-XFF in that order, no validation) is
+	// gone — it bucketed per attacker-spoofed value because none
+	// of those headers are gated on the peer being trusted. env:
+	// TRUSTED_PROXY_HEADER.
+	TrustedProxyHeader string
 	// PerSubjectConcurrency caps the number of in-flight requests per
 	// authenticated subject on the MCP route group. Default 16. A single
 	// runaway or compromised client identity cannot saturate the proxy's
@@ -344,6 +358,20 @@ func Load() (*Config, error) {
 				return nil, fmt.Errorf("TRUSTED_PROXY_CIDRS contains invalid CIDR %q: %w", s, err)
 			}
 			c.TrustedProxyCIDRs = append(c.TrustedProxyCIDRs, n)
+		}
+	}
+
+	// Pin the forwarding header the rate-limit keying walks
+	// right-to-left when the immediate peer is in
+	// TRUSTED_PROXY_CIDRS. Allowlist three forms operators
+	// realistically use; reject everything else so a typo cannot
+	// silently fall back to "no header keying".
+	if raw := strings.TrimSpace(os.Getenv("TRUSTED_PROXY_HEADER")); raw != "" {
+		switch http.CanonicalHeaderKey(raw) {
+		case "X-Forwarded-For", "X-Real-Ip", "True-Client-Ip":
+			c.TrustedProxyHeader = http.CanonicalHeaderKey(raw)
+		default:
+			return nil, fmt.Errorf("TRUSTED_PROXY_HEADER must be one of X-Forwarded-For, X-Real-IP, True-Client-IP, got %q", raw)
 		}
 	}
 
