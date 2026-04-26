@@ -82,6 +82,13 @@ func main() {
 		zap.Bool("revoke_before_set", !cfg.RevokeBefore.IsZero()),
 		zap.Bool("upstream_authorization_set", cfg.UpstreamAuthorization != ""),
 		zap.String("access_log_skip_re", accessLogSkipPattern(cfg.AccessLogSkipRE)),
+		// Surface the per-tool metrics toggle so an operator inspecting
+		// startup logs can confirm `MCP_TOOL_METRICS=true` actually took
+		// effect. Without this, the new mcp_auth_rpc_*{tool} counters
+		// only appear once real RPC traffic flows — there's no visible
+		// config evidence in the meantime.
+		zap.Bool("tool_metrics_enabled", cfg.ToolMetricsEnabled),
+		zap.Int("tool_metrics_max_cardinality", cfg.ToolMetricsMaxCardinality),
 	)
 
 	// Surface low-entropy secrets as a startup warning so operators notice
