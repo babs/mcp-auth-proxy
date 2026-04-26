@@ -337,6 +337,60 @@ func TestRegister_RejectsOversizeClientName(t *testing.T) {
 	}
 }
 
+// TestRegister_OversizedBodyReturns413 pins the
+// content-too-large-vs-malformed distinction. /token already
+// distinguishes them; /register used to collapse both into one
+// invalid_request / "invalid JSON body". Mirrors /token's branching.
+func TestRegister_OversizedBodyReturns413(t *testing.T) {
+	tm := newTestTokenManager(t)
+	// Body padded with a long, valid-JSON ignored field so we cross the
+	// 1 MB cap without leaving the JSON object structurally malformed.
+	pad := strings.Repeat("a", 1<<20+1024)
+	body := `{"redirect_uris":["https://app.example.com/cb"],"_pad":"` + pad + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	Register(tm, zap.NewNop(), testBaseURL)(rr, req)
+
+	if rr.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", rr.Code)
+	}
+	var oe OAuthError
+	if err := json.NewDecoder(rr.Body).Decode(&oe); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if oe.Error != "invalid_request" {
+		t.Errorf("error = %q, want invalid_request", oe.Error)
+	}
+	if !strings.Contains(oe.ErrorDescription, "1 MB") {
+		t.Errorf("error_description = %q, want it to mention the cap", oe.ErrorDescription)
+	}
+}
+
+// TestRegister_MalformedBodyReturns400 keeps the structural-error
+// path on 400 / invalid_request — cap and shape are distinguishable.
+func TestRegister_MalformedBodyReturns400(t *testing.T) {
+	tm := newTestTokenManager(t)
+	req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader("not-json"))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	Register(tm, zap.NewNop(), testBaseURL)(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rr.Code)
+	}
+	var oe OAuthError
+	if err := json.NewDecoder(rr.Body).Decode(&oe); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if oe.Error != "invalid_request" {
+		t.Errorf("error = %q, want invalid_request", oe.Error)
+	}
+	if oe.ErrorDescription != "invalid JSON body" {
+		t.Errorf("error_description = %q, want %q", oe.ErrorDescription, "invalid JSON body")
+	}
+}
+
 // TestRegister_RejectsClientNameControlBytes pins the control-byte
 // gate on client_name. The field is sealed into the returned
 // client_id and emitted to logs; control bytes (NUL/CR/LF/TAB) and
