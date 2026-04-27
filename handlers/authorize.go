@@ -216,6 +216,12 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 			state = hex.EncodeToString(b)
 		}
 
+		// All /authorize parameters have been validated. The funnel
+		// counter increments inside each fork branch with its
+		// `path` label so the labelled value is exactly the rate
+		// of that branch's traffic. Pre-validation rejections land
+		// on access_denied_total instead.
+		//
 		// Consent-page fork (default path; bypassed only when the
 		// operator sets RENDER_CONSENT_PAGE=false). All /authorize
 		// parameters have been validated, but the upstream IdP
@@ -226,6 +232,7 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 		// (nonce, upstream PKCE verifier, sealedSession, IdP
 		// redirect) replays from POST /consent on approval.
 		if authzCfg.RenderConsentPage {
+			metrics.AuthorizeInitiated.WithLabelValues("consent").Inc()
 			renderConsent(w, r, tm, logger, baseURL, authzCfg.ResourceName, sealedConsent{
 				// Per-render JTI: a fresh id every GET /authorize so
 				// back-button = re-consent (each render gets its own
@@ -244,6 +251,8 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 			})
 			return
 		}
+
+		metrics.AuthorizeInitiated.WithLabelValues("silent").Inc()
 
 		// Upstream OIDC nonce (H3): random 32 hex, bound to this session,
 		// verified against the id_token at /callback to defend against

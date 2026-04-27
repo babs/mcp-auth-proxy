@@ -688,6 +688,179 @@ func TestTokenRefresh_RaceGrace_ZeroDisablesGrace(t *testing.T) {
 	}
 }
 
+// --- T4.3: authorize_initiated funnel counter ---
+
+// TestAuthorize_Initiated_ConsentFork_LabelsCorrectly pins that
+// every validated GET /authorize entering the consent renderer
+// increments mcp_auth_authorize_initiated_total under the
+// `path=consent` label and ONLY that label — a regression that
+// labels both forks the same (or swaps the labels) breaks here.
+func TestAuthorize_Initiated_ConsentFork_LabelsCorrectly(t *testing.T) {
+	tm := newTestTokenManager(t)
+	encClientID, _ := registerClientNamed(t, tm, []string{"https://app.example.com/callback"}, "App")
+
+	codeVerifier := "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+	q := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {encClientID},
+		"redirect_uri":          {"https://app.example.com/callback"},
+		"code_challenge":        {pkceChallenge(codeVerifier)},
+		"code_challenge_method": {"S256"},
+		"state":                 {"client-state"},
+	}
+
+	consentBefore := testutil.ToFloat64(metrics.AuthorizeInitiated.WithLabelValues("consent"))
+	silentBefore := testutil.ToFloat64(metrics.AuthorizeInitiated.WithLabelValues("silent"))
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/authorize?"+q.Encode(), nil)
+	rr := httptest.NewRecorder()
+	authorizeConsentEnabled(tm)(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d", rr.Code)
+	}
+	if got := testutil.ToFloat64(metrics.AuthorizeInitiated.WithLabelValues("consent")) - consentBefore; got != 1 {
+		t.Errorf("AuthorizeInitiated{path=consent} delta = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.AuthorizeInitiated.WithLabelValues("silent")) - silentBefore; got != 0 {
+		t.Errorf("AuthorizeInitiated{path=silent} delta = %v, want 0 (consent fork must not bleed into silent label)", got)
+	}
+}
+
+// TestAuthorize_Initiated_SilentFork_LabelsCorrectly pins the
+// mirror of the consent test: the silent-redirect path
+// (RenderConsentPage=false) increments the `path=silent` label
+// and ONLY that label.
+func TestAuthorize_Initiated_SilentFork_LabelsCorrectly(t *testing.T) {
+	tm := newTestTokenManager(t)
+	encClientID, _ := registerClientNamed(t, tm, []string{"https://app.example.com/callback"}, "App")
+
+	codeVerifier := "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+	q := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {encClientID},
+		"redirect_uri":          {"https://app.example.com/callback"},
+		"code_challenge":        {pkceChallenge(codeVerifier)},
+		"code_challenge_method": {"S256"},
+		"state":                 {"client-state"},
+	}
+
+	consentBefore := testutil.ToFloat64(metrics.AuthorizeInitiated.WithLabelValues("consent"))
+	silentBefore := testutil.ToFloat64(metrics.AuthorizeInitiated.WithLabelValues("silent"))
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/authorize?"+q.Encode(), nil)
+	rr := httptest.NewRecorder()
+	Authorize(tm, zap.NewNop(), testBaseURL, testOAuth2Config(), AuthorizeConfig{
+		PKCERequired:      true,
+		ResourceURIs:      []string{testBaseURL + "/mcp"},
+		CanonicalResource: testBaseURL + "/mcp",
+	})(rr, req)
+
+	if rr.Code != http.StatusFound {
+		t.Fatalf("want 302, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if got := testutil.ToFloat64(metrics.AuthorizeInitiated.WithLabelValues("silent")) - silentBefore; got != 1 {
+		t.Errorf("AuthorizeInitiated{path=silent} delta = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.AuthorizeInitiated.WithLabelValues("consent")) - consentBefore; got != 0 {
+		t.Errorf("AuthorizeInitiated{path=consent} delta = %v, want 0 (silent fork must not bleed into consent label)", got)
+	}
+}
+
+// TestAuthorize_Initiated_NotIncrementedOnPreValidationReject
+// pins that every pre-funnel reject path skips the counter. The
+// table covers the four classes that share the "redirectAuthzError
+// before increment" or "writeOAuthError before increment" shape:
+// unknown client (JSON-error path), unsupported response_type
+// (redirect-error path), invalid resource (redirect-error path),
+// and missing state in strict mode (redirect-error path). Without
+// this guarantee the funnel math initiated → tokens_issued would
+// inflate with traffic that never reached Phase 3.
+func TestAuthorize_Initiated_NotIncrementedOnPreValidationReject(t *testing.T) {
+	tm := newTestTokenManager(t)
+	encClientID, _ := registerClientNamed(t, tm, []string{"https://app.example.com/callback"}, "App")
+	codeVerifier := "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+	chal := pkceChallenge(codeVerifier)
+
+	tests := []struct {
+		name string
+		q    url.Values
+	}{
+		{
+			name: "unknown_client_id",
+			q: url.Values{
+				"response_type":         {"code"},
+				"client_id":             {"not-a-real-client"},
+				"redirect_uri":          {"https://app.example.com/callback"},
+				"code_challenge":        {chal},
+				"code_challenge_method": {"S256"},
+				"state":                 {"s"},
+			},
+		},
+		{
+			name: "unsupported_response_type",
+			q: url.Values{
+				"response_type":         {"token"},
+				"client_id":             {encClientID},
+				"redirect_uri":          {"https://app.example.com/callback"},
+				"code_challenge":        {chal},
+				"code_challenge_method": {"S256"},
+				"state":                 {"s"},
+			},
+		},
+		{
+			name: "invalid_resource",
+			q: url.Values{
+				"response_type":         {"code"},
+				"client_id":             {encClientID},
+				"redirect_uri":          {"https://app.example.com/callback"},
+				"code_challenge":        {chal},
+				"code_challenge_method": {"S256"},
+				"state":                 {"s"},
+				"resource":              {"https://other-resource.example.com/api"},
+			},
+		},
+		{
+			name: "state_missing_strict",
+			q: url.Values{
+				"response_type":         {"code"},
+				"client_id":             {encClientID},
+				"redirect_uri":          {"https://app.example.com/callback"},
+				"code_challenge":        {chal},
+				"code_challenge_method": {"S256"},
+				// state intentionally absent
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			before := testutil.ToFloat64(metrics.AuthorizeInitiated.WithLabelValues("consent")) + testutil.ToFloat64(metrics.AuthorizeInitiated.WithLabelValues("silent"))
+
+			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/authorize?"+tc.q.Encode(), nil)
+			rr := httptest.NewRecorder()
+			Authorize(tm, zap.NewNop(), testBaseURL, testOAuth2Config(), AuthorizeConfig{
+				PKCERequired:      true,
+				ResourceURIs:      []string{testBaseURL + "/mcp"},
+				CanonicalResource: testBaseURL + "/mcp",
+				// CompatAllowStateless stays false → state-missing
+				// rejects in strict mode rather than synthesizing.
+			})(rr, req)
+
+			// Each row above causes either a 400 (JSON path) or a
+			// 302 (redirect-error path). Both shapes mean the
+			// request was rejected before the funnel point — the
+			// counter must NOT have moved.
+			if rr.Code != http.StatusBadRequest && rr.Code != http.StatusFound {
+				t.Fatalf("%s: unexpected status %d (want 400 or 302): %s", tc.name, rr.Code, rr.Body.String())
+			}
+			if got := testutil.ToFloat64(metrics.AuthorizeInitiated.WithLabelValues("consent")) + testutil.ToFloat64(metrics.AuthorizeInitiated.WithLabelValues("silent")) - before; got != 0 {
+				t.Errorf("%s: AuthorizeInitiated delta = %v, want 0 (pre-funnel reject must not increment)", tc.name, got)
+			}
+		})
+	}
+}
+
 // TestAuthorize_SilentRedirect_PopulatesSessionID pins that the
 // inline /authorize path (RenderConsentPage=false) seals a non-empty
 // SessionID into the session blob. /callback's per-state replay
