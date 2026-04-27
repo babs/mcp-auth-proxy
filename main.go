@@ -298,6 +298,9 @@ func main() {
 	mcpLimit := passthrough
 	discoveryLimit := passthrough
 	if cfg.RateLimitEnabled {
+		// /register's 10/min cap is the load-bearing mitigation in
+		// docs/threat-model.md row 1 (DCR abuse). Keep this in sync
+		// with that document if the value changes.
 		registerLimit = rateLimiter(10, time.Minute, "register", ipKeyFunc)
 		authorizeLimit = rateLimiter(30, time.Minute, "authorize", ipKeyFunc)
 		// /consent has its own bucket so the user-driven approve/deny
