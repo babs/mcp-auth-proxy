@@ -40,5 +40,6 @@ configMapGenerator:
 
 patches:
   - path: deployment-patch.yaml
-  - path: redis-delete-patch.yaml
+  - path: redis-deployment-delete-patch.yaml
+  - path: redis-service-delete-patch.yaml
   - path: secret-delete-patch.yaml
