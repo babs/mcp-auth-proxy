@@ -21,6 +21,20 @@ const (
 )
 
 // Token handles POST /token (authorization_code and refresh_token grants).
+// TokenConfig holds optional dependencies and tunables for the
+// /token handler. Replaces the old positional signature so future
+// knobs (refresh-rate-grace, etc.) don't keep breaking the call
+// site.
+type TokenConfig struct {
+	// RefreshRaceGrace, when > 0, treats a refresh-claim collision
+	// inside this window as a benign concurrent submit (parallel
+	// tab refresh, slow-network double-submit) and returns 429
+	// `refresh_concurrent_submit` without revoking the family.
+	// Outside the window the prior strict "every collision revokes"
+	// behavior applies. Set to 0 to disable.
+	RefreshRaceGrace time.Duration
+}
+
 // audience binds issued tokens to a specific proxy deployment; revokeBefore
 // is the bulk-revocation cutoff applied to refresh tokens (the access-token
 // path is enforced separately by middleware/auth.go). replayStore, when
@@ -28,7 +42,7 @@ const (
 // rotation with reuse detection across replicas; when nil, the handler
 // retains stateless behavior (codes/refresh tokens unique, audience-bound
 // and expiry-checked but not single-use).
-func Token(tm *token.Manager, logger *zap.Logger, audience string, revokeBefore time.Time, replayStore replay.Store, resourceURIs ...string) http.HandlerFunc {
+func Token(tm *token.Manager, logger *zap.Logger, audience string, revokeBefore time.Time, replayStore replay.Store, cfg TokenConfig, resourceURIs ...string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 
@@ -106,7 +120,7 @@ func Token(tm *token.Manager, logger *zap.Logger, audience string, revokeBefore 
 		case "authorization_code":
 			handleAuthorizationCode(w, r, tm, logger, audience, replayStore)
 		case "refresh_token":
-			handleRefreshToken(w, r, tm, logger, audience, revokeBefore, replayStore)
+			handleRefreshToken(w, r, tm, logger, audience, revokeBefore, replayStore, cfg.RefreshRaceGrace)
 		default:
 			writeOAuthError(w, http.StatusBadRequest, "unsupported_grant_type", "grant_type must be authorization_code or refresh_token")
 		}
@@ -315,7 +329,7 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 	})
 }
 
-func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manager, logger *zap.Logger, audience string, revokeBefore time.Time, replayStore replay.Store) {
+func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manager, logger *zap.Logger, audience string, revokeBefore time.Time, replayStore replay.Store, refreshRaceGrace time.Duration) {
 	refreshTokenStr := r.FormValue("refresh_token")
 	clientIDStr := r.FormValue("client_id")
 
@@ -413,7 +427,7 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 		// store; the handler does not need (and must not attempt) a
 		// separate Mark — doing so would reintroduce the fail-open
 		// path a client cancel could cut short.
-		revoked, alreadyClaimed, err := replayStore.ClaimOrCheckFamily(r.Context(), familyKey, claimKey, claimTTL, refreshTokenTTL)
+		revoked, racing, alreadyClaimed, err := replayStore.ClaimOrCheckFamily(r.Context(), familyKey, claimKey, claimTTL, refreshTokenTTL, refreshRaceGrace)
 		if err != nil {
 			logger.Error("replay_store_error", zap.String("op", "claim_refresh_family"), zap.Error(err))
 			metrics.AccessDenied.WithLabelValues("replay_store_unavailable").Inc()
@@ -428,6 +442,29 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 				zap.String("client_id", client.ID),
 			)
 			writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh token revoked", "refresh_family_revoked")
+			return
+		}
+		if racing {
+			// Benign concurrent submit within the grace window —
+			// parallel-tab refresh, double-submit on slow network.
+			// Family is NOT revoked. 429 with a dedicated error_code
+			// lets a client distinguish a race (retry-friendly) from
+			// real reuse (don't retry, re-auth) without learning
+			// anything an attacker doesn't already know.
+			metrics.AccessDenied.WithLabelValues("refresh_concurrent_submit").Inc()
+			logger.Info("refresh_token_concurrent_submit",
+				zap.String("token_id", refresh.TokenID),
+				zap.String("family_id", refresh.FamilyID),
+				zap.String("subject", refresh.Subject),
+				zap.String("client_id", client.ID),
+			)
+			// Retry-After matches the default grace window so a
+			// well-behaved client retries roughly when the legit
+			// peer's new refresh has had time to land in shared
+			// storage. The exact value is conservative; clients
+			// MAY retry sooner if they observe the new refresh.
+			w.Header().Set("Retry-After", "2")
+			writeOAuthError(w, http.StatusTooManyRequests, "invalid_grant", "refresh token concurrent submit; the legitimate peer is rotating, retry after the new refresh lands", "refresh_concurrent_submit")
 			return
 		}
 		if alreadyClaimed {

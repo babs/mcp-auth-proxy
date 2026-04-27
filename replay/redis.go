@@ -105,9 +105,10 @@ func (s *RedisStore) Exists(ctx context.Context, key string) (bool, error) {
 }
 
 // claimOrCheckFamilyScript collapses the family-revoked check, the
-// single-use claim, AND the on-reuse family-revocation into one
-// linearizable EVAL. Running all three inside a single script on the
-// primary closes two different fail-open edges:
+// single-use claim, the grace-window racing detection, AND the
+// on-reuse family-revocation into one linearizable EVAL. Running
+// all of it inside a single script on the primary closes two
+// different fail-open edges:
 //
 //  1. TOCTOU between EXISTS and SETNX: a stale replica read could
 //     previously miss a freshly-SET family marker.
@@ -117,47 +118,77 @@ func (s *RedisStore) Exists(ctx context.Context, key string) (bool, error) {
 //     reuse, and a cancel mid-request could skip it. Now the marker
 //     lands atomically with the detection.
 //
+// The claim VALUE is the wall-clock millisecond timestamp at which
+// the claim was first set (epoch ms as a string). On a collision
+// the script reads the stored timestamp and compares it to NOW
+// (passed in by Go to avoid Redis-side TIME drift) — within the
+// grace window we classify as racing rather than reuse. A
+// sysadmin doing `redis-cli GET <prefix>refresh:<tid>` will see a
+// large number like "1714567890123" rather than the legacy "1"
+// placeholder; this is intentional, not corruption. Pre-T2.3
+// claims that still hold the literal "1" parse to 1 ms; the
+// `(now - 1)` distance is always larger than any allowed grace
+// (≤10s), so they correctly fall through to the strict revoke
+// branch — the rolling-deploy contract is "at least as strict
+// as before, never looser".
+//
 // KEYS[1] = family_revoked key
 // KEYS[2] = claim key (refresh token id)
 // ARGV[1] = claim TTL in milliseconds
-// ARGV[2] = family-revoke TTL in milliseconds (used only on reuse)
-// Returns {familyRevoked, alreadyClaimed} as integers in {0,1}.
+// ARGV[2] = family-revoke TTL in milliseconds (used only on stale reuse)
+// ARGV[3] = NOW (epoch ms, set by Go side)
+// ARGV[4] = grace window ms (0 = strict; every collision revokes family)
+// Returns {familyRevoked, racing, alreadyClaimed} as integers in {0,1}.
+// At most one of the three is 1.
 var claimOrCheckFamilyScript = redis.NewScript(`
 if redis.call("EXISTS", KEYS[1]) == 1 then
-  return {1, 0}
+  return {1, 0, 0}
 end
-local ok = redis.call("SET", KEYS[2], "1", "NX", "PX", ARGV[1])
+local ok = redis.call("SET", KEYS[2], ARGV[3], "NX", "PX", ARGV[1])
 if ok then
-  return {0, 0}
+  return {0, 0, 0}
+end
+local grace = tonumber(ARGV[4])
+if grace and grace > 0 then
+  local prior = tonumber(redis.call("GET", KEYS[2]))
+  local now = tonumber(ARGV[3])
+  if prior and now and (now - prior) < grace then
+    return {0, 1, 0}
+  end
 end
 redis.call("SET", KEYS[1], "1", "PX", ARGV[2])
-return {0, 1}
+return {0, 0, 1}
 `)
 
 // ClaimOrCheckFamily implements replay.Store.ClaimOrCheckFamily. See the
 // interface doc for semantics. TTLs are truncated to millisecond
 // resolution (Redis PX).
-func (s *RedisStore) ClaimOrCheckFamily(ctx context.Context, familyKey, claimKey string, claimTTL, familyTTL time.Duration) (familyRevoked bool, alreadyClaimed bool, err error) {
+func (s *RedisStore) ClaimOrCheckFamily(ctx context.Context, familyKey, claimKey string, claimTTL, familyTTL, graceWindow time.Duration) (familyRevoked bool, racing bool, alreadyClaimed bool, err error) {
 	claimMs := max(claimTTL.Milliseconds(), 1)
 	familyMs := max(familyTTL.Milliseconds(), 1)
+	nowMs := time.Now().UnixMilli()
+	graceMs := max(graceWindow.Milliseconds(), 0)
 	res, err := claimOrCheckFamilyScript.Run(
 		ctx,
 		s.client,
 		[]string{s.k(familyKey), s.k(claimKey)},
 		claimMs,
 		familyMs,
+		nowMs,
+		graceMs,
 	).Result()
 	if err != nil {
-		return false, false, fmt.Errorf("redis eval: %w", err)
+		return false, false, false, fmt.Errorf("redis eval: %w", err)
 	}
 
 	arr, ok := res.([]any)
-	if !ok || len(arr) != 2 {
-		return false, false, fmt.Errorf("redis eval: unexpected result %T", res)
+	if !ok || len(arr) != 3 {
+		return false, false, false, fmt.Errorf("redis eval: unexpected result %T", res)
 	}
 	revoked, _ := arr[0].(int64)
-	claimed, _ := arr[1].(int64)
-	return revoked == 1, claimed == 1, nil
+	race, _ := arr[1].(int64)
+	claimed, _ := arr[2].(int64)
+	return revoked == 1, race == 1, claimed == 1, nil
 }
 
 // Close releases the underlying Redis connection pool.

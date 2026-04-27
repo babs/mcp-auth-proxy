@@ -166,12 +166,12 @@ func TestRedisStore_ClaimOrCheckFamily_FreshClaim(t *testing.T) {
 	s, mr := newTestRedis(t, "p:")
 	ctx := context.Background()
 
-	revoked, claimed, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute, 7*24*time.Hour)
+	revoked, racing, claimed, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute, 7*24*time.Hour, 0)
 	if err != nil {
 		t.Fatalf("ClaimOrCheckFamily: %v", err)
 	}
-	if revoked || claimed {
-		t.Fatalf("fresh claim: revoked=%v claimed=%v (want both false)", revoked, claimed)
+	if revoked || racing || claimed {
+		t.Fatalf("fresh claim: revoked=%v racing=%v claimed=%v (want all false)", revoked, racing, claimed)
 	}
 	if !mr.Exists("p:tid:A") {
 		t.Errorf("expected claim key present, keys=%v", mr.Keys())
@@ -182,16 +182,17 @@ func TestRedisStore_ClaimOrCheckFamily_AlreadyClaimed(t *testing.T) {
 	s, _ := newTestRedis(t, "")
 	ctx := context.Background()
 
-	if _, _, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute, 7*24*time.Hour); err != nil {
+	if _, _, _, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute, 7*24*time.Hour, 0); err != nil {
 		t.Fatalf("first claim: %v", err)
 	}
 
-	revoked, claimed, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute, 7*24*time.Hour)
+	// graceWindow=0 (strict) — every collision flags alreadyClaimed.
+	revoked, racing, claimed, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute, 7*24*time.Hour, 0)
 	if err != nil {
 		t.Fatalf("second claim: %v", err)
 	}
-	if revoked {
-		t.Errorf("second claim must not flag familyRevoked")
+	if revoked || racing {
+		t.Errorf("second claim (no grace): want only claimed=true, got revoked=%v racing=%v", revoked, racing)
 	}
 	if !claimed {
 		t.Errorf("second claim must flag alreadyClaimed")
@@ -206,15 +207,15 @@ func TestRedisStore_ClaimOrCheckFamily_FamilyRevoked(t *testing.T) {
 		t.Fatalf("Mark: %v", err)
 	}
 
-	revoked, claimed, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute, 7*24*time.Hour)
+	revoked, racing, claimed, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute, 7*24*time.Hour, 0)
 	if err != nil {
 		t.Fatalf("ClaimOrCheckFamily: %v", err)
 	}
 	if !revoked {
 		t.Errorf("expected familyRevoked=true")
 	}
-	if claimed {
-		t.Errorf("revoked family must NOT also report alreadyClaimed")
+	if claimed || racing {
+		t.Errorf("revoked family must not also report racing/alreadyClaimed: racing=%v claimed=%v", racing, claimed)
 	}
 	// Critical: the claim MUST NOT happen when the family is revoked —
 	// otherwise a leaked tid silently consumes a claim slot for a
@@ -228,7 +229,7 @@ func TestRedisStore_ClaimOrCheckFamily_AppliesPrefix(t *testing.T) {
 	s, mr := newTestRedis(t, "proxy-a:")
 	ctx := context.Background()
 
-	if _, _, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute, 7*24*time.Hour); err != nil {
+	if _, _, _, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute, 7*24*time.Hour, 0); err != nil {
 		t.Fatalf("ClaimOrCheckFamily: %v", err)
 	}
 	if !mr.Exists("proxy-a:tid:A") {
@@ -236,5 +237,59 @@ func TestRedisStore_ClaimOrCheckFamily_AppliesPrefix(t *testing.T) {
 	}
 	if mr.Exists("tid:A") {
 		t.Errorf("bare key must not exist under prefix, keys=%v", mr.Keys())
+	}
+}
+
+// TestRedisStore_ClaimOrCheckFamily_RacingWithinGrace pins T2.3:
+// a second claim within graceWindow returns racing=true and does
+// NOT mark the family revoked.
+func TestRedisStore_ClaimOrCheckFamily_RacingWithinGrace(t *testing.T) {
+	s, mr := newTestRedis(t, "")
+	ctx := context.Background()
+
+	grace := 5 * time.Second
+
+	if _, _, _, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute, 7*24*time.Hour, grace); err != nil {
+		t.Fatalf("first claim: %v", err)
+	}
+	revoked, racing, claimed, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute, 7*24*time.Hour, grace)
+	if err != nil {
+		t.Fatalf("racing claim: %v", err)
+	}
+	if !racing {
+		t.Errorf("want racing=true, got revoked=%v racing=%v claimed=%v", revoked, racing, claimed)
+	}
+	if revoked || claimed {
+		t.Errorf("racing must not co-flag with revoked/claimed")
+	}
+	if mr.Exists("fam:1") {
+		t.Error("racing collision must not write the family-revoked marker")
+	}
+}
+
+// TestRedisStore_ClaimOrCheckFamily_PastGraceRevokes pins that
+// past-grace collisions fall back to the strict reuse path. Uses
+// a small grace + sleep across the boundary; miniredis advances
+// real wall clock so this works without FastForward. Margins are
+// generous enough to stay stable on a slow CI runner under -race.
+func TestRedisStore_ClaimOrCheckFamily_PastGraceRevokes(t *testing.T) {
+	s, mr := newTestRedis(t, "")
+	ctx := context.Background()
+
+	grace := 200 * time.Millisecond
+
+	if _, _, _, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute, 7*24*time.Hour, grace); err != nil {
+		t.Fatalf("first claim: %v", err)
+	}
+	time.Sleep(grace + 100*time.Millisecond)
+	revoked, racing, claimed, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute, 7*24*time.Hour, grace)
+	if err != nil {
+		t.Fatalf("post-grace claim: %v", err)
+	}
+	if !claimed || racing || revoked {
+		t.Fatalf("post-grace: want only claimed=true, got revoked=%v racing=%v claimed=%v", revoked, racing, claimed)
+	}
+	if !mr.Exists("fam:1") {
+		t.Error("post-grace reuse must atomically write the family-revoked marker")
 	}
 }

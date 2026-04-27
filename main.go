@@ -362,7 +362,9 @@ func main() {
 		GroupsClaim:   cfg.GroupsClaim,
 		ReplayStore:   replayStore,
 	}))
-	r.With(tokenLimit).Post("/token", handlers.Token(tm, logger, cfg.ProxyBaseURL, cfg.RevokeBefore, replayStore, cfg.ProxyBaseURL+cfg.UpstreamMCPMountPath))
+	r.With(tokenLimit).Post("/token", handlers.Token(tm, logger, cfg.ProxyBaseURL, cfg.RevokeBefore, replayStore, handlers.TokenConfig{
+		RefreshRaceGrace: cfg.RefreshRaceGrace,
+	}, cfg.ProxyBaseURL+cfg.UpstreamMCPMountPath))
 
 	// Liveness probe: always 200 as long as the process is up.
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {

@@ -239,6 +239,71 @@ func TestLoad_RevokeBefore_Unset(t *testing.T) {
 	}
 }
 
+func TestLoad_RefreshRaceGrace_Default(t *testing.T) {
+	setAllRequired(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.RefreshRaceGrace != 2*time.Second {
+		t.Errorf("RefreshRaceGrace default = %v, want 2s", cfg.RefreshRaceGrace)
+	}
+}
+
+func TestLoad_RefreshRaceGrace_ZeroDisables(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("REFRESH_RACE_GRACE_SEC", "0")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.RefreshRaceGrace != 0 {
+		t.Errorf("RefreshRaceGrace = %v, want 0 (disabled)", cfg.RefreshRaceGrace)
+	}
+}
+
+func TestLoad_RefreshRaceGrace_Custom(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("REFRESH_RACE_GRACE_SEC", "5")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.RefreshRaceGrace != 5*time.Second {
+		t.Errorf("RefreshRaceGrace = %v, want 5s", cfg.RefreshRaceGrace)
+	}
+}
+
+func TestLoad_RefreshRaceGrace_RejectsNonInt(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("REFRESH_RACE_GRACE_SEC", "two")
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "REFRESH_RACE_GRACE_SEC") {
+		t.Fatalf("want error mentioning REFRESH_RACE_GRACE_SEC, got %v", err)
+	}
+}
+
+func TestLoad_RefreshRaceGrace_RejectsNegative(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("REFRESH_RACE_GRACE_SEC", "-1")
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), ">= 0") {
+		t.Fatalf("want error mentioning >= 0, got %v", err)
+	}
+}
+
+// TestLoad_RefreshRaceGrace_RejectsAboveCeiling pins the 10-second
+// security cap. Wider windows are rejected at startup so the
+// operator cannot quietly extend the attacker's ride window.
+func TestLoad_RefreshRaceGrace_RejectsAboveCeiling(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("REFRESH_RACE_GRACE_SEC", "11")
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "<= 10") {
+		t.Fatalf("want error mentioning <= 10, got %v", err)
+	}
+}
+
 func TestLoad_PKCERequired_Default(t *testing.T) {
 	setAllRequired(t)
 	cfg, err := Load()

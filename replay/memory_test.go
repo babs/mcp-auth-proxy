@@ -117,16 +117,20 @@ func TestMemoryStore_ClaimOrCheckFamily(t *testing.T) {
 	defer func() { _ = s.Close() }()
 	ctx := context.Background()
 
-	// Fresh claim: both flags false.
-	revoked, claimed, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute, 7*24*time.Hour)
-	if err != nil || revoked || claimed {
-		t.Fatalf("first call: revoked=%v claimed=%v err=%v", revoked, claimed, err)
+	// graceWindow=0 keeps the strict "every collision revokes" shape
+	// — pinning the pre-grace behaviour explicitly.
+	const noGrace time.Duration = 0
+
+	// Fresh claim: all flags false.
+	revoked, racing, claimed, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute, 7*24*time.Hour, noGrace)
+	if err != nil || revoked || racing || claimed {
+		t.Fatalf("first call: revoked=%v racing=%v claimed=%v err=%v", revoked, racing, claimed, err)
 	}
 
-	// Re-use same tid: alreadyClaimed=true.
-	revoked, claimed, err = s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute, 7*24*time.Hour)
-	if err != nil || revoked || !claimed {
-		t.Fatalf("second call (reuse): revoked=%v claimed=%v err=%v", revoked, claimed, err)
+	// Re-use same tid with no grace: alreadyClaimed=true.
+	revoked, racing, claimed, err = s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute, 7*24*time.Hour, noGrace)
+	if err != nil || revoked || racing || !claimed {
+		t.Fatalf("second call (reuse, no grace): revoked=%v racing=%v claimed=%v err=%v", revoked, racing, claimed, err)
 	}
 
 	// Mark the family revoked, then try a fresh tid: familyRevoked=true,
@@ -134,9 +138,9 @@ func TestMemoryStore_ClaimOrCheckFamily(t *testing.T) {
 	if err := s.Mark(ctx, "fam:1", time.Minute); err != nil {
 		t.Fatalf("Mark family: %v", err)
 	}
-	revoked, claimed, err = s.ClaimOrCheckFamily(ctx, "fam:1", "tid:B", time.Minute, 7*24*time.Hour)
-	if err != nil || !revoked || claimed {
-		t.Fatalf("after revoke: revoked=%v claimed=%v err=%v", revoked, claimed, err)
+	revoked, racing, claimed, err = s.ClaimOrCheckFamily(ctx, "fam:1", "tid:B", time.Minute, 7*24*time.Hour, noGrace)
+	if err != nil || !revoked || racing || claimed {
+		t.Fatalf("after revoke: revoked=%v racing=%v claimed=%v err=%v", revoked, racing, claimed, err)
 	}
 	// Confirm the revoked branch did not leak a claim on tid:B.
 	ok, err := s.Exists(ctx, "tid:B")
@@ -145,6 +149,68 @@ func TestMemoryStore_ClaimOrCheckFamily(t *testing.T) {
 	}
 	if ok {
 		t.Error("revoked family must NOT claim the tid")
+	}
+}
+
+// TestMemoryStore_ClaimOrCheckFamily_RacingWithinGrace pins the
+// new T2.3 grace-window behavior on the in-memory store. A second
+// claim within graceWindow returns racing=true and does NOT revoke
+// the family.
+func TestMemoryStore_ClaimOrCheckFamily_RacingWithinGrace(t *testing.T) {
+	s := NewMemoryStore()
+	defer func() { _ = s.Close() }()
+	ctx := context.Background()
+
+	grace := 5 * time.Second
+
+	// First claim sets the entry's setAt to ~now.
+	if _, _, _, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute, 7*24*time.Hour, grace); err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+
+	// Second claim within grace: racing=true, family NOT revoked.
+	revoked, racing, claimed, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute, 7*24*time.Hour, grace)
+	if err != nil {
+		t.Fatalf("racing call: %v", err)
+	}
+	if revoked || claimed {
+		t.Fatalf("racing call: want only racing=true, got revoked=%v racing=%v claimed=%v", revoked, racing, claimed)
+	}
+	if !racing {
+		t.Error("racing call: want racing=true")
+	}
+	// Confirm the family was NOT marked.
+	if exists, _ := s.Exists(ctx, "fam:1"); exists {
+		t.Error("racing collision must not revoke the family")
+	}
+}
+
+// TestMemoryStore_ClaimOrCheckFamily_PastGraceRevokes pins that a
+// collision past the grace window still triggers the strict reuse
+// path (alreadyClaimed=true, family revoked). Drives the boundary
+// by using a small grace + a sleep across it. Margins are generous
+// enough to stay stable on a slow CI runner under -race.
+func TestMemoryStore_ClaimOrCheckFamily_PastGraceRevokes(t *testing.T) {
+	s := NewMemoryStore()
+	defer func() { _ = s.Close() }()
+	ctx := context.Background()
+
+	grace := 200 * time.Millisecond
+
+	if _, _, _, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute, 7*24*time.Hour, grace); err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+	time.Sleep(grace + 100*time.Millisecond)
+	revoked, racing, claimed, err := s.ClaimOrCheckFamily(ctx, "fam:1", "tid:A", time.Minute, 7*24*time.Hour, grace)
+	if err != nil {
+		t.Fatalf("post-grace call: %v", err)
+	}
+	if !claimed || racing || revoked {
+		t.Fatalf("post-grace: want claimed=true only, got revoked=%v racing=%v claimed=%v", revoked, racing, claimed)
+	}
+	// Family must be revoked atomically alongside the alreadyClaimed signal.
+	if exists, _ := s.Exists(ctx, "fam:1"); !exists {
+		t.Error("post-grace reuse must atomically revoke the family")
 	}
 }
 
