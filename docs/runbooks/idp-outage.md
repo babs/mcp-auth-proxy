@@ -78,6 +78,37 @@ rollout-restart.
   `OIDC_ISSUER_URL`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET` and a
   rollout.
 
+### IdP overload — proxy → IdP rate-bucket
+
+If `mcp_auth_idp_exchange_throttled_total` is climbing while
+inbound traffic stays steady, the optional outbound rate-bucket
+(`IDP_EXCHANGE_RATE_PER_SEC` + `IDP_EXCHANGE_BURST`) is doing its
+job — capping proxy → IdP fan-out at `/callback` so the IdP isn't
+hammered. Throttled requests return 503 `idp_exchange_throttled`
++ `Retry-After: 1`; the user retries and gets through once the
+bucket refills.
+
+Tuning playbook (only if the bucket is wired):
+
+1. **Start liberal, narrow if alerting fires.** Default 20/sec +
+   burst 50 is generous for a typical MCP deployment doing <1
+   auth/sec. Most operators never need this enabled.
+2. **Per-replica scope.** The limiter is in-process. An
+   `N`-replica Deployment admits up to `N × IDP_EXCHANGE_RATE_PER_SEC`
+   to the IdP. Divide your IdP-side ceiling by replica count.
+3. **If `idp_exchange_throttled_total` climbs under steady
+   inbound traffic, two distinct causes:**
+   a. A distributed flood is slipping past the per-IP limiter
+      (check `TRUSTED_PROXY_CIDRS` — a permissive XFF trust
+      matrix can be the culprit).
+   b. The IdP itself is slow enough that the bucket refills
+      slower than it drains. In that case raise the rate
+      cautiously after confirming the IdP can handle it.
+4. **Do not raise the rate to "make the alert go away".** The
+   bucket exists to protect the IdP; bypassing it can cascade
+   the IdP outage into a proxy outage when the IdP eventually
+   drops requests on the floor.
+
 ## Prevention
 
 - **Monitor the IdP's availability independently** of the proxy.

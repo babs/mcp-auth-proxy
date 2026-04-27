@@ -304,6 +304,63 @@ func TestLoad_RefreshRaceGrace_RejectsAboveCeiling(t *testing.T) {
 	}
 }
 
+func TestLoad_IdPExchangeRate_DefaultDisabled(t *testing.T) {
+	setAllRequired(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.IdPExchangeRatePerSec != 0 {
+		t.Errorf("IdPExchangeRatePerSec default = %v, want 0 (disabled)", cfg.IdPExchangeRatePerSec)
+	}
+	if cfg.IdPExchangeBurst != 50 {
+		t.Errorf("IdPExchangeBurst default = %d, want 50", cfg.IdPExchangeBurst)
+	}
+}
+
+func TestLoad_IdPExchangeRate_Custom(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("IDP_EXCHANGE_RATE_PER_SEC", "20")
+	t.Setenv("IDP_EXCHANGE_BURST", "100")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.IdPExchangeRatePerSec != 20 {
+		t.Errorf("IdPExchangeRatePerSec = %v, want 20", cfg.IdPExchangeRatePerSec)
+	}
+	if cfg.IdPExchangeBurst != 100 {
+		t.Errorf("IdPExchangeBurst = %d, want 100", cfg.IdPExchangeBurst)
+	}
+}
+
+func TestLoad_IdPExchangeRate_RejectsNegative(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("IDP_EXCHANGE_RATE_PER_SEC", "-1")
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "IDP_EXCHANGE_RATE_PER_SEC") {
+		t.Fatalf("want error mentioning IDP_EXCHANGE_RATE_PER_SEC, got %v", err)
+	}
+}
+
+func TestLoad_IdPExchangeRate_RejectsNonNumber(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("IDP_EXCHANGE_RATE_PER_SEC", "fast")
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "must be a number") {
+		t.Fatalf("want parse error, got %v", err)
+	}
+}
+
+func TestLoad_IdPExchangeBurst_RejectsZero(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("IDP_EXCHANGE_BURST", "0")
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), ">= 1") {
+		t.Fatalf("want >= 1 rejection, got %v", err)
+	}
+}
+
 func TestLoad_PKCERequired_Default(t *testing.T) {
 	setAllRequired(t)
 	cfg, err := Load()

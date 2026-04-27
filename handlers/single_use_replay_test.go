@@ -19,6 +19,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 	"golang.org/x/oauth2"
+	"golang.org/x/time/rate"
 )
 
 // erroringStore is a replay.Store stub for driving the
@@ -401,6 +402,98 @@ func TestCallback_SingleUse_StoreErrorFailClosed(t *testing.T) {
 	if got := testutil.ToFloat64(metrics.AccessDenied.WithLabelValues("replay_store_unavailable")); got-before != 1 {
 		t.Errorf("AccessDenied{reason=replay_store_unavailable} delta = %v, want 1", got-before)
 	}
+}
+
+// --- T2.2: outbound rate-bucket on the /callback IdP exchange ---
+
+// TestCallback_IdPExchangeThrottled pins T2.2: when the wired
+// rate.Limiter rejects the call, /callback returns 503
+// temporarily_unavailable + error_code=idp_exchange_throttled
+// BEFORE reaching the upstream IdP exchange. The verifyFunc must
+// not run, and mcp_auth_idp_exchange_throttled_total increments.
+func TestCallback_IdPExchangeThrottled(t *testing.T) {
+	tm := newTestTokenManager(t)
+	oauth2Cfg := testOAuth2Config()
+	verifyFunc := func(_ context.Context, _ string) (*oidc.IDToken, error) {
+		t.Fatalf("verifyFunc must not run when the IdP exchange is throttled")
+		return nil, nil
+	}
+
+	// Tiny rate + 1-token burst, drained immediately, models an
+	// exhausted bucket that won't refill within the test window
+	// (replenishes at 1/1000s ≈ once every ~17min). More
+	// future-proof than rate.NewLimiter(0, 0): the upstream
+	// `golang.org/x/time/rate` package contract for "rate=0,
+	// burst=0" has shifted between versions, but a real positive
+	// rate with the burst pre-drained is unambiguously empty.
+	limiter := rate.NewLimiter(0.001, 1)
+	if !limiter.Allow() {
+		t.Fatal("limiter setup: initial Allow should succeed to drain the burst")
+	}
+
+	state := mintCallbackSession(t, tm, uuid.NewString())
+
+	before := testutil.ToFloat64(metrics.IdPExchangeThrottled)
+
+	req := httptest.NewRequest(http.MethodGet, "/callback?code=fake&state="+url.QueryEscape(state), nil)
+	rr := httptest.NewRecorder()
+	CallbackWithVerifyFunc(tm, zap.NewNop(), testBaseURL, oauth2Cfg, verifyFunc, CallbackConfig{IdPExchangeLimiter: limiter})(rr, req)
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("want 503, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if got := rr.Header().Get("Retry-After"); got == "" {
+		t.Errorf("want Retry-After header, got empty")
+	}
+	var oauthErr OAuthError
+	if err := json.NewDecoder(rr.Body).Decode(&oauthErr); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if oauthErr.Error != "temporarily_unavailable" {
+		t.Errorf("error = %q, want temporarily_unavailable", oauthErr.Error)
+	}
+	if oauthErr.ErrorCode != "idp_exchange_throttled" {
+		t.Errorf("error_code = %q, want idp_exchange_throttled", oauthErr.ErrorCode)
+	}
+	if got := testutil.ToFloat64(metrics.IdPExchangeThrottled); got-before != 1 {
+		t.Errorf("IdPExchangeThrottled delta = %v, want 1", got-before)
+	}
+}
+
+// TestCallback_IdPExchangeNoLimiter pins the back-compat path:
+// when no limiter is wired (the default) /callback proceeds to the
+// IdP exchange exactly as it did before T2.2. Any operator who
+// leaves IDP_EXCHANGE_RATE_PER_SEC unset gets the previous
+// behavior with no throttling overhead.
+func TestCallback_IdPExchangeNoLimiter(t *testing.T) {
+	tm := newTestTokenManager(t)
+	oauth2Cfg := testOAuth2Config()
+	exchangeReached := false
+	verifyFunc := func(_ context.Context, _ string) (*oidc.IDToken, error) {
+		exchangeReached = true
+		return nil, errors.New("not used — exchange happens before verify")
+	}
+
+	state := mintCallbackSession(t, tm, uuid.NewString())
+
+	req := httptest.NewRequest(http.MethodGet, "/callback?code=fake&state="+url.QueryEscape(state), nil)
+	rr := httptest.NewRecorder()
+	CallbackWithVerifyFunc(tm, zap.NewNop(), testBaseURL, oauth2Cfg, verifyFunc, CallbackConfig{})(rr, req)
+
+	// We don't assert the final status — the upstream Exchange
+	// fails (no real IdP) and that path returns 502 — what we
+	// pin is that the throttle branch did NOT short-circuit.
+	if rr.Code == http.StatusServiceUnavailable {
+		var oauthErr OAuthError
+		if err := json.NewDecoder(rr.Body).Decode(&oauthErr); err == nil && oauthErr.ErrorCode == "idp_exchange_throttled" {
+			t.Fatalf("nil limiter must not throttle: %s", rr.Body.String())
+		}
+	}
+	// verifyFunc would only run after a successful Exchange; with a
+	// fake config Exchange itself errors first. The point is no
+	// throttle-branch short-circuit. exchangeReached being false is
+	// expected here; just confirm we didn't 503-throttle.
+	_ = exchangeReached
 }
 
 // TestAuthorize_RenderConsent_PopulatesJTI pins that GET /authorize

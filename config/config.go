@@ -62,6 +62,16 @@ type Config struct {
 	// applies. Default 2s; clamped to [0, 10s] at Load. Set to 0 to
 	// keep the strict pre-grace behavior. env: REFRESH_RACE_GRACE_SEC.
 	RefreshRaceGrace time.Duration
+	// IdPExchangeRatePerSec caps the proxy → IdP token-endpoint
+	// fan-out at /callback. Defense in depth: a flood of /callback
+	// hits that slips past the per-IP limiter (distributed sources,
+	// permissive XFF trust matrix) is bounded by this token-bucket
+	// before reaching the IdP. 0 disables (no outbound throttling).
+	// env: IDP_EXCHANGE_RATE_PER_SEC.
+	IdPExchangeRatePerSec float64
+	// IdPExchangeBurst is the burst size for the IdP-exchange limiter
+	// when IdPExchangeRatePerSec > 0. env: IDP_EXCHANGE_BURST.
+	IdPExchangeBurst int
 	// CompatAllowStateless keeps the legacy Cursor/MCP Inspector behavior of
 	// accepting /authorize requests without a client-supplied state. Default
 	// false — strict mode refuses stateless requests so the client cannot
@@ -313,6 +323,33 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("REFRESH_RACE_GRACE_SEC must be <= 10; got %d (wider windows are statistically attacker-shaped)", n)
 		}
 		c.RefreshRaceGrace = time.Duration(n) * time.Second
+	}
+
+	// IDP_EXCHANGE_RATE_PER_SEC + IDP_EXCHANGE_BURST tune the
+	// outbound rate-limit bucket on the proxy → IdP /token leg.
+	// 0 disables. Default off — operators behind a permissive XFF
+	// trust matrix or facing distributed flood patterns opt in
+	// explicitly.
+	if raw := os.Getenv("IDP_EXCHANGE_RATE_PER_SEC"); raw != "" {
+		f, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return nil, fmt.Errorf("IDP_EXCHANGE_RATE_PER_SEC must be a number: %w", err)
+		}
+		if f < 0 {
+			return nil, fmt.Errorf("IDP_EXCHANGE_RATE_PER_SEC must be >= 0; got %v", f)
+		}
+		c.IdPExchangeRatePerSec = f
+	}
+	c.IdPExchangeBurst = 50
+	if raw := os.Getenv("IDP_EXCHANGE_BURST"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			return nil, fmt.Errorf("IDP_EXCHANGE_BURST must be an integer: %w", err)
+		}
+		if n < 1 {
+			return nil, fmt.Errorf("IDP_EXCHANGE_BURST must be >= 1; got %d", n)
+		}
+		c.IdPExchangeBurst = n
 	}
 
 	if ag := os.Getenv("ALLOWED_GROUPS"); ag != "" {

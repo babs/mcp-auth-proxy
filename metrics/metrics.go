@@ -101,6 +101,18 @@ var (
 		Help: "Requests rejected by the per-IP rate limiter, by endpoint.",
 	}, []string{"endpoint"})
 
+	// IdPExchangeThrottled counts /callback hits whose upstream IdP
+	// token-endpoint exchange was throttled by the proxy's outbound
+	// rate-limit bucket (defense in depth on the proxy → IdP leg).
+	// A spike here under steady inbound traffic usually means a
+	// distributed flood is slipping past the per-IP limiter or the
+	// IdP itself is slow enough that the bucket is filling faster
+	// than it drains.
+	IdPExchangeThrottled = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "mcp_auth_idp_exchange_throttled_total",
+		Help: "Upstream IdP token-endpoint exchanges denied by the proxy outbound rate-limit bucket.",
+	})
+
 	// ConsentDecisions counts user clicks on the proxy-rendered
 	// consent page, labelled by outcome (approved / denied). Distinct
 	// from AccessDenied: a user clicking "Deny" is not a policy
