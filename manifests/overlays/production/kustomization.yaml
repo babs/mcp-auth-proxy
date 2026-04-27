@@ -1,0 +1,43 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: mcp-auth-proxy
+
+resources:
+  - ../../k8s
+  - networkpolicy.yaml
+
+images:
+  - name: ghcr.io/babs/mcp-auth-proxy
+    newTag: 1.0.0
+
+configMapGenerator:
+  - name: mcp-auth-proxy-config
+    namespace: mcp-auth-proxy
+    behavior: replace
+    literals:
+      - "OIDC_ISSUER_URL=https://idp.example.com/realms/mcp"
+      - "OIDC_CLIENT_ID=mcp-auth-proxy"
+      - "PROXY_BASE_URL=https://mcp.example.com"
+      - "UPSTREAM_MCP_URL=http://mcp-server.mcp.svc.cluster.local:8080/mcp"
+      - "REDIS_URL=redis://redis:6379/0"
+      - "REDIS_REQUIRED=true"
+      - "REDIS_KEY_PREFIX=mcp-auth-proxy:"
+      - "LISTEN_ADDR=:8080"
+      - "METRICS_ADDR=:9090"
+      - "LOG_LEVEL=info"
+      - "PKCE_REQUIRED=true"
+      - "RATE_LIMIT_ENABLED=true"
+      - "SHUTDOWN_TIMEOUT=120s"
+      - "GROUPS_CLAIM=groups"
+      - "COMPAT_ALLOW_STATELESS=false"
+      - "PROD_MODE=true"
+      - "TRUSTED_PROXY_CIDRS=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+      - "TRUSTED_PROXY_HEADER=X-Forwarded-For"
+      - "MCP_PER_SUBJECT_CONCURRENCY=16"
+      - "MCP_LOG_BODY_MAX=65536"
+
+patches:
+  - path: deployment-patch.yaml
+  - path: redis-delete-patch.yaml
+  - path: secret-delete-patch.yaml

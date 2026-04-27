@@ -72,6 +72,17 @@ kubectl apply -f manifests/k8s/ingress.example.yaml  # fill in hostname first
 
 See [`k8s/README.md`](k8s/README.md) for the full checklist.
 
+For production-like clusters, start from the kustomize overlay at
+[`overlays/production`](overlays/production). It renders a
+version-pinned, `PROD_MODE=true` deployment with NetworkPolicy and
+stricter resource defaults. Copy it into your environment repo and set
+the IdP, ingress, upstream, Redis, trusted-proxy CIDR, NetworkPolicy
+selector, and image values before applying.
+
+The base K8s manifests keep a demo Redis deployment for turnkey local
+testing. The production overlay deletes that demo Redis and expects a
+managed or operator-managed Redis endpoint.
+
 ---
 
 ## MCP server choice
