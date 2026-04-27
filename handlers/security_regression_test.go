@@ -283,7 +283,7 @@ func TestRegister_RejectsTooManyRedirectURIs(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(string(body)))
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
-	Register(tm, zap.NewNop(), testBaseURL)(rr, req)
+	Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("M5 count cap: expected 400, got %d: %s", rr.Code, rr.Body.String())
@@ -304,7 +304,7 @@ func TestRegister_RejectsOversizeRedirectURI(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(string(body)))
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
-	Register(tm, zap.NewNop(), testBaseURL)(rr, req)
+	Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("M5 length cap: expected 400, got %d: %s", rr.Code, rr.Body.String())
@@ -325,7 +325,7 @@ func TestRegister_RejectsOversizeClientName(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(string(body)))
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
-	Register(tm, zap.NewNop(), testBaseURL)(rr, req)
+	Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("client_name cap: expected 400, got %d: %s", rr.Code, rr.Body.String())
@@ -350,7 +350,7 @@ func TestRegister_OversizedBodyReturns413(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
-	Register(tm, zap.NewNop(), testBaseURL)(rr, req)
+	Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
 
 	if rr.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status = %d, want 413", rr.Code)
@@ -374,7 +374,7 @@ func TestRegister_MalformedBodyReturns400(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader("not-json"))
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
-	Register(tm, zap.NewNop(), testBaseURL)(rr, req)
+	Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rr.Code)
@@ -416,7 +416,7 @@ func TestRegister_RejectsClientNameControlBytes(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(string(body)))
 			req.Header.Set("Content-Type", "application/json")
 			rr := httptest.NewRecorder()
-			Register(tm, zap.NewNop(), testBaseURL)(rr, req)
+			Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
 
 			if rr.Code != http.StatusBadRequest {
 				t.Fatalf("status = %d, want 400", rr.Code)
@@ -447,7 +447,7 @@ func TestRegister_RejectsFragmentAndUserinfo(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(string(body)))
 			req.Header.Set("Content-Type", "application/json")
 			rr := httptest.NewRecorder()
-			Register(tm, zap.NewNop(), testBaseURL)(rr, req)
+			Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
 
 			if rr.Code != http.StatusBadRequest {
 				t.Fatalf("M6 %s: expected 400, got %d: %s", tc.name, rr.Code, rr.Body.String())
@@ -540,7 +540,7 @@ func TestRegister_RejectsNonHTTPScheme(t *testing.T) {
 			req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/register", strings.NewReader(string(body)))
 			req.Header.Set("Content-Type", "application/json")
 			rr := httptest.NewRecorder()
-			Register(tm, zap.NewNop(), testBaseURL)(rr, req)
+			Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
 			if rr.Code != http.StatusBadRequest {
 				t.Fatalf("scheme %q: expected 400, got %d: %s", uri, rr.Code, rr.Body.String())
 			}

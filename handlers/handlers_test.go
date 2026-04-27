@@ -67,7 +67,7 @@ func registerClient(t *testing.T, tm *token.Manager, redirectURIs []string) (enc
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 
-	Register(tm, zap.NewNop(), testBaseURL)(rr, req)
+	Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
 
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("registerClient: expected 201, got %d: %s", rr.Code, rr.Body.String())
@@ -238,7 +238,7 @@ func TestRegister_Success(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 
-	Register(tm, zap.NewNop(), testBaseURL)(rr, req)
+	Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
 
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %s", rr.Code, rr.Body.String())
@@ -268,9 +268,9 @@ func TestRegister_Success(t *testing.T) {
 		t.Errorf("client_id_expires_at=%d must be > client_id_issued_at=%d",
 			resp.ClientIDExpiresAt, resp.ClientIDIssuedAt)
 	}
-	// Must be ~clientTTL (24h) away from issued_at; allow ±1 min slop.
-	if delta := resp.ClientIDExpiresAt - resp.ClientIDIssuedAt; delta < int64(clientTTL.Seconds())-60 || delta > int64(clientTTL.Seconds())+60 {
-		t.Errorf("client_id_expires_at delta = %ds, want ~%ds", delta, int64(clientTTL.Seconds()))
+	// Must be ~DefaultClientTTL (7d) away from issued_at; allow ±1 min slop.
+	if delta := resp.ClientIDExpiresAt - resp.ClientIDIssuedAt; delta < int64(DefaultClientTTL.Seconds())-60 || delta > int64(DefaultClientTTL.Seconds())+60 {
+		t.Errorf("client_id_expires_at delta = %ds, want ~%ds", delta, int64(DefaultClientTTL.Seconds()))
 	}
 	// RFC 7591 §3.2.1: registered client_name must be echoed back.
 	if resp.ClientName != "my-app" {
@@ -304,7 +304,7 @@ func TestRegister_UnsupportedAuthMethod(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 
-	Register(tm, zap.NewNop(), testBaseURL)(rr, req)
+	Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
@@ -326,7 +326,7 @@ func TestRegister_ExplicitNoneAuthMethod(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 
-	Register(tm, zap.NewNop(), testBaseURL)(rr, req)
+	Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
 
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %s", rr.Code, rr.Body.String())
@@ -348,7 +348,7 @@ func TestRegister_MissingRedirectURIs(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 
-	Register(tm, zap.NewNop(), testBaseURL)(rr, req)
+	Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", rr.Code)
@@ -371,7 +371,7 @@ func TestRegister_InvalidJSON(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 
-	Register(tm, zap.NewNop(), testBaseURL)(rr, req)
+	Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", rr.Code)
@@ -394,7 +394,7 @@ func TestRegister_RejectsTrailingJSON(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 
-	Register(tm, zap.NewNop(), testBaseURL)(rr, req)
+	Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
@@ -1573,7 +1573,7 @@ func TestRegister_RejectsHTTPNonLoopback(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 
-	Register(tm, zap.NewNop(), testBaseURL)(rr, req)
+	Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
@@ -1606,7 +1606,7 @@ func TestRegister_AllowsHTTPLoopback(t *testing.T) {
 			req.Header.Set("Content-Type", "application/json")
 			rr := httptest.NewRecorder()
 
-			Register(tm, zap.NewNop(), testBaseURL)(rr, req)
+			Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
 
 			if rr.Code != http.StatusCreated {
 				t.Fatalf("expected 201 for loopback URI %q, got %d: %s", uri, rr.Code, rr.Body.String())
@@ -1748,6 +1748,87 @@ func TestTokenAuthCode_ExpiredClient(t *testing.T) {
 	json.NewDecoder(rr.Body).Decode(&oauthErr)
 	if oauthErr.Error != "invalid_client" {
 		t.Errorf("expected error 'invalid_client', got %q", oauthErr.Error)
+	}
+}
+
+// TestTokenRefresh_ClientLifecycleAroundTTL pins three boundary
+// points around CLIENT_REGISTRATION_TTL using a single sealed
+// shape and varying the synthetic age:
+//
+//   - 48h old (well past the prior 24h hardcode) → rotation
+//     succeeds. This is the regression case that motivated the
+//     fix; users were hitting invalid_client even with a
+//     still-valid refresh token.
+//   - 6d23h old (just inside the 7d default envelope) → rotation
+//     succeeds. Pins the lower edge of the boundary so a future
+//     accidental TTL shrinkage (e.g. someone swapping refresh
+//     and client TTLs) breaks here.
+//   - 1m past expiry → rotation rejects with invalid_client.
+//     Pins the upper edge: an expired client_id MUST NOT keep
+//     working under any path.
+func TestTokenRefresh_ClientLifecycleAroundTTL(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+
+	tests := []struct {
+		name       string
+		expiresAt  time.Time
+		wantStatus int
+	}{
+		{
+			name:       "48h_old_well_inside_default",
+			expiresAt:  time.Now().Add(-48*time.Hour + DefaultClientTTL),
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "6d23h_old_just_inside_boundary",
+			expiresAt:  time.Now().Add(time.Hour), // ~1h before expiry under 7d TTL
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "1m_past_expiry_must_reject",
+			expiresAt:  time.Now().Add(-1 * time.Minute),
+			wantStatus: http.StatusBadRequest,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sc := sealedClient{
+				ID:           "lifecycle-client-" + tc.name,
+				RedirectURIs: []string{"https://app.example.com/callback"},
+				ClientName:   "lifecycle",
+				Typ:          token.PurposeClient,
+				Audience:     testBaseURL,
+				ExpiresAt:    tc.expiresAt,
+			}
+			encClientID, err := tm.SealJSON(sc, token.PurposeClient)
+			if err != nil {
+				t.Fatalf("SealJSON: %v", err)
+			}
+			refreshTokenStr := sealRefresh(t, tm, "user-sub", "user@example.com", sc.ID)
+
+			form := url.Values{
+				"grant_type":    {"refresh_token"},
+				"refresh_token": {refreshTokenStr},
+				"client_id":     {encClientID},
+			}
+			req := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(form.Encode()))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			rr := httptest.NewRecorder()
+			Token(tm, logger, testBaseURL, time.Time{}, nil, TokenConfig{})(rr, req)
+
+			if rr.Code != tc.wantStatus {
+				t.Fatalf("%s: want status %d, got %d (body: %s)", tc.name, tc.wantStatus, rr.Code, rr.Body.String())
+			}
+			if tc.wantStatus == http.StatusBadRequest {
+				var oauthErr OAuthError
+				_ = json.NewDecoder(rr.Body).Decode(&oauthErr)
+				if oauthErr.Error != "invalid_client" {
+					t.Errorf("%s: error = %q, want invalid_client", tc.name, oauthErr.Error)
+				}
+			}
+		})
 	}
 }
 
@@ -4230,7 +4311,7 @@ func TestRegister_RejectsHostlessOrOpaque(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(body))
 			req.Header.Set("Content-Type", "application/json")
 			rr := httptest.NewRecorder()
-			Register(tm, logger, testBaseURL)(rr, req)
+			Register(tm, logger, testBaseURL, DefaultClientTTL)(rr, req)
 
 			if rr.Code != http.StatusBadRequest {
 				t.Fatalf("redirect_uri=%q: want 400, got %d body=%s", u, rr.Code, rr.Body.String())

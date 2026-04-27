@@ -72,6 +72,15 @@ type Config struct {
 	// IdPExchangeBurst is the burst size for the IdP-exchange limiter
 	// when IdPExchangeRatePerSec > 0. env: IDP_EXCHANGE_BURST.
 	IdPExchangeBurst int
+	// ClientRegistrationTTL is the lifetime of a sealed client_id
+	// minted by POST /register. Defaults to 7 days so the envelope
+	// always covers a full refresh-token cycle — a shorter value
+	// would silently kill long-running MCP clients (which treat DCR
+	// as one-shot at startup) the moment their access token first
+	// expired. env: CLIENT_REGISTRATION_TTL (Go duration: 168h, 7d-
+	// equivalent values like 168h0m0s, etc.; "d" suffix not supported
+	// by time.ParseDuration).
+	ClientRegistrationTTL time.Duration
 	// CompatAllowStateless keeps the legacy Cursor/MCP Inspector behavior of
 	// accepting /authorize requests without a client-supplied state. Default
 	// false — strict mode refuses stateless requests so the client cannot
@@ -350,6 +359,27 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("IDP_EXCHANGE_BURST must be >= 1; got %d", n)
 		}
 		c.IdPExchangeBurst = n
+	}
+
+	// CLIENT_REGISTRATION_TTL: how long a sealed client_id stays
+	// openable. Default 7d so a client holding a still-valid
+	// refresh token (refreshTokenTTL = 7d) can always exchange it.
+	// Hard cap at 90d — a longer envelope materially extends the
+	// window an exfiltrated client_id (which is unauthenticated
+	// metadata) can be reused.
+	c.ClientRegistrationTTL = 7 * 24 * time.Hour
+	if raw := os.Getenv("CLIENT_REGISTRATION_TTL"); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return nil, fmt.Errorf("CLIENT_REGISTRATION_TTL must be a Go duration (e.g. 168h, 24h, 720h): %w", err)
+		}
+		if d <= 0 {
+			return nil, fmt.Errorf("CLIENT_REGISTRATION_TTL must be positive, got %s", d)
+		}
+		if d > 90*24*time.Hour {
+			return nil, fmt.Errorf("CLIENT_REGISTRATION_TTL exceeds 90d cap, got %s", d)
+		}
+		c.ClientRegistrationTTL = d
 	}
 
 	if ag := os.Getenv("ALLOWED_GROUPS"); ag != "" {
