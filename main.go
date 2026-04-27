@@ -351,10 +351,13 @@ func main() {
 	// /consent POST, and the two consume from independent buckets
 	// so a human who clicks Approve quickly after Authorize doesn't
 	// halve the per-IP budget for either path.
-	r.With(consentLimit).Post("/consent", handlers.Consent(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, handlers.ConsentConfig{}))
+	r.With(consentLimit).Post("/consent", handlers.Consent(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, handlers.ConsentConfig{
+		ReplayStore: replayStore,
+	}))
 	r.With(callbackLimit).Get("/callback", handlers.Callback(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, idTokenVerifier, handlers.CallbackConfig{
 		AllowedGroups: cfg.AllowedGroups,
 		GroupsClaim:   cfg.GroupsClaim,
+		ReplayStore:   replayStore,
 	}))
 	r.With(tokenLimit).Post("/token", handlers.Token(tm, logger, cfg.ProxyBaseURL, cfg.RevokeBefore, replayStore, cfg.ProxyBaseURL+cfg.UpstreamMCPMountPath))
 

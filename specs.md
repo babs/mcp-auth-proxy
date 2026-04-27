@@ -334,7 +334,7 @@ Always registered. Driven by the consent form rendered at step 3 of `/authorize`
 3. **`action=approve`:** mint upstream OIDC `nonce` (random 32 hex) + upstream PKCE verifier, regenerate the H6 server-side PKCE pair if the consent blob recorded one, seal a `sealedSession` (same shape as step 4 of `/authorize`), redirect 302 to the IdP. Increment `mcp_auth_consent_decisions_total{decision="approved"}`.
 4. **Anything else:** 400 `invalid_request`.
 
-**Why no replay-store integration on `consent_token`:** within the 5-min TTL the token can be redeemed multiple times. Each Approve mints a *new* `sealedSession` (different `nonce` / verifier), and the IdP login still has to complete; each Deny just emits another `error=access_denied` to the registered `redirect_uri`. Neither path produces an effect the original user couldn't produce themselves by clicking again. Adding a Redis claim would be belt-and-braces against an attacker who exfiltrated the consent_token (a stronger compromise than this defense addresses) — accepted as a deliberate trade-off rather than a default.
+**Single-use replay defense on `consent_token`:** when a replay store is wired (`REDIS_URL`), the consent token's `jti` is claimed atomically before either branch runs — a captured `consent_token` can be redeemed at most once for either Approve or Deny. Each GET `/authorize` render mints a fresh `jti`, so the back-button case still works (a re-render gets a new claim slot, the prior one is dead once redeemed). On replay: 400 `invalid_request` with `error_code=consent_replay`, `mcp_auth_replay_detected_total{kind="consent"}` increments. With no replay store wired (configured opt-out) the handler falls back to the prior stateless behavior (token unique, audience-bound, TTL-bounded, but replayable within the 5-min window).
 
 ---
 
@@ -345,13 +345,14 @@ Always registered. Driven by the consent form rendered at step 3 of `/authorize`
 **Behavior:**
 1. If the IdP returns an `error` (RFC 6749 §4.1.2.1), propagate it to the client
 2. Decrypt the `state` → retrieve the session, verify not expired
-3. Exchange the code with the IdP (POST token endpoint, 10s timeout) to obtain `id_token` + `access_token`
-4. Validate the `id_token` via go-oidc (JWKS signature auto-discovery, issuer, audience)
-5. Extract claims: `sub`, `email`, `email_verified`, `name`
-6. If `email_verified` is present and false, reject with 403 `access_denied` + `error_code: email_not_verified` (absent claim is accepted — not all IdPs emit it)
-7. Extract groups from the configured claim (`GROUPS_CLAIM`, default `groups`)
-8. If `ALLOWED_GROUPS` is configured, verify the user belongs to at least one allowed group → 403 otherwise
-9. Encrypt an internal authorization code with AES-GCM (60s TTL):
+3. **Single-use claim** on the session's `sid` when a replay store is wired — a replayed `/callback` is rejected with 400 `invalid_request` + `error_code=callback_state_replay` BEFORE the upstream IdP exchange runs (no fan-out, no audit-log noise). `mcp_auth_replay_detected_total{kind="callback_state"}` increments. Empty `sid` (legacy session in flight during rollout) falls through to stateless behavior. Store-error path fail-closes to 503 + `replay_store_unavailable`.
+4. Exchange the code with the IdP (POST token endpoint, 10s timeout) to obtain `id_token` + `access_token`
+5. Validate the `id_token` via go-oidc (JWKS signature auto-discovery, issuer, audience)
+6. Extract claims: `sub`, `email`, `email_verified`, `name`
+7. If `email_verified` is present and false, reject with 403 `access_denied` + `error_code: email_not_verified` (absent claim is accepted — not all IdPs emit it)
+8. Extract groups from the configured claim (`GROUPS_CLAIM`, default `groups`)
+9. If `ALLOWED_GROUPS` is configured, verify the user belongs to at least one allowed group → 403 otherwise
+10. Encrypt an internal authorization code with AES-GCM (60s TTL):
    ```
    {
      token_id (UUID, used for single-use replay check),
@@ -361,7 +362,7 @@ Always registered. Driven by the consent form rendered at step 3 of `/authorize`
      expires_at
    }
    ```
-10. Redirect 302 to `redirect_uri?code={encrypted_code}&state={original_state}&iss={PROXY_BASE_URL}`
+11. Redirect 302 to `redirect_uri?code={encrypted_code}&state={original_state}&iss={PROXY_BASE_URL}`
     - Built via `url.Parse` + merged query params (safe even if redirect_uri already contains query params)
     - `iss` is emitted per RFC 9700 §2.1.4 (mix-up defense): a client that talks to multiple ASes can verify the response came from the AS it actually sent the request to. Value matches the `issuer` field in the RFC 8414 metadata document.
 
