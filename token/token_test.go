@@ -1,6 +1,7 @@
 package token
 
 import (
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -194,6 +195,42 @@ func TestOpenJSON_InvalidData(t *testing.T) {
 		if err := m.OpenJSON(bad, &v, PurposeClient); err == nil {
 			t.Errorf("expected error for %q", bad)
 		}
+	}
+}
+
+// TestOpen_RejectsOversized pins the size cap at the top of open():
+// the function MUST refuse a sealed string larger than maxSealedLen
+// without performing base64 decode or AEAD authentication. Anything
+// less risks seconds of work on a megabyte-class fuzz input — the
+// HTTP layer caps inputs in production but the fuzz harness has no
+// such cap and was tripping its per-iteration timeout on grown
+// inputs.
+func TestOpen_RejectsOversized(t *testing.T) {
+	m := mustNewManager(t, make([]byte, 32))
+
+	// One byte past the cap; content irrelevant — base64 decode and
+	// AEAD.Open must both be skipped.
+	oversized := strings.Repeat("A", maxSealedLen+1)
+
+	start := time.Now()
+	if err := m.OpenJSON(oversized, &struct{}{}, PurposeClient); err == nil {
+		t.Fatal("oversized input must be rejected")
+	}
+	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
+		t.Errorf("oversized rejection took %v, want fast-path < 50ms (the cap is meant to short-circuit before base64 + AEAD)", elapsed)
+	}
+
+	// Sanity: a valid same-length-class sealed payload still opens.
+	sealed, err := m.SealJSON(map[string]string{"k": "v"}, PurposeClient)
+	if err != nil {
+		t.Fatalf("SealJSON: %v", err)
+	}
+	if len(sealed) >= maxSealedLen {
+		t.Fatalf("test fixture sealed payload too large: %d bytes (>= cap %d)", len(sealed), maxSealedLen)
+	}
+	var got map[string]string
+	if err := m.OpenJSON(sealed, &got, PurposeClient); err != nil {
+		t.Errorf("under-cap payload should open: %v", err)
 	}
 }
 

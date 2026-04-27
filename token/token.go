@@ -24,6 +24,18 @@ import (
 // secret without hitting a cryptographic cliff.
 const sealRotationThreshold uint64 = 1 << 28
 
+// maxSealedLen caps the base64-encoded length open() will accept.
+// 16 KiB is roughly 100x the largest sealed payload this codebase ever
+// produces (sealedClient with 5×512-char redirect URIs + 512-char
+// client_name JSON-marshalled and AES-GCM-sealed lands around 5 KiB),
+// so legitimate traffic never approaches the cap. The bound exists so
+// a caller cannot force open() into seconds of base64-decode + AEAD-
+// authenticate work on a multi-megabyte input — production HTTP
+// handlers cap request bodies / headers separately, but the fuzz
+// harness has no such limit and was tripping its per-iteration
+// timeout on grown inputs.
+const maxSealedLen = 16 * 1024
+
 // Purpose constants bind every sealed payload to a specific role via AEAD
 // additional-data (AAD). A ciphertext minted with one purpose cannot be
 // opened as any other, which closes the sealed-type confusion family
@@ -234,6 +246,13 @@ func (m *Manager) seal(data []byte, purpose string) (string, error) {
 // the primary (most-useful diagnostic — if the payload is genuinely
 // corrupt or the purpose mismatched, that's what the operator sees).
 func (m *Manager) open(sealed, purpose string) ([]byte, error) {
+	// Reject oversized inputs BEFORE base64 decode + AEAD.Open so a
+	// caller cannot force seconds of work on a multi-megabyte string.
+	// HTTP handlers already cap header / body sizes in production, but
+	// every defensive layer that protects the AEAD path adds margin.
+	if len(sealed) > maxSealedLen {
+		return nil, fmt.Errorf("sealed data exceeds %d-byte cap", maxSealedLen)
+	}
 	ciphertext, err := base64.RawURLEncoding.DecodeString(sealed)
 	if err != nil {
 		return nil, fmt.Errorf("base64 decode: %w", err)
