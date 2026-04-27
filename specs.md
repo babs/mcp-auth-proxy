@@ -4,6 +4,8 @@
 
 Reverse proxy in Go acting as an OAuth 2.1 Authorization Server compatible with the MCP auth spec, federating authentication to any OIDC Identity Provider (Keycloak, Microsoft Entra ID, Auth0, Okta, Google...) via auto-discovery. It lets MCP clients (claude.ai, Claude Code) access a private MCP server through a standard PKCE flow.
 
+Companion docs: [`docs/conformance.md`](docs/conformance.md) (RFC claim matrix + IdP evidence), [`docs/threat-model.md`](docs/threat-model.md) (STRIDE coverage with code + test + runbook links).
+
 ---
 
 ## Standards Conformance

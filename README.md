@@ -76,7 +76,9 @@ Drop this in front, point it at your existing IdP, done.
 
 Full design notes live in [`specs.md`](./specs.md). The implementation
 claim matrix, compatibility notes, and current IdP evidence live in
-[`docs/conformance.md`](./docs/conformance.md).
+[`docs/conformance.md`](./docs/conformance.md). The STRIDE-style
+threat coverage (one row per threat → code + test + runbook) lives
+in [`docs/threat-model.md`](./docs/threat-model.md).
 
 ---
 
