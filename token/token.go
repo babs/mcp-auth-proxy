@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sync/atomic"
@@ -15,6 +16,15 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
+
+// ErrTokenExpired is returned by Validate when the bearer's
+// ExpiresAt has already passed. Sentinel — separate from the
+// generic "validation failed" surface so the middleware can bucket
+// expired-token traffic under a dedicated metric reason. Without
+// this, operators can't tell "clients walked away / forgot to
+// refresh" (benign, expected) from "attacker probing with forged
+// tokens" (attack signal): both look like invalid_token spikes.
+var ErrTokenExpired = errors.New("token expired")
 
 // sealRotationThreshold is the point at which the caller should rotate the
 // signing secret. AES-GCM with random 96-bit nonces is safe up to roughly
@@ -366,7 +376,7 @@ func (m *Manager) Validate(tokenStr string) (*Claims, error) {
 		return nil, fmt.Errorf("issued_at zero")
 	}
 	if time.Now().After(claims.ExpiresAt) {
-		return nil, fmt.Errorf("token expired")
+		return nil, ErrTokenExpired
 	}
 
 	return &claims, nil

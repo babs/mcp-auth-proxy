@@ -8,7 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/babs/mcp-auth-proxy/metrics"
 	"github.com/babs/mcp-auth-proxy/token"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 )
 
@@ -240,6 +242,42 @@ func TestValidate_ExpiredToken(t *testing.T) {
 
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", rr.Code)
+	}
+}
+
+// TestValidate_ReasonBucket_ExpiryVsForged pins the reason-label
+// split: expired tokens hit access_denied{reason="token_expired"}
+// (benign — clients aging out), forged/malformed tokens hit
+// {reason="invalid_token"} (attack signal). Conflating both as
+// invalid_token would noise up alerts wired against the latter.
+func TestValidate_ReasonBucket_ExpiryVsForged(t *testing.T) {
+	auth, tm := setupAuth(t)
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Fatal("next must not be called")
+	})
+
+	send := func(t *testing.T, bearer string) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/mcp", nil)
+		req.Header.Set("Authorization", "Bearer "+bearer)
+		rr := httptest.NewRecorder()
+		auth.Validate(next).ServeHTTP(rr, req)
+		if rr.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401", rr.Code)
+		}
+	}
+
+	expiredBefore := testutil.ToFloat64(metrics.AccessDenied.WithLabelValues("token_expired"))
+	invalidBefore := testutil.ToFloat64(metrics.AccessDenied.WithLabelValues("invalid_token"))
+
+	send(t, issueToken(t, tm, "u", "u@x", -1*time.Second)) // expired
+	send(t, "totally-garbage-token")                       // forged
+
+	if delta := testutil.ToFloat64(metrics.AccessDenied.WithLabelValues("token_expired")) - expiredBefore; delta != 1 {
+		t.Errorf("token_expired delta = %v, want 1 (expired token must not bucket as invalid_token)", delta)
+	}
+	if delta := testutil.ToFloat64(metrics.AccessDenied.WithLabelValues("invalid_token")) - invalidBefore; delta != 1 {
+		t.Errorf("invalid_token delta = %v, want 1 (forged token must not bucket as token_expired)", delta)
 	}
 }
 
