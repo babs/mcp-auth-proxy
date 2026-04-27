@@ -3,6 +3,7 @@ package middleware
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -109,13 +110,21 @@ func (a *Auth) Validate(next http.Handler) http.Handler {
 		claims, err := a.tokenManager.Validate(tokenStr)
 		if err != nil {
 			a.logger.Debug("token_validation_failed", zap.Error(err))
-			// Reason label split: `invalid_token` covers shape /
-			// signature / TTL failures; `audience_mismatch` and
-			// `token_revoked_iat_cutoff` are tracked separately so a
-			// rotation gone wrong (audience drift) or a bulk revoke
-			// (REVOKE_BEFORE) is alertable independently of routine
-			// expired-token noise.
-			metrics.AccessDenied.WithLabelValues("invalid_token").Inc()
+			// Reason label split:
+			//  - `token_expired` is benign (sessions age out); pages
+			//    on a spike here mean "clients aren't refreshing".
+			//  - `invalid_token` covers shape / signature / AAD
+			//    failures; a spike means "something is sending bad
+			//    tokens" and is the attack-signal channel.
+			//  - `audience_mismatch` and `token_revoked_iat_cutoff`
+			//    are tracked downstream so a rotation gone wrong
+			//    (audience drift) or a bulk revoke (REVOKE_BEFORE)
+			//    is alertable independently of either of the above.
+			reason := "invalid_token"
+			if errors.Is(err, token.ErrTokenExpired) {
+				reason = "token_expired"
+			}
+			metrics.AccessDenied.WithLabelValues(reason).Inc()
 			a.writeAuthError(w, "invalid_token")
 			return
 		}

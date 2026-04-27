@@ -61,6 +61,17 @@ type Config struct {
 	// opt into the compat mode (emits mcp_auth_access_denied_total{reason=
 	// "state_missing"} as a denial counter either way for visibility).
 	CompatAllowStateless bool
+	// RenderConsentPage gates the proxy-rendered consent screen on
+	// /authorize. Default true: /authorize stops after parameter
+	// validation and renders an HTML page that requires an explicit
+	// user click before the upstream IdP redirect — closes the
+	// silent-issuance phishing path where a malicious DCR client +
+	// an active IdP session = a token issued without the user ever
+	// seeing the proxy. Set RENDER_CONSENT_PAGE=false to fall back
+	// to the legacy silent-redirect path; only do that when every
+	// caller is non-interactive and known-trusted.
+	// env: RENDER_CONSENT_PAGE.
+	RenderConsentPage bool
 	// MCPLogBodyMax is the max bytes buffered per request for JSON-RPC method
 	// extraction into access logs. 0 disables buffering entirely (no method
 	// logging). Default 65536 (64 KiB).
@@ -306,6 +317,11 @@ func Load() (*Config, error) {
 	// COMPAT_ALLOW_STATELESS defaults to false. H7: a server-synthesized
 	// state hides a client-side CSRF bug; strict mode refuses the request.
 	c.CompatAllowStateless = strings.ToLower(os.Getenv("COMPAT_ALLOW_STATELESS")) == "true"
+
+	// Default true: only an explicit "false" opts out. Mirrors the
+	// PKCE_REQUIRED / REDIS_REQUIRED / RATE_LIMIT_ENABLED shape so
+	// every "secure-by-default" toggle behaves the same way.
+	c.RenderConsentPage = strings.ToLower(os.Getenv("RENDER_CONSENT_PAGE")) != "false"
 
 	c.ResourceName = os.Getenv("MCP_RESOURCE_NAME")
 

@@ -402,6 +402,61 @@ func TestLoad_CompatAllowStateless_True(t *testing.T) {
 	}
 }
 
+func TestLoad_RenderConsentPage_Default(t *testing.T) {
+	setAllRequired(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.RenderConsentPage {
+		t.Error("RenderConsentPage should default to true (consent page on by default)")
+	}
+}
+
+func TestLoad_RenderConsentPage_False(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("RENDER_CONSENT_PAGE", "false")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.RenderConsentPage {
+		t.Error("RenderConsentPage should be false when RENDER_CONSENT_PAGE=false")
+	}
+}
+
+// TestLoad_RenderConsentPage_NonStrictBoolean pins the env-parser
+// shape: only the literal "false" (case-insensitive) opts out;
+// every other value keeps the secure default true. Mirrors
+// PKCE_REQUIRED / REDIS_REQUIRED / RATE_LIMIT_ENABLED so an
+// operator copy-pasting "0" / "no" / "off" from a different config
+// schema does not silently disable the consent page.
+func TestLoad_RenderConsentPage_NonStrictBoolean(t *testing.T) {
+	cases := map[string]bool{
+		"FALSE": false,
+		"False": false,
+		"false": false,
+		"true":  true,
+		"":      true,
+		"0":     true,
+		"no":    true,
+		"off":   true,
+	}
+	for value, want := range cases {
+		t.Run("value="+value, func(t *testing.T) {
+			setAllRequired(t)
+			t.Setenv("RENDER_CONSENT_PAGE", value)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cfg.RenderConsentPage != want {
+				t.Errorf("RenderConsentPage = %v for env %q, want %v", cfg.RenderConsentPage, value, want)
+			}
+		})
+	}
+}
+
 func TestLoad_MCPLogBodyMax_Default(t *testing.T) {
 	setAllRequired(t)
 	cfg, err := Load()

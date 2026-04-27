@@ -30,6 +30,13 @@ const (
 // point.
 var formActionRE = regexp.MustCompile(`(?is)<form[^>]*\saction=["']([^"']+)["']`)
 
+// consentTokenInputRE extracts the sealed consent_token from the
+// hidden input on the proxy-rendered consent form. Run only on the
+// proxy's own consent page (server-controlled HTML); the regex is
+// scoped tight enough that it won't accidentally match Keycloak
+// markup.
+var consentTokenInputRE = regexp.MustCompile(`(?is)<input[^>]*name=["']consent_token["'][^>]*value=["']([^"']+)["']`)
+
 func TestKeycloakE2EFullOAuthFlow(t *testing.T) {
 	proxyBaseURL := envOrDefaultForTest("KEYCLOAK_E2E_PROXY_BASE_URL", "http://localhost:8080")
 	keycloakBrowserBaseURL := envOrDefaultForTest("KEYCLOAK_BROWSER_BASE_URL", "http://localhost:8180")
@@ -126,19 +133,59 @@ func authorizeViaKeycloak(t *testing.T, client *http.Client, proxyBaseURL, keycl
 		t.Fatalf("GET /authorize: %v", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusFound {
-		t.Fatalf("GET /authorize: got %d, want 302: %s", resp.StatusCode, readSnippet(resp.Body))
-	}
 
-	idpLocation := resp.Header.Get("Location")
+	// /authorize returns either 302 to the IdP (legacy silent path)
+	// or 200 with the consent HTML form (RENDER_CONSENT_PAGE=true).
+	// Branch on the status so the test exercises whichever the
+	// demo stack is configured for; on the consent path it submits
+	// "approve" and follows the resulting 302.
+	var idpLocation string
+	switch resp.StatusCode {
+	case http.StatusFound:
+		idpLocation = resp.Header.Get("Location")
+	case http.StatusOK:
+		idpLocation = approveConsent(t, client, resp, proxyBaseURL)
+	default:
+		t.Fatalf("GET /authorize: got %d, want 302 or 200(consent): %s", resp.StatusCode, readSnippet(resp.Body))
+	}
 	if idpLocation == "" {
-		t.Fatal("/authorize response missing Location")
+		t.Fatal("/authorize response missing Location after consent")
 	}
 
 	loginPageURL := translateKeycloakURL(t, idpLocation, keycloakBrowserBaseURL)
 	loginAction := fetchLoginAction(t, client, loginPageURL, keycloakBrowserBaseURL)
 	proxyCallbackURL := submitKeycloakLogin(t, client, loginAction, keycloakBrowserBaseURL, proxyBaseURL)
 	return completeProxyCallback(t, client, proxyCallbackURL, redirectURI, proxyBaseURL)
+}
+
+// approveConsent walks the proxy-rendered consent page on RENDER_CONSENT_PAGE=true:
+// reads the sealed consent_token from the form, POSTs action=approve to /consent,
+// and returns the Location header of the resulting 302 (which points at the IdP).
+func approveConsent(t *testing.T, client *http.Client, resp *http.Response, proxyBaseURL string) string {
+	t.Helper()
+	page, err := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
+	if err != nil {
+		t.Fatalf("read consent page: %v", err)
+	}
+	match := consentTokenInputRE.FindSubmatch(page)
+	if len(match) < 2 {
+		t.Fatalf("consent_token input not found in consent page; first 500 bytes: %q", string(page[:min(len(page), 500)]))
+	}
+	consentToken := html.UnescapeString(string(match[1]))
+
+	form := url.Values{
+		"consent_token": {consentToken},
+		"action":        {"approve"},
+	}
+	consentResp, err := client.PostForm(proxyBaseURL+"/consent", form)
+	if err != nil {
+		t.Fatalf("POST /consent: %v", err)
+	}
+	defer consentResp.Body.Close()
+	if consentResp.StatusCode != http.StatusFound {
+		t.Fatalf("POST /consent: got %d, want 302: %s", consentResp.StatusCode, readSnippet(consentResp.Body))
+	}
+	return consentResp.Header.Get("Location")
 }
 
 func fetchLoginAction(t *testing.T, client *http.Client, loginPageURL, keycloakBrowserBaseURL string) string {

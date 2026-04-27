@@ -22,6 +22,7 @@ Check the rendered production overlay:
 - `PROD_MODE=true`,
 - `REDIS_REQUIRED=true`,
 - `PKCE_REQUIRED=true`,
+- `RENDER_CONSENT_PAGE=true` (default; explicit in the overlay so a prior `=false` override is loud at release time),
 - metrics port is reachable only through NetworkPolicy,
 - Redis egress points at the intended managed/operator Redis endpoint,
 - pod security context remains nonroot with dropped capabilities.

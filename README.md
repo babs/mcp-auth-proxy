@@ -146,6 +146,7 @@ All configuration via **environment variables**. Bold = required.
 | `UPSTREAM_AUTHORIZATION_HEADER` | _(empty)_ | When set, sent verbatim as the `Authorization` header on every request to the upstream MCP backend. Full header value incl. scheme, e.g. `Bearer xyz`. Treat as a secret |
 | `MCP_PER_SUBJECT_CONCURRENCY` | `16` | Per-subject in-flight cap on the authenticated MCP route. Excess requests get 503 `temporarily_unavailable` + `Retry-After: 1`. Idle subjects (no in-flight work for ≥5 min) are reclaimed by a background pruner so map memory stays proportional to active principals. `0` disables |
 | `COMPAT_ALLOW_STATELESS` | `false` | Synthesize a server-side `state` on `/authorize` when the client omits it (legacy Cursor / MCP Inspector). Strict mode refuses the request; counter `mcp_auth_access_denied_total{reason="state_missing"}` fires either way |
+| `RENDER_CONSENT_PAGE` | `true` | Render an explicit proxy-side consent page on `/authorize` so the user sees who's asking and where they'll be redirected before the IdP login. Closes the silent-token-issuance path where a malicious DCR client + an active IdP session = tokens issued without any user interaction with the proxy. Plain HTML, no JavaScript; the form's submit POSTs to `/consent` with an Approve / Deny choice. Set `RENDER_CONSENT_PAGE=false` to fall back to the legacy silent-redirect — only do that when every caller is non-interactive and known-trusted |
 | `MCP_LOG_BODY_MAX` | `65536` | Max bytes buffered per request for JSON-RPC method extraction into access logs. `0` disables buffering (no `rpc_method`/`rpc_tool`/`rpc_id` fields). Raise for large batches; lower or zero when tool names must stay out of logs |
 | `ACCESS_LOG_SKIP_RE` | _(empty)_ | **Go [RE2](https://pkg.go.dev/regexp/syntax) regexp** matched against `r.URL.Path` on the **public listener only**. When a request path matches, the access-log line is suppressed; the handler response, Prometheus counters, and panic recovery are unaffected. Invalid pattern fails startup. RE2 is linear-time — no ReDoS. Typical value: `ACCESS_LOG_SKIP_RE=^/healthz$` (liveness-probe noise). **Always anchor with `^…$`** unless you intentionally want substring matching — `healthz` (no anchors) also matches `/mcp/healthz-tool` if an upstream tool carries that substring; `.*` silences the entire access log. `/readyz` and `/metrics` live on `METRICS_ADDR` by default and do not reach this middleware — no need to match them unless you've deliberately moved them onto the public listener |
 | `MCP_TOOL_METRICS` | `false` | When `true`, emits per-tool Prometheus counters: `mcp_auth_rpc_calls_total{tool}`, `mcp_auth_rpc_calls_failed_total{tool}` (status ≥ 400), `mcp_auth_rpc_request_bytes_total{tool}`, `mcp_auth_rpc_response_bytes_total{tool}`. Counters fire only on JSON-RPC `tools/call` requests; protocol-level methods (`initialize`, `notifications/*`, `tools/list`, `prompts/*`, …) do not contribute. Tool name comes from `params.name`; calls with unparseable params land in `_unknown`. Disabled by default — the `tool` label increases series cardinality and reveals workflow patterns; flip on when the visibility is worth the trade |
@@ -192,7 +193,8 @@ rollout notes, and K8s deployment shape.
 | `GET /.well-known/oauth-authorization-server` | RFC 8414 AS metadata |
 | `GET /.well-known/oauth-authorization-server<mount>` | Same document as above — non-spec compat for MCP clients that probe the per-resource suffix |
 | `POST /register` | RFC 7591 dynamic client registration |
-| `GET  /authorize` | PKCE authorization endpoint |
+| `GET  /authorize` | PKCE authorization endpoint. Returns 200 HTML with a consent form by default; setting `RENDER_CONSENT_PAGE=false` reverts to the legacy 302 straight to the IdP |
+| `POST /consent` | Consent-page Approve / Deny submission. Approve → 302 to IdP. Deny → 302 to the client's registered `redirect_uri` with `error=access_denied`. Always registered; no-op when `RENDER_CONSENT_PAGE=false` because nothing mints a valid `consent_token` in that mode |
 | `GET  /callback` | OIDC callback from the IdP |
 | `POST /token` | `authorization_code` + `refresh_token` grants |
 | `GET  /healthz` | Liveness probe (always 200 while the process is up) |
@@ -223,8 +225,19 @@ rollout notes, and K8s deployment shape.
   - `mcp_auth_access_denied_total{reason}` — `group` / `group_invalid` /
     `email_unverified` / `refresh_family_revoked` / `state_missing` /
     `subject_missing` / `subject_concurrency_exceeded` /
-    `invalid_token` / `audience_mismatch` / `token_revoked_iat_cutoff`
-    rejections
+    `invalid_token` (forged / malformed / signature / AAD failures —
+    attack signal) / `token_expired` (benign aging) /
+    `audience_mismatch` / `resource_mismatch` /
+    `token_revoked_iat_cutoff` / `id_token_verification_failed` /
+    `replay_store_unavailable` rejections. Note: `token_expired` is
+    a separate bucket from `invalid_token` so a spike on the latter
+    is unambiguously the attack-signal channel
+  - `mcp_auth_consent_decisions_total{decision}` — `approved` /
+    `denied` clicks on the proxy-rendered consent page. Distinct
+    from `access_denied_total`: a user clicking Deny is a normal
+    expected interaction, not a policy rejection. Pair with
+    `mcp_auth_tokens_issued_total{grant_type="authorization_code"}`
+    to derive abandoned-after-approve as a funnel signal
   - `mcp_auth_replay_detected_total{kind}` — `code` or `refresh` replays
     caught by the Redis-backed store
   - `mcp_auth_rate_limited_total{endpoint}` — httprate 429s by endpoint
