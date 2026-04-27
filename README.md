@@ -140,6 +140,7 @@ All configuration via **environment variables**. Bold = required.
 | `REDIS_REQUIRED` | `true` | Fail startup when `REDIS_URL` is unset. Set `false` only for dev / single-replica; stateless mode leaves codes/refresh replayable within TTL |
 | `REDIS_KEY_PREFIX` | `mcp-auth-proxy:` | Key prefix for shared Redis; set to empty to opt out of namespacing |
 | `REFRESH_RACE_GRACE_SEC` | `2` | Grace window in seconds during which a refresh-rotation collision is treated as a benign concurrent submit (parallel-tab refresh, slow-network double-submit) and returns 429 `refresh_concurrent_submit` without revoking the family. Outside the window every collision still revokes. Range `[0, 10]`; `0` disables (every collision = reuse). The 10s ceiling is a security cap — wider windows are statistically attacker-shaped |
+| `CLIENT_REGISTRATION_TTL` | `168h` (7d) | Lifetime of a sealed `client_id` minted by `POST /register`. Default matches the 7-day refresh-token TTL so a client holding a still-valid refresh can always exchange it; a shorter value silently kills long-running MCP clients (which treat DCR as one-shot at startup) the moment their access token first expires. Go duration syntax (`168h`, `720h`, …); capped at 90d. **Rolling-deploy note:** the TTL is sealed into each `client_id` at registration time, so bumping this env var only affects newly-issued client_ids — existing registrations stay on whatever TTL was in effect when they were minted. See [`docs/runbooks/client-registration-expired.md`](./docs/runbooks/client-registration-expired.md) |
 | `IDP_EXCHANGE_RATE_PER_SEC` | _(empty / disabled)_ | Cap on outbound proxy → IdP token-endpoint requests at `/callback`. Defense in depth: a flood of `/callback` hits that slips past the per-IP limiter (distributed sources, permissive XFF trust matrix) is bounded by this token bucket before reaching the IdP. Denied requests get 503 `temporarily_unavailable` + `error_code=idp_exchange_throttled` + `Retry-After: 1`. Set to a positive number (e.g. `20`) to enable |
 | `IDP_EXCHANGE_BURST` | `50` | Burst size for the IdP-exchange limiter when `IDP_EXCHANGE_RATE_PER_SEC > 0`. Higher burst absorbs a short spike (e.g. a deploy-time reconnect storm) without 503s; lower burst keeps the ceiling tighter. Ignored when `IDP_EXCHANGE_RATE_PER_SEC` is unset/zero (limiter is not constructed) |
 | `RATE_LIMIT_ENABLED` | `true` | Per-IP rate limiting on pre-auth endpoints and on the authenticated MCP route. Disable only behind a WAF that already enforces it |
@@ -173,7 +174,7 @@ payloads alone remain replayable within their TTL.
 
 | Flow state | Encrypted into | TTL |
 |---|---|---|
-| Client registration | `client_id` | 24h |
+| Client registration | `client_id` | 7d (configurable via `CLIENT_REGISTRATION_TTL`) |
 | Authorize session | IdP `state` parameter | 10min |
 | Authorization code | `code` parameter | 60s |
 | Access token | Opaque bearer | 1h |

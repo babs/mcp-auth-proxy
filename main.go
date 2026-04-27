@@ -341,7 +341,7 @@ func main() {
 	}
 
 	registerDiscoveryRoutes(r, cfg.ProxyBaseURL, cfg.UpstreamMCPMountPath, cfg.ResourceName, discoveryLimit)
-	r.With(registerLimit).Post("/register", handlers.Register(tm, logger, cfg.ProxyBaseURL))
+	r.With(registerLimit).Post("/register", handlers.Register(tm, logger, cfg.ProxyBaseURL, cfg.ClientRegistrationTTL))
 	r.With(authorizeLimit).Get("/authorize", handlers.Authorize(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, handlers.AuthorizeConfig{
 		PKCERequired:         cfg.PKCERequired,
 		ResourceURIs:         []string{cfg.ProxyBaseURL + cfg.UpstreamMCPMountPath},

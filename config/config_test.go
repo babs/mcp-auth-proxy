@@ -361,6 +361,56 @@ func TestLoad_IdPExchangeBurst_RejectsZero(t *testing.T) {
 	}
 }
 
+func TestLoad_ClientRegistrationTTL_Default(t *testing.T) {
+	setAllRequired(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.ClientRegistrationTTL != 7*24*time.Hour {
+		t.Errorf("ClientRegistrationTTL default = %v, want 168h (7d)", cfg.ClientRegistrationTTL)
+	}
+}
+
+func TestLoad_ClientRegistrationTTL_Custom(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("CLIENT_REGISTRATION_TTL", "720h")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.ClientRegistrationTTL != 720*time.Hour {
+		t.Errorf("ClientRegistrationTTL = %v, want 720h", cfg.ClientRegistrationTTL)
+	}
+}
+
+func TestLoad_ClientRegistrationTTL_RejectsNonPositive(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("CLIENT_REGISTRATION_TTL", "0s")
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "positive") {
+		t.Fatalf("want positive rejection, got %v", err)
+	}
+}
+
+func TestLoad_ClientRegistrationTTL_RejectsAboveCap(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("CLIENT_REGISTRATION_TTL", "2400h") // 100 days, > 90d cap
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "90d cap") {
+		t.Fatalf("want 90d-cap rejection, got %v", err)
+	}
+}
+
+func TestLoad_ClientRegistrationTTL_RejectsBadFormat(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("CLIENT_REGISTRATION_TTL", "7d") // time.ParseDuration doesn't accept "d"
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "Go duration") {
+		t.Fatalf("want format-error, got %v", err)
+	}
+}
+
 func TestLoad_PKCERequired_Default(t *testing.T) {
 	setAllRequired(t)
 	cfg, err := Load()

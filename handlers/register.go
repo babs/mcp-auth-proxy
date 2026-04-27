@@ -16,7 +16,15 @@ import (
 )
 
 const (
-	clientTTL = 24 * time.Hour
+	// DefaultClientTTL is the default lifetime of a sealed
+	// client_id. Set to match refreshTokenTTL so a client holding
+	// a still-valid refresh token can always exchange it: a shorter
+	// clientTTL would silently kill long-running MCP clients
+	// (which treat DCR as one-shot at startup) the moment their
+	// access token first expired and they tried to rotate. The
+	// operator can override via CLIENT_REGISTRATION_TTL when their
+	// deployment needs a different lifetime envelope.
+	DefaultClientTTL = 7 * 24 * time.Hour
 	// Cap DCR amplification: a client
 	// registration bloats the sealed client_id (and any logs/metrics
 	// referencing it) in proportion to the submitted redirect_uris. Five
@@ -53,8 +61,11 @@ type registerResponse struct {
 
 // Register handles POST /register (RFC 7591 Dynamic Client Registration).
 // Client record is encrypted into the client_id itself for stateless operation.
-// audience binds the client to a specific proxy deployment.
-func Register(tm *token.Manager, logger *zap.Logger, audience string) http.HandlerFunc {
+// audience binds the client to a specific proxy deployment. clientTTL
+// is the sealed client_id's lifetime; pass DefaultClientTTL to keep
+// the standard 7-day envelope (aligns with refreshTokenTTL so a
+// client holding a still-valid refresh can always exchange it).
+func Register(tm *token.Manager, logger *zap.Logger, audience string, clientTTL time.Duration) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 
