@@ -140,6 +140,8 @@ All configuration via **environment variables**. Bold = required.
 | `REDIS_REQUIRED` | `true` | Fail startup when `REDIS_URL` is unset. Set `false` only for dev / single-replica; stateless mode leaves codes/refresh replayable within TTL |
 | `REDIS_KEY_PREFIX` | `mcp-auth-proxy:` | Key prefix for shared Redis; set to empty to opt out of namespacing |
 | `REFRESH_RACE_GRACE_SEC` | `2` | Grace window in seconds during which a refresh-rotation collision is treated as a benign concurrent submit (parallel-tab refresh, slow-network double-submit) and returns 429 `refresh_concurrent_submit` without revoking the family. Outside the window every collision still revokes. Range `[0, 10]`; `0` disables (every collision = reuse). The 10s ceiling is a security cap — wider windows are statistically attacker-shaped |
+| `IDP_EXCHANGE_RATE_PER_SEC` | _(empty / disabled)_ | Cap on outbound proxy → IdP token-endpoint requests at `/callback`. Defense in depth: a flood of `/callback` hits that slips past the per-IP limiter (distributed sources, permissive XFF trust matrix) is bounded by this token bucket before reaching the IdP. Denied requests get 503 `temporarily_unavailable` + `error_code=idp_exchange_throttled` + `Retry-After: 1`. Set to a positive number (e.g. `20`) to enable |
+| `IDP_EXCHANGE_BURST` | `50` | Burst size for the IdP-exchange limiter when `IDP_EXCHANGE_RATE_PER_SEC > 0`. Higher burst absorbs a short spike (e.g. a deploy-time reconnect storm) without 503s; lower burst keeps the ceiling tighter. Ignored when `IDP_EXCHANGE_RATE_PER_SEC` is unset/zero (limiter is not constructed) |
 | `RATE_LIMIT_ENABLED` | `true` | Per-IP rate limiting on pre-auth endpoints and on the authenticated MCP route. Disable only behind a WAF that already enforces it |
 | `TOKEN_SIGNING_SECRETS_PREVIOUS` | _(empty)_ | Whitespace-separated retired signing secrets accepted on Open during a rolling rotation. New seals always use `TOKEN_SIGNING_SECRET` (primary); Open tries primary first, then each previous. See [`docs/runbooks/key-rotation.md`](./docs/runbooks/key-rotation.md) |
 | `TRUSTED_PROXY_CIDRS` | _(empty)_ | Comma-separated CIDRs of peers whose forwarding header (default `X-Forwarded-For`) is walked right-to-left for rate-limit keying. The first hop NOT in the trusted set is the bucket key; everything left of it (typically appended by the client) is ignored. Other peers fall back to RemoteAddr. Preferred over the legacy `TRUST_PROXY_HEADERS` bool |
@@ -245,6 +247,12 @@ rollout notes, and K8s deployment shape.
     `consent`, or `callback_state` replays caught by the Redis-backed
     store
   - `mcp_auth_rate_limited_total{endpoint}` — httprate 429s by endpoint
+  - `mcp_auth_idp_exchange_throttled_total` — outbound proxy → IdP
+    token-endpoint exchanges denied by the rate-limit bucket
+    (`IDP_EXCHANGE_RATE_PER_SEC`). A spike under steady inbound
+    traffic usually means a distributed flood is slipping past the
+    per-IP limiter, or the IdP is slow enough that the bucket
+    fills faster than it drains
   - `mcp_auth_clients_registered_total` — RFC 7591 registrations
   - `mcp_auth_groups_claim_shape_mismatch_total` — id_token `groups`
     claim failed to decode as `[]string`; user is admitted with empty

@@ -24,6 +24,7 @@ import (
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/oauth2"
 	"golang.org/x/term"
+	"golang.org/x/time/rate"
 
 	"github.com/babs/mcp-auth-proxy/config"
 	"github.com/babs/mcp-auth-proxy/handlers"
@@ -357,10 +358,19 @@ func main() {
 	r.With(consentLimit).Post("/consent", handlers.Consent(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, handlers.ConsentConfig{
 		ReplayStore: replayStore,
 	}))
+	var idpExchangeLimiter *rate.Limiter
+	if cfg.IdPExchangeRatePerSec > 0 {
+		idpExchangeLimiter = rate.NewLimiter(rate.Limit(cfg.IdPExchangeRatePerSec), cfg.IdPExchangeBurst)
+		logger.Info("idp_exchange_limiter_enabled",
+			zap.Float64("rate_per_sec", cfg.IdPExchangeRatePerSec),
+			zap.Int("burst", cfg.IdPExchangeBurst),
+		)
+	}
 	r.With(callbackLimit).Get("/callback", handlers.Callback(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, idTokenVerifier, handlers.CallbackConfig{
-		AllowedGroups: cfg.AllowedGroups,
-		GroupsClaim:   cfg.GroupsClaim,
-		ReplayStore:   replayStore,
+		AllowedGroups:      cfg.AllowedGroups,
+		GroupsClaim:        cfg.GroupsClaim,
+		ReplayStore:        replayStore,
+		IdPExchangeLimiter: idpExchangeLimiter,
 	}))
 	r.With(tokenLimit).Post("/token", handlers.Token(tm, logger, cfg.ProxyBaseURL, cfg.RevokeBefore, replayStore, handlers.TokenConfig{
 		RefreshRaceGrace: cfg.RefreshRaceGrace,

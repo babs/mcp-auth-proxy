@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"golang.org/x/oauth2"
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -86,6 +87,15 @@ type CallbackConfig struct {
 	// burn the IdP's `invalid_grant` quota anyway). nil = stateless
 	// fallback (configured opt-out).
 	ReplayStore replay.Store
+	// IdPExchangeLimiter, when non-nil, throttles the proxy → IdP
+	// token-endpoint exchange (the second leg of /callback). Defense
+	// in depth: if a flood of /callback hits slips past the per-IP
+	// rate limiter (e.g. distributed across IPs, behind a permissive
+	// XFF trust matrix), the limiter caps the rate at which the
+	// proxy can fan out to the IdP. Denied requests get a 503 +
+	// `idp_exchange_throttled` log + metric; the user can retry once
+	// the bucket refills. nil = no outbound throttling.
+	IdPExchangeLimiter *rate.Limiter
 }
 
 // Callback handles GET /callback (IdP redirect after user authentication).
@@ -193,6 +203,31 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 
 		if time.Now().After(session.ExpiresAt) {
 			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "session expired")
+			return
+		}
+
+		// Outbound rate-limit (defense in depth). When a limiter is
+		// wired, fail fast with 503 if the bucket is empty rather
+		// than queueing. Queueing ties up proxy connection budget on
+		// behalf of the IdP and cascades the IdP outage into a proxy
+		// outage. The limiter is nil for unit tests / operators who
+		// opt out by leaving IDP_EXCHANGE_RATE_PER_SEC unset.
+		//
+		// The throttle check runs BEFORE the SessionID replay claim
+		// so a transiently-throttled legitimate user can retry the
+		// same /callback URL once the bucket refills — placing it
+		// after the claim would burn the slot and force a 400
+		// callback_state_replay on the retry. Replay defense is
+		// per-state (claim slot is unique to one user); throttling
+		// is global IdP-protection — they don't need to share a
+		// fail-fast point.
+		if cbCfg.IdPExchangeLimiter != nil && !cbCfg.IdPExchangeLimiter.Allow() {
+			metrics.IdPExchangeThrottled.Inc()
+			logger.Warn("idp_exchange_throttled",
+				zap.String("client_id", session.ClientID),
+			)
+			w.Header().Set("Retry-After", "1")
+			writeOAuthError(w, http.StatusServiceUnavailable, "temporarily_unavailable", "upstream IdP exchange throttled; retry shortly", "idp_exchange_throttled")
 			return
 		}
 
