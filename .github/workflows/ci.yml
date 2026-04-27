@@ -139,6 +139,31 @@ jobs:
         if: always()
         run: docker compose -f manifests/docker-compose/compose.yaml down -v
 
+  manifest-prod:
+    name: manifest-prod
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: install kubectl
+        # Embeds kustomize >= v5; ubuntu-latest ships kubectl already
+        # but pinning avoids silent drift if the runner image changes.
+        uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d # v5.1.0
+        with:
+          version: v1.31.1
+
+      - name: install yq
+        uses: dcarbone/install-yq-action@4075b4dca348d74bd83f2bf82d30f25d7c54539b # v1.3.1
+        with:
+          version: v4.44.3
+
+      - name: production overlay posture check
+        # Renders the production overlay and asserts PROD_MODE,
+        # RENDER_CONSENT_PAGE, REDIS_REQUIRED, RATE_LIMIT_ENABLED,
+        # TRUSTED_PROXY_CIDRS, runAsNonRoot, replicas >= 2, and an
+        # explicit (non-:latest) image tag. Catches drift before rollout.
+        run: bash manifests/overlays/production/check.sh
+
   vuln:
     name: govulncheck
     runs-on: ubuntu-latest
