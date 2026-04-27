@@ -9,6 +9,7 @@ coverage.*
 
 # Local dev
 misc/
+manifests/docker-compose/.env
 
 # Editor
 .idea/

@@ -1024,6 +1024,10 @@ func TestLoad_ProdMode_BlocksUnsafeFlags(t *testing.T) {
 		{"legacy_trust_proxy_headers", func(t *testing.T) {
 			t.Setenv("TRUST_PROXY_HEADERS", "true")
 		}},
+		{"insecure_oidc_http", func(t *testing.T) {
+			t.Setenv("OIDC_ALLOW_INSECURE_HTTP", "true")
+			t.Setenv("OIDC_ISSUER_URL", "http://keycloak:8080/realms/mcp-demo")
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1286,6 +1290,21 @@ func TestLoad_UpstreamAuthorizationHeader(t *testing.T) {
 			t.Errorf("want %q, got %q", "Bearer upstream-xyz", cfg.UpstreamAuthorization)
 		}
 	})
+}
+
+func TestLoad_OIDCIssuerURL_AllowsExplicitDevCleartext(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("PROD_MODE", "false")
+	t.Setenv("OIDC_ALLOW_INSECURE_HTTP", "true")
+	t.Setenv("OIDC_ISSUER_URL", "http://keycloak:8080/realms/mcp-demo")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("expected explicit dev cleartext issuer to be accepted: %v", err)
+	}
+	if cfg.OIDCIssuerURL != "http://keycloak:8080/realms/mcp-demo" {
+		t.Errorf("OIDCIssuerURL = %q", cfg.OIDCIssuerURL)
+	}
 }
 
 // TestLoad_OIDCIssuerURL_RejectsCleartextAndHostless covers the

@@ -160,14 +160,16 @@ func Load() (*Config, error) {
 		MetricsAddr: envOrDefault("METRICS_ADDR", "127.0.0.1:9090"),
 		LogLevel:    envOrDefault("LOG_LEVEL", "info"),
 		GroupsClaim: envOrDefault("GROUPS_CLAIM", "groups"),
+		ProdMode:    strings.ToLower(os.Getenv("PROD_MODE")) != "false",
 	}
+	allowInsecureOIDCHTTP := strings.ToLower(os.Getenv("OIDC_ALLOW_INSECURE_HTTP")) == "true"
 
 	var missing []string
 
 	c.OIDCIssuerURL = strings.TrimRight(os.Getenv("OIDC_ISSUER_URL"), "/")
 	if c.OIDCIssuerURL == "" {
 		missing = append(missing, "OIDC_ISSUER_URL")
-	} else if err := validateOIDCIssuerURL(c.OIDCIssuerURL); err != nil {
+	} else if err := validateOIDCIssuerURL(c.OIDCIssuerURL, allowInsecureOIDCHTTP); err != nil {
 		return nil, err
 	}
 
@@ -386,10 +388,6 @@ func Load() (*Config, error) {
 		c.PerSubjectConcurrency = n
 	}
 
-	// Default ON: the strict posture must match the advertised
-	// metadata. Explicit "false" opts out for dev / single-replica.
-	c.ProdMode = strings.ToLower(os.Getenv("PROD_MODE")) != "false"
-
 	// PROD_MODE fails closed on every compatibility flag that relaxes
 	// a security control. None of these flags are exploitable when
 	// used intentionally (dev, legacy clients, stateless dev
@@ -413,6 +411,9 @@ func Load() (*Config, error) {
 		}
 		if c.TrustProxyHeaders && len(c.TrustedProxyCIDRs) == 0 {
 			violations = append(violations, "TRUST_PROXY_HEADERS=true without TRUSTED_PROXY_CIDRS (forwarded-header spoofing can bypass per-IP limits)")
+		}
+		if allowInsecureOIDCHTTP {
+			violations = append(violations, "OIDC_ALLOW_INSECURE_HTTP=true (cleartext OIDC exposes the client secret)")
 		}
 		// Promote the L1 low-entropy warning to a hard fail under
 		// PROD_MODE. A 32-byte secret with <16 distinct bytes signals
@@ -477,12 +478,13 @@ func validateRedisKeyPrefix(p string) error {
 }
 
 // validateOIDCIssuerURL enforces https:// (or http:// to a loopback host
-// for dev, mirroring the PROXY_BASE_URL posture). Without this an
-// operator who sets OIDC_ISSUER_URL=http://idp.example.com sends OIDC
-// discovery, the authorization-code exchange, and the confidential
-// client secret over cleartext HTTP. go-oidc does not enforce TLS
-// itself.
-func validateOIDCIssuerURL(raw string) error {
+// for dev, mirroring the PROXY_BASE_URL posture). The explicit
+// allowInsecureHTTP escape hatch exists for the Docker Compose demo,
+// where Keycloak is reached over a single-host bridge network. PROD_MODE
+// rejects that escape hatch so production cannot silently ship cleartext
+// OIDC. Without this, go-oidc would allow discovery, code exchange, and
+// the confidential client secret over HTTP.
+func validateOIDCIssuerURL(raw string, allowInsecureHTTP bool) error {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return fmt.Errorf("OIDC_ISSUER_URL is not a valid URL: %w", err)
@@ -494,6 +496,9 @@ func validateOIDCIssuerURL(raw string) error {
 	case "https":
 		return nil
 	case "http":
+		if allowInsecureHTTP {
+			return nil
+		}
 		host := strings.TrimSuffix(u.Hostname(), ".")
 		if host == "localhost" {
 			return nil

@@ -36,6 +36,29 @@ kubectl apply -f networkpolicy.example.yaml   # fill in scraper / ingress labels
 4. **Ingress** — fill in your hostname and TLS secret name in
    `ingress.example.yaml`.
 
+## Production overlay
+
+A production-oriented kustomize overlay is available at
+`../overlays/production`. It keeps the reference manifests intact while
+adding a renderable baseline with a pinned image tag, `PROD_MODE=true`,
+Redis required, PKCE required, NetworkPolicy, and stricter resource
+defaults.
+
+Render it before applying:
+
+```bash
+kubectl kustomize manifests/overlays/production
+```
+
+Before rollout, copy the overlay into your environment repo or fork and
+replace the example IdP, public URL, upstream MCP URL, trusted-proxy
+CIDRs, NetworkPolicy selectors, Redis URL, and image tag or digest.
+Create `mcp-auth-proxy-secret` from your secret manager; the overlay
+deliberately does not generate production secrets. The base K8s
+kustomization includes demo Redis for turnkey testing; the production
+overlay deletes those demo Redis resources and expects a managed or
+operator-managed Redis endpoint instead.
+
 ## Notes
 
 - Redis (`redis.yaml`) is a **demo-only single replica** with no persistence

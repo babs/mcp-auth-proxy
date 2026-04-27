@@ -74,7 +74,9 @@ Drop this in front, point it at your existing IdP, done.
 | [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707.html) | `resource` indicator on `/authorize` and `/token` |
 | [MCP Authorization 2025-06-18](https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization) | End-to-end MCP auth flow |
 
-Full design notes live in [`specs.md`](./specs.md).
+Full design notes live in [`specs.md`](./specs.md). The implementation
+claim matrix, compatibility notes, and current IdP evidence live in
+[`docs/conformance.md`](./docs/conformance.md).
 
 ---
 
@@ -117,6 +119,7 @@ All configuration via **environment variables**. Bold = required.
 | Variable | Default | Description |
 |---|---|---|
 | **`OIDC_ISSUER_URL`** | — | OIDC issuer (auto-discovered via `/.well-known/openid-configuration`) |
+| `OIDC_ALLOW_INSECURE_HTTP` | `false` | Dev-only escape hatch for cleartext `http://` OIDC issuers, used by the Docker Compose Keycloak demo. Rejected when `PROD_MODE=true`; production should use `https://` |
 | **`OIDC_CLIENT_ID`** | — | Client registered on the IdP |
 | **`OIDC_CLIENT_SECRET`** | — | IdP client secret |
 | **`PROXY_BASE_URL`** | — | Public URL of this proxy (audience-bound into every sealed token) |
@@ -276,8 +279,8 @@ rollout notes, and K8s deployment shape.
 [`manifests/`](./manifests) ships a turn-key local stack: Docker Compose
 with Keycloak (pre-seeded realm + admin user), Redis, a minimal MCP
 server, and the proxy itself wired end-to-end. The `manifests/k8s/` set
-is a reference `Deployment` + `Service` + `PodDisruptionBudget` +
-`Ingress` that mirrors the "Deploying on Kubernetes" shape below.
+is split between reference YAML templates and a production-oriented
+kustomize overlay at `manifests/overlays/production`.
 `scripts/generate-signing-secret.sh` emits a 32-byte random hex string
 suitable for `TOKEN_SIGNING_SECRET`.
 
@@ -323,6 +326,10 @@ Production posture guides:
 
 - [`docs/redis-production.md`](./docs/redis-production.md) — what
   "production Redis" means for this proxy (auth, TLS, HA, sizing).
+- [`docs/conformance.md`](./docs/conformance.md) — spec claim matrix,
+  compatibility notes, and current IdP evidence.
+- [`docs/release-checklist.md`](./docs/release-checklist.md) — checks
+  to run before and after publishing a release image.
 - [`docs/runbooks/`](./docs/runbooks/) — key rotation, bulk
   revocation via `REVOKE_BEFORE`, Redis outage, IdP outage.
 
@@ -332,6 +339,7 @@ Production posture guides:
 
 ```bash
 go test ./...                           # unit + e2e (mock OIDC provider)
+go test -tags=keycloak_e2e -run TestKeycloakE2EFullOAuthFlow -count=1 .
 go test -race ./...                     # with the race detector
 go test -cover ./...                    # with coverage
 ```
@@ -339,6 +347,10 @@ go test -cover ./...                    # with coverage
 The E2E test (`e2e_test.go`) spins up a full mock OIDC provider and
 exercises registration → authorize → callback → token → refresh →
 bearer-protected proxy in one go.
+
+The `keycloak_e2e` test runs against the Docker Compose demo stack with
+real Keycloak. Generate `manifests/docker-compose/.env`, start the stack,
+then run the tagged test above. CI runs this path automatically.
 
 ---
 

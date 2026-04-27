@@ -30,6 +30,7 @@ services:
       KC_BOOTSTRAP_ADMIN_USERNAME: admin
       KC_BOOTSTRAP_ADMIN_PASSWORD: admin
       KC_HTTP_ENABLED: "true"
+      KC_HOSTNAME: "http://keycloak:8080"
       KC_HOSTNAME_STRICT: "false"
       KC_HOSTNAME_STRICT_HTTPS: "false"
       KC_HEALTH_ENABLED: "true"
@@ -38,7 +39,9 @@ services:
     volumes:
       - ./keycloak:/opt/keycloak/data/import:ro
     healthcheck:
-      test: ["CMD-SHELL", "curl -fs http://localhost:8080/health/ready | grep -q UP || exit 1"]
+      # The current Keycloak image includes bash but not curl/wget.
+      # If that base image changes, replace this with an explicit HTTP probe.
+      test: ["CMD-SHELL", "bash -ec 'exec 3<>/dev/tcp/localhost/9000; printf \"GET /health/ready HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n\" >&3; grep -q UP <&3'"]
       interval: 10s
       timeout: 5s
       retries: 18
