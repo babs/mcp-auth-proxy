@@ -690,11 +690,12 @@ func TestTokenRefresh_RaceGrace_ZeroDisablesGrace(t *testing.T) {
 
 // --- T4.3: authorize_initiated funnel counter ---
 
-// TestAuthorize_Initiated_IncrementsOnConsentFork pins T4.3 on
-// the consent-fork path: every validated GET /authorize that
-// enters the consent renderer increments
-// mcp_auth_authorize_initiated_total exactly once.
-func TestAuthorize_Initiated_IncrementsOnConsentFork(t *testing.T) {
+// TestAuthorize_Initiated_ConsentFork_LabelsCorrectly pins that
+// every validated GET /authorize entering the consent renderer
+// increments mcp_auth_authorize_initiated_total under the
+// `path=consent` label and ONLY that label — a regression that
+// labels both forks the same (or swaps the labels) breaks here.
+func TestAuthorize_Initiated_ConsentFork_LabelsCorrectly(t *testing.T) {
 	tm := newTestTokenManager(t)
 	encClientID, _ := registerClientNamed(t, tm, []string{"https://app.example.com/callback"}, "App")
 
@@ -708,7 +709,8 @@ func TestAuthorize_Initiated_IncrementsOnConsentFork(t *testing.T) {
 		"state":                 {"client-state"},
 	}
 
-	before := testutil.ToFloat64(metrics.AuthorizeInitiated)
+	consentBefore := testutil.ToFloat64(metrics.AuthorizeInitiated.WithLabelValues("consent"))
+	silentBefore := testutil.ToFloat64(metrics.AuthorizeInitiated.WithLabelValues("silent"))
 
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/authorize?"+q.Encode(), nil)
 	rr := httptest.NewRecorder()
@@ -717,17 +719,19 @@ func TestAuthorize_Initiated_IncrementsOnConsentFork(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d", rr.Code)
 	}
-	if got := testutil.ToFloat64(metrics.AuthorizeInitiated) - before; got != 1 {
-		t.Errorf("AuthorizeInitiated delta = %v, want 1", got)
+	if got := testutil.ToFloat64(metrics.AuthorizeInitiated.WithLabelValues("consent")) - consentBefore; got != 1 {
+		t.Errorf("AuthorizeInitiated{path=consent} delta = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.AuthorizeInitiated.WithLabelValues("silent")) - silentBefore; got != 0 {
+		t.Errorf("AuthorizeInitiated{path=silent} delta = %v, want 0 (consent fork must not bleed into silent label)", got)
 	}
 }
 
-// TestAuthorize_Initiated_IncrementsOnSilentFork pins T4.3 on
-// the silent-redirect path (RenderConsentPage=false): the same
-// counter increments whether the proxy renders a consent page or
-// redirects directly to the IdP. Funnel math doesn't fork on
-// build flag.
-func TestAuthorize_Initiated_IncrementsOnSilentFork(t *testing.T) {
+// TestAuthorize_Initiated_SilentFork_LabelsCorrectly pins the
+// mirror of the consent test: the silent-redirect path
+// (RenderConsentPage=false) increments the `path=silent` label
+// and ONLY that label.
+func TestAuthorize_Initiated_SilentFork_LabelsCorrectly(t *testing.T) {
 	tm := newTestTokenManager(t)
 	encClientID, _ := registerClientNamed(t, tm, []string{"https://app.example.com/callback"}, "App")
 
@@ -741,7 +745,8 @@ func TestAuthorize_Initiated_IncrementsOnSilentFork(t *testing.T) {
 		"state":                 {"client-state"},
 	}
 
-	before := testutil.ToFloat64(metrics.AuthorizeInitiated)
+	consentBefore := testutil.ToFloat64(metrics.AuthorizeInitiated.WithLabelValues("consent"))
+	silentBefore := testutil.ToFloat64(metrics.AuthorizeInitiated.WithLabelValues("silent"))
 
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/authorize?"+q.Encode(), nil)
 	rr := httptest.NewRecorder()
@@ -754,8 +759,11 @@ func TestAuthorize_Initiated_IncrementsOnSilentFork(t *testing.T) {
 	if rr.Code != http.StatusFound {
 		t.Fatalf("want 302, got %d: %s", rr.Code, rr.Body.String())
 	}
-	if got := testutil.ToFloat64(metrics.AuthorizeInitiated) - before; got != 1 {
-		t.Errorf("AuthorizeInitiated delta = %v, want 1", got)
+	if got := testutil.ToFloat64(metrics.AuthorizeInitiated.WithLabelValues("silent")) - silentBefore; got != 1 {
+		t.Errorf("AuthorizeInitiated{path=silent} delta = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.AuthorizeInitiated.WithLabelValues("consent")) - consentBefore; got != 0 {
+		t.Errorf("AuthorizeInitiated{path=consent} delta = %v, want 0 (silent fork must not bleed into consent label)", got)
 	}
 }
 
@@ -827,7 +835,7 @@ func TestAuthorize_Initiated_NotIncrementedOnPreValidationReject(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			before := testutil.ToFloat64(metrics.AuthorizeInitiated)
+			before := testutil.ToFloat64(metrics.AuthorizeInitiated.WithLabelValues("consent")) + testutil.ToFloat64(metrics.AuthorizeInitiated.WithLabelValues("silent"))
 
 			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/authorize?"+tc.q.Encode(), nil)
 			rr := httptest.NewRecorder()
@@ -846,7 +854,7 @@ func TestAuthorize_Initiated_NotIncrementedOnPreValidationReject(t *testing.T) {
 			if rr.Code != http.StatusBadRequest && rr.Code != http.StatusFound {
 				t.Fatalf("%s: unexpected status %d (want 400 or 302): %s", tc.name, rr.Code, rr.Body.String())
 			}
-			if got := testutil.ToFloat64(metrics.AuthorizeInitiated) - before; got != 0 {
+			if got := testutil.ToFloat64(metrics.AuthorizeInitiated.WithLabelValues("consent")) + testutil.ToFloat64(metrics.AuthorizeInitiated.WithLabelValues("silent")) - before; got != 0 {
 				t.Errorf("%s: AuthorizeInitiated delta = %v, want 0 (pre-funnel reject must not increment)", tc.name, got)
 			}
 		})
