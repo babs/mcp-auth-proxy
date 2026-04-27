@@ -216,6 +216,13 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 			state = hex.EncodeToString(b)
 		}
 
+		// All /authorize parameters have been validated. Increment
+		// the funnel counter BEFORE the consent/silent fork so it
+		// counts every validated request exactly once regardless of
+		// which path is taken. Pre-validation rejections land on
+		// access_denied_total instead.
+		metrics.AuthorizeInitiated.Inc()
+
 		// Consent-page fork (default path; bypassed only when the
 		// operator sets RENDER_CONSENT_PAGE=false). All /authorize
 		// parameters have been validated, but the upstream IdP

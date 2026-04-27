@@ -243,6 +243,15 @@ rollout notes, and K8s deployment shape.
     expected interaction, not a policy rejection. Pair with
     `mcp_auth_tokens_issued_total{grant_type="authorization_code"}`
     to derive abandoned-after-approve as a funnel signal
+  - `mcp_auth_authorize_initiated_total` — validated `/authorize`
+    requests entering the consent or silent-redirect fork. Closes
+    the GET-side of the consent funnel: `initiated` →
+    `consent_decisions` (consent fork) → `tokens_issued`
+    (`authorization_code`). A spike in `initiated` without a
+    matching spike downstream points at consent abandonment or
+    callback failures. Derive fork rates: `consent_rate =
+    sum(consent_decisions) / authorize_initiated`; `silent_rate =
+    1 - consent_rate`
   - `mcp_auth_replay_detected_total{kind}` — `code`, `refresh`,
     `consent`, or `callback_state` replays caught by the Redis-backed
     store

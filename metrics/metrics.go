@@ -127,6 +127,19 @@ var (
 		Help: "Consent-page decisions, by outcome (approved/denied). Approved is not a denial — see access_denied_total for those.",
 	}, []string{"decision"})
 
+	// AuthorizeInitiated counts validated GET /authorize requests
+	// that are about to fork into either the consent page or the
+	// silent IdP redirect. Closes the GET-side of the consent
+	// funnel: initiated → consent_decisions → tokens_issued. A
+	// validated request is one that passed client_id, redirect_uri,
+	// response_type, resource, PKCE, and state checks — pre-validation
+	// rejections (unknown client_id, unregistered redirect_uri, …)
+	// land on access_denied_total instead.
+	AuthorizeInitiated = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "mcp_auth_authorize_initiated_total",
+		Help: "Validated /authorize requests entering the consent or silent-redirect fork (closes the GET-side of the consent funnel).",
+	})
+
 	// GroupsClaimShapeMismatch counts id_tokens whose `groups` claim
 	// did not decode as []string. Distinct from AccessDenied because
 	// the request is NOT denied on this path — the proxy admits with
