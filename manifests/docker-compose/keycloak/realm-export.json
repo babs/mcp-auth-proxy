@@ -1,5 +1,4 @@
 {
-  "_comment_SECURITY": "DEMO ONLY — The client secret and user password below are hardcoded for local development. ROTATE ALL CREDENTIALS before pointing any real traffic at this realm.",
   "realm": "mcp-demo",
   "enabled": true,
   "sslRequired": "none",

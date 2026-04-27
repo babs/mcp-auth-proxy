@@ -117,6 +117,7 @@ All configuration via **environment variables**. Bold = required.
 | Variable | Default | Description |
 |---|---|---|
 | **`OIDC_ISSUER_URL`** | — | OIDC issuer (auto-discovered via `/.well-known/openid-configuration`) |
+| `OIDC_ALLOW_INSECURE_HTTP` | `false` | Dev-only escape hatch for cleartext `http://` OIDC issuers, used by the Docker Compose Keycloak demo. Rejected when `PROD_MODE=true`; production should use `https://` |
 | **`OIDC_CLIENT_ID`** | — | Client registered on the IdP |
 | **`OIDC_CLIENT_SECRET`** | — | IdP client secret |
 | **`PROXY_BASE_URL`** | — | Public URL of this proxy (audience-bound into every sealed token) |
@@ -332,6 +333,7 @@ Production posture guides:
 
 ```bash
 go test ./...                           # unit + e2e (mock OIDC provider)
+go test -tags=keycloak_e2e -run TestKeycloakE2EFullOAuthFlow -count=1 .
 go test -race ./...                     # with the race detector
 go test -cover ./...                    # with coverage
 ```
@@ -339,6 +341,10 @@ go test -cover ./...                    # with coverage
 The E2E test (`e2e_test.go`) spins up a full mock OIDC provider and
 exercises registration → authorize → callback → token → refresh →
 bearer-protected proxy in one go.
+
+The `keycloak_e2e` test runs against the Docker Compose demo stack with
+real Keycloak. Generate `manifests/docker-compose/.env`, start the stack,
+then run the tagged test above. CI runs this path automatically.
 
 ---
 

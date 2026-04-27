@@ -70,5 +70,6 @@ if [[ $FAIL -gt 0 ]]; then
 fi
 
 echo ""
-echo "Smoke test passed. Next step: use Claude.ai or Claude Code to trigger"
-echo "a full OAuth flow against http://localhost:8080"
+echo "Smoke test passed. Next step: run"
+echo "  go test -tags=keycloak_e2e -run TestKeycloakE2EFullOAuthFlow -count=1 ."
+echo "or use Claude.ai / Claude Code against http://localhost:8080"
