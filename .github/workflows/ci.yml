@@ -129,7 +129,12 @@ jobs:
           exit 1
 
       - name: go test real Keycloak e2e
-        run: go test -tags=keycloak_e2e -run TestKeycloakE2EFullOAuthFlow -count=1 .
+        # Run every TestKeycloakE2E* test — happy path + the
+        # negative-path tests (consent denied, replayed code,
+        # refresh family revoke, resource mismatch). Adding new
+        # negative-path tests does not require a CI workflow change
+        # as long as they keep the TestKeycloakE2E_ prefix.
+        run: go test -tags=keycloak_e2e -run "^TestKeycloakE2E" -count=1 -v .
 
       - name: dump compose logs on failure
         if: failure()
