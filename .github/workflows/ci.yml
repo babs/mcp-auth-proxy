@@ -1,9 +1,14 @@
 name: CI
 
 on:
+  # Push covers the mainline only — feature branches are verified
+  # via the pull_request trigger below. Without this restriction,
+  # every push to a branch with an open PR fires CI twice (once
+  # for the push, once for the PR's merge commit), duplicating
+  # the entire matrix on every commit.
   push:
     branches:
-      - '**'
+      - master
   pull_request:
     branches:
       - master
