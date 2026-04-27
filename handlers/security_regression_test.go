@@ -96,7 +96,7 @@ func TestC1b_SessionBlobRejectedAtTokenRefresh(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rr := httptest.NewRecorder()
 
-	Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
+	Token(tm, logger, testBaseURL, time.Time{}, nil, TokenConfig{})(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("C1.b: expected 400 for sealedSession at /token, got %d: %s", rr.Code, rr.Body.String())
@@ -128,7 +128,7 @@ func TestC1c_CodeBlobRejectedAtTokenRefresh(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rr := httptest.NewRecorder()
 
-	Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
+	Token(tm, logger, testBaseURL, time.Time{}, nil, TokenConfig{})(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("C1.c: expected 400 for sealedCode at /token refresh, got %d: %s", rr.Code, rr.Body.String())
@@ -184,7 +184,7 @@ func TestC1e_AccessBlobRejectedAtTokenRefresh(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rr := httptest.NewRecorder()
 
-	Token(tm, logger, testBaseURL, time.Time{}, nil)(rr, req)
+	Token(tm, logger, testBaseURL, time.Time{}, nil, TokenConfig{})(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("C1.e: expected 400 for access-token at /token refresh, got %d: %s", rr.Code, rr.Body.String())
@@ -506,7 +506,7 @@ func TestRefreshToken_RejectsMissingFamilyOrTokenID(t *testing.T) {
 				http.MethodPost, "/token", strings.NewReader(form.Encode()))
 			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 			rr := httptest.NewRecorder()
-			Token(tm, zap.NewNop(), testBaseURL, time.Time{}, nil)(rr, req)
+			Token(tm, zap.NewNop(), testBaseURL, time.Time{}, nil, TokenConfig{})(rr, req)
 
 			if rr.Code != http.StatusBadRequest {
 				t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())

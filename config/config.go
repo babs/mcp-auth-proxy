@@ -54,6 +54,14 @@ type Config struct {
 	// safe default is Redis-enforced single-use. Set REDIS_REQUIRED=false
 	// only for dev / single-replica deployments that accept the trade-off.
 	RedisRequired bool
+	// RefreshRaceGrace is the window inside which a refresh-rotation
+	// claim collision is treated as a benign concurrent submit
+	// (parallel-tab refresh, slow-network double-submit) and surfaces
+	// as 429 `refresh_concurrent_submit` without revoking the family.
+	// Outside the window the strict "every collision revokes" behavior
+	// applies. Default 2s; clamped to [0, 10s] at Load. Set to 0 to
+	// keep the strict pre-grace behavior. env: REFRESH_RACE_GRACE_SEC.
+	RefreshRaceGrace time.Duration
 	// CompatAllowStateless keeps the legacy Cursor/MCP Inspector behavior of
 	// accepting /authorize requests without a client-supplied state. Default
 	// false — strict mode refuses stateless requests so the client cannot
@@ -284,6 +292,27 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("REVOKE_BEFORE must be RFC3339 (e.g. 2026-03-28T12:00:00Z): %w", err)
 		}
 		c.RevokeBefore = t
+	}
+
+	// REFRESH_RACE_GRACE_SEC: integer seconds, default 2, clamped to
+	// [0, 10]. The 10s ceiling is a security cap — any collision wider
+	// than 10s is statistically attacker-shaped (real parallel-tab
+	// races complete sub-second; HTTP clients retry at single-digit
+	// seconds). 0 disables the grace window (every collision revokes
+	// the family — pre-grace behavior).
+	c.RefreshRaceGrace = 2 * time.Second
+	if raw := os.Getenv("REFRESH_RACE_GRACE_SEC"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			return nil, fmt.Errorf("REFRESH_RACE_GRACE_SEC must be an integer: %w", err)
+		}
+		if n < 0 {
+			return nil, fmt.Errorf("REFRESH_RACE_GRACE_SEC must be >= 0; got %d", n)
+		}
+		if n > 10 {
+			return nil, fmt.Errorf("REFRESH_RACE_GRACE_SEC must be <= 10; got %d (wider windows are statistically attacker-shaped)", n)
+		}
+		c.RefreshRaceGrace = time.Duration(n) * time.Second
 	}
 
 	if ag := os.Getenv("ALLOWED_GROUPS"); ag != "" {

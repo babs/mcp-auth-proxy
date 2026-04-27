@@ -42,13 +42,21 @@ const memoryMaxEntries = 100_000
 // Callers treat it like a backend failure and fail closed.
 var ErrStoreFull = errors.New("replay memory store at capacity")
 
+// memoryEntry tracks both the expiry and the original set time of a
+// claim. setAt is only consulted by ClaimOrCheckFamily's grace-window
+// logic; for every other path expiresAt is what matters.
+type memoryEntry struct {
+	expiresAt time.Time
+	setAt     time.Time
+}
+
 // MemoryStore is a single-process Store. Entries expire lazily on read
 // and are also swept by a background ticker. It is intended for tests
 // and for single-replica deployments where a full Redis dependency is
 // overkill; it does NOT protect against replay across replicas.
 type MemoryStore struct {
 	mu       sync.Mutex
-	entries  map[string]time.Time
+	entries  map[string]memoryEntry
 	stop     chan struct{}
 	stopOnce sync.Once
 }
@@ -74,7 +82,7 @@ func NewMemoryStoreWithContext(ctx context.Context) *MemoryStore {
 // for tests so eviction can be observed without waiting the full 30s.
 func newMemoryStore(ctx context.Context, interval time.Duration) *MemoryStore {
 	s := &MemoryStore{
-		entries: make(map[string]time.Time),
+		entries: make(map[string]memoryEntry),
 		stop:    make(chan struct{}),
 	}
 	go s.gcLoop(ctx, interval)
@@ -103,13 +111,13 @@ func (s *MemoryStore) ClaimOnce(_ context.Context, key string, ttl time.Duration
 	defer s.mu.Unlock()
 
 	now := time.Now()
-	if exp, ok := s.entries[key]; ok && now.Before(exp) {
+	if e, ok := s.entries[key]; ok && now.Before(e.expiresAt) {
 		return ErrAlreadyClaimed
 	}
 	if _, exists := s.entries[key]; !exists && !s.hasRoomLocked(now) {
 		return ErrStoreFull
 	}
-	s.entries[key] = now.Add(ttl)
+	s.entries[key] = memoryEntry{expiresAt: now.Add(ttl), setAt: now}
 	return nil
 }
 
@@ -120,34 +128,52 @@ func (s *MemoryStore) Mark(_ context.Context, key string, ttl time.Duration) err
 	if _, exists := s.entries[key]; !exists && !s.hasRoomLocked(now) {
 		return ErrStoreFull
 	}
-	s.entries[key] = now.Add(ttl)
+	// setAt is recorded for symmetry with ClaimOnce, but Mark is
+	// only used for revocation markers (e.g. refresh_family_revoked)
+	// which live in a different keyspace from refresh-claim keys —
+	// the racing branch in ClaimOrCheckFamily never reads it from a
+	// Mark-written entry under any current call site.
+	s.entries[key] = memoryEntry{expiresAt: now.Add(ttl), setAt: now}
 	return nil
 }
 
 func (s *MemoryStore) Exists(_ context.Context, key string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	exp, ok := s.entries[key]
-	return ok && time.Now().Before(exp), nil
+	e, ok := s.entries[key]
+	return ok && time.Now().Before(e.expiresAt), nil
 }
 
 // ClaimOrCheckFamily implements replay.Store.ClaimOrCheckFamily under a
-// single mutex so the three-step sequence (family-revoked check,
-// single-use claim, on-reuse family revocation) is observationally
-// atomic on this replica — the same invariant the Redis EVAL variant
-// enforces across replicas.
-func (s *MemoryStore) ClaimOrCheckFamily(_ context.Context, familyKey, claimKey string, claimTTL, familyTTL time.Duration) (familyRevoked bool, alreadyClaimed bool, err error) {
+// single mutex so the four-step sequence (family-revoked check,
+// single-use claim, racing-within-grace, on-stale-reuse family
+// revocation) is observationally atomic on this replica — the same
+// invariant the Redis EVAL variant enforces across replicas.
+func (s *MemoryStore) ClaimOrCheckFamily(_ context.Context, familyKey, claimKey string, claimTTL, familyTTL, graceWindow time.Duration) (familyRevoked bool, racing bool, alreadyClaimed bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	now := time.Now()
-	if exp, ok := s.entries[familyKey]; ok && now.Before(exp) {
-		return true, false, nil
+	if e, ok := s.entries[familyKey]; ok && now.Before(e.expiresAt) {
+		return true, false, false, nil
 	}
-	if exp, ok := s.entries[claimKey]; ok && now.Before(exp) {
-		// Reuse detected: revoke the family atomically here so the
-		// invariant "alreadyClaimed ⇒ family revoked" holds without
-		// relying on a second handler-driven write.
+	if e, ok := s.entries[claimKey]; ok && now.Before(e.expiresAt) {
+		// Collision. If the prior claim is still inside the grace
+		// window the call is treated as a benign concurrent submit
+		// (parallel-tab refresh, double-submit on slow network) — the
+		// family is NOT revoked, the caller surfaces a transient
+		// error so the legit peer can keep going. setAt covers the
+		// case where an entry left over from a non-claim operation
+		// (e.g. a Mark that happened to land on this key) has a
+		// zero setAt — `now.Sub(time.Time{})` is huge and exits the
+		// grace branch correctly.
+		if graceWindow > 0 && now.Sub(e.setAt) < graceWindow {
+			return false, true, false, nil
+		}
+		// Stale reuse past the grace window: revoke the family
+		// atomically here so the invariant "alreadyClaimed ⇒ family
+		// revoked" holds without relying on a second handler-driven
+		// write.
 		if _, exists := s.entries[familyKey]; !exists && !s.hasRoomLocked(now) {
 			// Cannot satisfy the alreadyClaimed-implies-family-
 			// revoked contract under cap pressure. Surface as an
@@ -157,16 +183,16 @@ func (s *MemoryStore) ClaimOrCheckFamily(_ context.Context, familyKey, claimKey 
 			// isn't. The handler treats err != nil as a 503 anyway,
 			// so no token is issued — the contract gap is the
 			// observable risk, not a token leak.
-			return false, false, ErrStoreFull
+			return false, false, false, ErrStoreFull
 		}
-		s.entries[familyKey] = now.Add(familyTTL)
-		return false, true, nil
+		s.entries[familyKey] = memoryEntry{expiresAt: now.Add(familyTTL), setAt: now}
+		return false, false, true, nil
 	}
 	if _, exists := s.entries[claimKey]; !exists && !s.hasRoomLocked(now) {
-		return false, false, ErrStoreFull
+		return false, false, false, ErrStoreFull
 	}
-	s.entries[claimKey] = now.Add(claimTTL)
-	return false, false, nil
+	s.entries[claimKey] = memoryEntry{expiresAt: now.Add(claimTTL), setAt: now}
+	return false, false, false, nil
 }
 
 func (s *MemoryStore) Close() error {
@@ -189,8 +215,8 @@ func (s *MemoryStore) hasRoomLocked(now time.Time) bool {
 // sweepExpired removes every entry whose expiry is in the past. Caller
 // must hold s.mu.
 func (s *MemoryStore) sweepExpired(now time.Time) {
-	for k, exp := range s.entries {
-		if now.After(exp) {
+	for k, e := range s.entries {
+		if now.After(e.expiresAt) {
 			delete(s.entries, k)
 		}
 	}

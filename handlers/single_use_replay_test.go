@@ -54,11 +54,11 @@ func (e *erroringStore) Exists(_ context.Context, _ string) (bool, error) {
 	}
 	return false, nil
 }
-func (e *erroringStore) ClaimOrCheckFamily(_ context.Context, _, _ string, _, _ time.Duration) (bool, bool, error) {
+func (e *erroringStore) ClaimOrCheckFamily(_ context.Context, _, _ string, _, _, _ time.Duration) (bool, bool, bool, error) {
 	if err := e.effective(e.claimOrCheckFamErr); err != nil {
-		return false, false, err
+		return false, false, false, err
 	}
-	return false, false, nil
+	return false, false, false, nil
 }
 func (e *erroringStore) Close() error { return nil }
 
@@ -448,6 +448,150 @@ func TestAuthorize_RenderConsent_PopulatesJTI(t *testing.T) {
 	}
 	if consent.JTI == "" {
 		t.Errorf("sealedConsent.JTI is empty — per-render claim slot not populated")
+	}
+}
+
+// --- T2.3: refresh-token race grace window ---
+
+// TestTokenRefresh_RaceGrace_RacingReturns429 pins T2.3 happy path:
+// when the operator configures a non-zero RefreshRaceGrace and a
+// second submit of the same refresh lands inside that window, the
+// response is 429 + error_code=refresh_concurrent_submit AND the
+// family is NOT revoked. The first refresh that already succeeded
+// stays usable.
+func TestTokenRefresh_RaceGrace_RacingReturns429(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+	store := replay.NewMemoryStore()
+	defer store.Close()
+
+	encClientID, internalID := registerClient(t, tm, []string{"https://app.example.com/callback"})
+
+	// Mint a refresh token with FamilyID/TokenID populated.
+	familyID := uuid.New().String()
+	original := sealedRefresh{
+		TokenID:   uuid.New().String(),
+		FamilyID:  familyID,
+		Subject:   "user-sub",
+		Email:     "user@example.com",
+		ClientID:  internalID,
+		Typ:       token.PurposeRefresh,
+		Audience:  testBaseURL,
+		IssuedAt:  time.Now(),
+		ExpiresAt: time.Now().Add(7 * 24 * time.Hour),
+	}
+	originalStr, err := tm.SealJSON(original, token.PurposeRefresh)
+	if err != nil {
+		t.Fatalf("SealJSON: %v", err)
+	}
+
+	exchange := func() *httptest.ResponseRecorder {
+		form := url.Values{
+			"grant_type":    {"refresh_token"},
+			"refresh_token": {originalStr},
+			"client_id":     {encClientID},
+		}
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/token", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rr := httptest.NewRecorder()
+		Token(tm, logger, testBaseURL, time.Time{}, store, TokenConfig{RefreshRaceGrace: 5 * time.Second})(rr, req)
+		return rr
+	}
+
+	// First rotation succeeds, claims the TokenID.
+	first := exchange()
+	if first.Code != http.StatusOK {
+		t.Fatalf("first rotation: want 200, got %d: %s", first.Code, first.Body.String())
+	}
+
+	racingBefore := testutil.ToFloat64(metrics.AccessDenied.WithLabelValues("refresh_concurrent_submit"))
+	familyRevokedBefore := testutil.ToFloat64(metrics.AccessDenied.WithLabelValues("refresh_family_revoked"))
+	reuseBefore := testutil.ToFloat64(metrics.ReplayDetected.WithLabelValues("refresh"))
+
+	// Second submit of the SAME refresh, within the 5s grace window.
+	second := exchange()
+	if second.Code != http.StatusTooManyRequests {
+		t.Fatalf("racing rotation: want 429, got %d: %s", second.Code, second.Body.String())
+	}
+	if got := second.Header().Get("Retry-After"); got == "" {
+		t.Errorf("racing rotation: want Retry-After header, got empty")
+	}
+	var racingErr OAuthError
+	if err := json.NewDecoder(second.Body).Decode(&racingErr); err != nil {
+		t.Fatalf("decode racing: %v", err)
+	}
+	if racingErr.ErrorCode != "refresh_concurrent_submit" {
+		t.Errorf("error_code = %q, want refresh_concurrent_submit", racingErr.ErrorCode)
+	}
+
+	if got := testutil.ToFloat64(metrics.AccessDenied.WithLabelValues("refresh_concurrent_submit")); got-racingBefore != 1 {
+		t.Errorf("AccessDenied{reason=refresh_concurrent_submit} delta = %v, want 1", got-racingBefore)
+	}
+	// Family must NOT be revoked — that's the whole point of the grace window.
+	if got := testutil.ToFloat64(metrics.AccessDenied.WithLabelValues("refresh_family_revoked")); got != familyRevokedBefore {
+		t.Errorf("AccessDenied{reason=refresh_family_revoked} delta = %v, want 0", got-familyRevokedBefore)
+	}
+	if got := testutil.ToFloat64(metrics.ReplayDetected.WithLabelValues("refresh")); got != reuseBefore {
+		t.Errorf("ReplayDetected{kind=refresh} delta = %v, want 0", got-reuseBefore)
+	}
+}
+
+// TestTokenRefresh_RaceGrace_ZeroDisablesGrace pins that
+// RefreshRaceGrace=0 keeps the strict pre-T2.3 behavior: every
+// collision is reuse, the family is revoked. Operators who want
+// the strict mode can opt out of the grace window by setting
+// REFRESH_RACE_GRACE_SEC=0.
+func TestTokenRefresh_RaceGrace_ZeroDisablesGrace(t *testing.T) {
+	tm := newTestTokenManager(t)
+	logger := zap.NewNop()
+	store := replay.NewMemoryStore()
+	defer store.Close()
+
+	encClientID, internalID := registerClient(t, tm, []string{"https://app.example.com/callback"})
+
+	familyID := uuid.New().String()
+	original := sealedRefresh{
+		TokenID:   uuid.New().String(),
+		FamilyID:  familyID,
+		Subject:   "user-sub",
+		Email:     "user@example.com",
+		ClientID:  internalID,
+		Typ:       token.PurposeRefresh,
+		Audience:  testBaseURL,
+		IssuedAt:  time.Now(),
+		ExpiresAt: time.Now().Add(7 * 24 * time.Hour),
+	}
+	originalStr, err := tm.SealJSON(original, token.PurposeRefresh)
+	if err != nil {
+		t.Fatalf("SealJSON: %v", err)
+	}
+
+	exchange := func() *httptest.ResponseRecorder {
+		form := url.Values{
+			"grant_type":    {"refresh_token"},
+			"refresh_token": {originalStr},
+			"client_id":     {encClientID},
+		}
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/token", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rr := httptest.NewRecorder()
+		Token(tm, logger, testBaseURL, time.Time{}, store, TokenConfig{RefreshRaceGrace: 0})(rr, req)
+		return rr
+	}
+
+	if got := exchange().Code; got != http.StatusOK {
+		t.Fatalf("first rotation: want 200, got %d", got)
+	}
+	second := exchange()
+	if second.Code != http.StatusBadRequest {
+		t.Fatalf("strict-mode collision: want 400, got %d: %s", second.Code, second.Body.String())
+	}
+	var oauthErr OAuthError
+	if err := json.NewDecoder(second.Body).Decode(&oauthErr); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if oauthErr.ErrorCode != "refresh_reuse_detected" {
+		t.Errorf("error_code = %q, want refresh_reuse_detected", oauthErr.ErrorCode)
 	}
 }
 

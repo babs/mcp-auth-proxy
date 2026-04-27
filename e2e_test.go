@@ -213,7 +213,7 @@ func buildTestProxy(t *testing.T, oidcProvider *mockOIDCProvider, mcpServer *moc
 	r.Get("/callback", handlers.Callback(tm, zap.NewNop(), proxyBaseURL, oauth2Cfg, verifier, handlers.CallbackConfig{
 		GroupsClaim: "groups",
 	}))
-	r.Post("/token", handlers.Token(tm, zap.NewNop(), proxyBaseURL, time.Time{}, nil))
+	r.Post("/token", handlers.Token(tm, zap.NewNop(), proxyBaseURL, time.Time{}, nil, handlers.TokenConfig{}))
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
 	r.Group(func(r chi.Router) {
 		r.Use(authMW.Validate)

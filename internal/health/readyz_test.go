@@ -29,8 +29,8 @@ func (f *fakeStore) Exists(_ context.Context, _ string) (bool, error) {
 	f.existsCalls.Add(1)
 	return false, f.existsErr
 }
-func (f *fakeStore) ClaimOrCheckFamily(_ context.Context, _, _ string, _, _ time.Duration) (bool, bool, error) {
-	return false, false, nil
+func (f *fakeStore) ClaimOrCheckFamily(_ context.Context, _, _ string, _, _, _ time.Duration) (bool, bool, bool, error) {
+	return false, false, false, nil
 }
 func (f *fakeStore) Close() error { return nil }
 
