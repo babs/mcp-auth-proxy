@@ -4,10 +4,3 @@ metadata:
   name: redis
   namespace: mcp-auth-proxy
 $patch: delete
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: redis
-  namespace: mcp-auth-proxy
-$patch: delete
