@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/babs/mcp-auth-proxy/metrics"
+	"github.com/babs/mcp-auth-proxy/replay"
 	"github.com/babs/mcp-auth-proxy/token"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"golang.org/x/oauth2"
 )
@@ -183,10 +185,14 @@ func redirectHost(redirectURI string) string {
 }
 
 // ConsentConfig holds optional dependencies for the consent
-// approval handler. Mirrors the shape of CallbackConfig — no
-// runtime tunables today, kept as a struct so future fields don't
-// re-break the constructor signature.
-type ConsentConfig struct{}
+// approval handler. Mirrors the shape of CallbackConfig.
+type ConsentConfig struct {
+	// ReplayStore, when non-nil, enforces single-use semantics on the
+	// consent token's JTI: a captured consent_token can be POSTed at
+	// most once. nil = stateless fallback (configured opt-out — the
+	// token is still audience- and TTL-bound).
+	ReplayStore replay.Store
+}
 
 // Consent handles POST /consent (consent-page approval submit).
 //
@@ -206,17 +212,14 @@ type ConsentConfig struct{}
 // purpose-bound, 5-min TTL). A POST without a valid consent_token
 // is rejected.
 //
-// Replay note: the consent token is NOT integrated with the replay
-// store. A given token can be redeemed multiple times within its
-// 5-min window. Each Approve mints a fresh sealedSession (different
-// nonce / verifier), and the IdP login still has to complete; each
-// Deny just emits another error=access_denied to the registered
-// redirect_uri. Neither path produces an effect the original user
-// couldn't reproduce by clicking again. Wiring single-use through
-// the replay store would be belt-and-braces against an attacker
-// who exfiltrated the consent token (a stronger compromise than
-// this defense addresses) — accepted as a deliberate trade-off.
-func Consent(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg *oauth2.Config, _ ConsentConfig) http.HandlerFunc {
+// Replay defense: when ConsentConfig.ReplayStore is wired, the
+// consent token's JTI is claimed single-use before either branch
+// runs. Each GET /authorize render mints a fresh JTI so the
+// back-button case still works (a re-render gets a new claim
+// slot); a stolen consent_token can be POSTed at most once. Empty
+// JTI (token sealed by an older binary still in flight during
+// rollout) falls through to the prior stateless behavior.
+func Consent(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg *oauth2.Config, cfg ConsentConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 
@@ -278,6 +281,39 @@ func Consent(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg *o
 			return
 		}
 
+		// Single-use claim on the consent JTI — applies BEFORE the
+		// approve/deny branch so a captured token cannot be replayed
+		// for either decision. Mirrors the /token authorization-code
+		// claim policy: nil store = stateless fallback (configured
+		// opt-out); ErrAlreadyClaimed = 400 + replay metric; other
+		// backend errors = fail-closed 503 so we never proceed
+		// against an uncertain replay-state result. Empty JTI is the
+		// in-flight-rollout fallback (older binary sealed the token
+		// before this field existed).
+		if cfg.ReplayStore != nil && consent.JTI != "" {
+			remaining := max(time.Until(consent.ExpiresAt), time.Second)
+			key := replay.NamespacedKey("consent", consent.JTI)
+			if err := cfg.ReplayStore.ClaimOnce(r.Context(), key, remaining); err != nil {
+				if errors.Is(err, replay.ErrAlreadyClaimed) {
+					metrics.ReplayDetected.WithLabelValues("consent").Inc()
+					logger.Warn("consent_token_replay",
+						zap.String("jti", consent.JTI),
+						zap.String("client_id", consent.ClientID),
+					)
+					writeOAuthError(w, http.StatusBadRequest, "invalid_request", "consent token already used", "consent_replay")
+					return
+				}
+				// Reuse the same access_denied{replay_store_unavailable}
+				// counter as /token rather than a per-site counter — a
+				// Redis outage hits every claim site at once and a single
+				// alerting rule on this counter covers all of them.
+				logger.Error("replay_store_error", zap.String("op", "claim_consent"), zap.Error(err))
+				metrics.AccessDenied.WithLabelValues("replay_store_unavailable").Inc()
+				writeOAuthError(w, http.StatusServiceUnavailable, "server_error", "replay store unavailable", "replay_store_unavailable")
+				return
+			}
+		}
+
 		if action == "deny" {
 			// Counted on a dedicated funnel counter rather than
 			// AccessDenied: clicking Deny is a normal expected user
@@ -335,6 +371,7 @@ func Consent(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg *o
 			PKCEVerifier:  upstreamVerifier,
 			SvrVerifier:   svrVerifier,
 			SvrChallenge:  svrChallenge,
+			SessionID:     uuid.New().String(),
 			Typ:           token.PurposeSession,
 			Audience:      baseURL,
 			Resource:      consent.Resource,

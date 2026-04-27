@@ -9,6 +9,7 @@ import (
 
 	"github.com/babs/mcp-auth-proxy/metrics"
 	"github.com/babs/mcp-auth-proxy/token"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"golang.org/x/oauth2"
 )
@@ -226,6 +227,10 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 		// redirect) replays from POST /consent on approval.
 		if authzCfg.RenderConsentPage {
 			renderConsent(w, r, tm, logger, baseURL, authzCfg.ResourceName, sealedConsent{
+				// Per-render JTI: a fresh id every GET /authorize so
+				// back-button = re-consent (each render gets its own
+				// single-use claim slot) rather than dead-state errors.
+				JTI:                   uuid.New().String(),
 				ClientID:              client.ID,
 				ClientName:            client.ClientName,
 				RedirectURI:           redirectURI,
@@ -280,6 +285,7 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 			PKCEVerifier:  upstreamVerifier,
 			SvrVerifier:   svrVerifier,  // empty unless H6 server-side PKCE kicked in
 			SvrChallenge:  svrChallenge, // mirrors sessionChallenge in that case
+			SessionID:     uuid.New().String(),
 			Typ:           token.PurposeSession,
 			Audience:      baseURL,
 			Resource:      authzCfg.CanonicalResource,

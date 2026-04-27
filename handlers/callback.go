@@ -3,12 +3,14 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
 	"github.com/babs/mcp-auth-proxy/metrics"
+	"github.com/babs/mcp-auth-proxy/replay"
 	"github.com/babs/mcp-auth-proxy/token"
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/google/uuid"
@@ -72,10 +74,18 @@ func sanitizeErrorDescription(s string) string {
 	return string(b)
 }
 
-// CallbackConfig holds the group filtering parameters for the callback handler.
+// CallbackConfig holds optional dependencies for the callback handler.
 type CallbackConfig struct {
 	AllowedGroups []string // empty = allow all authenticated users
 	GroupsClaim   string   // flat claim name in id_token (default "groups")
+	// ReplayStore, when non-nil, enforces single-use semantics on the
+	// sealed `state` parameter via its embedded SessionID: a captured
+	// /callback URL cannot be replayed to fan out to the upstream IdP
+	// (audit-noise + outbound-fan-out defense — the IdP authorization
+	// code is itself single-use, so a successful replay would just
+	// burn the IdP's `invalid_grant` quota anyway). nil = stateless
+	// fallback (configured opt-out).
+	ReplayStore replay.Store
 }
 
 // Callback handles GET /callback (IdP redirect after user authentication).
@@ -118,6 +128,17 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 		internalState := q.Get("state")
 
 		if idpError != "" {
+			// Deliberately NO ClaimOnce on this branch even when the
+			// session opens cleanly. The error redirect produces no
+			// IdP fan-out (no token-endpoint call) and no token
+			// issuance — just an idempotent 302 to the registered
+			// redirect_uri carrying `error=…`. Claiming here would
+			// burn the state on the first transient IdP error and
+			// force the user through full re-auth on the next legit
+			// retry. Trade-off accepted: a stolen state can replay
+			// the same error redirect, but the attacker gains
+			// nothing not already producible by sending the user a
+			// crafted /authorize URL.
 			safeError := normalizeIdPError(idpError)
 			// `error_description` from a /callback hit is fully
 			// attacker-controlled — anyone can craft a /callback URL
@@ -173,6 +194,33 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 		if time.Now().After(session.ExpiresAt) {
 			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "session expired")
 			return
+		}
+
+		// Single-use claim on the sealed state's SessionID. Applies
+		// BEFORE the upstream IdP exchange so a replayed /callback
+		// URL never fans out to the IdP. Same nil-store /
+		// ErrAlreadyClaimed / fail-closed-on-error policy as the
+		// /token code claim. Empty SessionID is the in-flight-rollout
+		// fallback (older binary sealed the session before this
+		// field existed).
+		if cbCfg.ReplayStore != nil && session.SessionID != "" {
+			remaining := max(time.Until(session.ExpiresAt), time.Second)
+			key := replay.NamespacedKey("callback_state", session.SessionID)
+			if err := cbCfg.ReplayStore.ClaimOnce(r.Context(), key, remaining); err != nil {
+				if errors.Is(err, replay.ErrAlreadyClaimed) {
+					metrics.ReplayDetected.WithLabelValues("callback_state").Inc()
+					logger.Warn("callback_state_replay",
+						zap.String("session_id", session.SessionID),
+						zap.String("client_id", session.ClientID),
+					)
+					writeOAuthError(w, http.StatusBadRequest, "invalid_request", "callback state already used", "callback_state_replay")
+					return
+				}
+				logger.Error("replay_store_error", zap.String("op", "claim_callback_state"), zap.Error(err))
+				metrics.AccessDenied.WithLabelValues("replay_store_unavailable").Inc()
+				writeOAuthError(w, http.StatusServiceUnavailable, "server_error", "replay store unavailable", "replay_store_unavailable")
+				return
+			}
 		}
 
 		// Explicit timeout for upstream OIDC token exchange

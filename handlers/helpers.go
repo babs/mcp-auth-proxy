@@ -60,8 +60,14 @@ type sealedSession struct {
 	PKCEVerifier  string `json:"pv"`
 	SvrVerifier   string `json:"sv,omitempty"`
 	SvrChallenge  string `json:"sch,omitempty"`
-	Typ           string `json:"typ"`
-	Audience      string `json:"aud"`
+	// SessionID is a per-session unique id used as the replay-store
+	// claim key at /callback so a captured `state` cannot be replayed
+	// against the IdP token endpoint (audit + outbound-fan-out
+	// defense). Empty on sessions sealed before this field existed —
+	// /callback then falls through to the prior stateless behavior.
+	SessionID string `json:"sid,omitempty"`
+	Typ       string `json:"typ"`
+	Audience  string `json:"aud"`
 	// Resource is the canonical RFC 8707 resource indicator the
 	// downstream tokens will be bound to. Captured at /authorize so
 	// the binding is fixed BEFORE the upstream IdP round trip — a
@@ -125,6 +131,13 @@ type sealedCode struct {
 // usefulness). AAD purpose binding keeps it from being opened as
 // any other sealed type.
 type sealedConsent struct {
+	// JTI is a per-render unique id used as the single-use claim key
+	// at POST /consent. Each GET /authorize render mints a fresh JTI
+	// (back-button-safe: a re-render gets a new claim slot, the prior
+	// one is dead once redeemed). Empty on tokens sealed before this
+	// field existed — /consent then falls through to the prior
+	// stateless behavior for that token.
+	JTI           string `json:"jti,omitempty"`
 	ClientID      string `json:"cid"`
 	ClientName    string `json:"cn,omitempty"`
 	RedirectURI   string `json:"ru"`

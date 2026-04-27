@@ -238,8 +238,9 @@ rollout notes, and K8s deployment shape.
     expected interaction, not a policy rejection. Pair with
     `mcp_auth_tokens_issued_total{grant_type="authorization_code"}`
     to derive abandoned-after-approve as a funnel signal
-  - `mcp_auth_replay_detected_total{kind}` — `code` or `refresh` replays
-    caught by the Redis-backed store
+  - `mcp_auth_replay_detected_total{kind}` — `code`, `refresh`,
+    `consent`, or `callback_state` replays caught by the Redis-backed
+    store
   - `mcp_auth_rate_limited_total{endpoint}` — httprate 429s by endpoint
   - `mcp_auth_clients_registered_total` — RFC 7591 registrations
   - `mcp_auth_groups_claim_shape_mismatch_total` — id_token `groups`

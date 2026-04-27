@@ -81,10 +81,11 @@ var (
 	}, []string{"reason"})
 
 	// ReplayDetected counts replay attempts caught by the replay store
-	// (requires REDIS_URL). Labelled by kind (code / refresh).
+	// (requires REDIS_URL). Labelled by kind: code, refresh, consent,
+	// callback_state.
 	ReplayDetected = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "mcp_auth_replay_detected_total",
-		Help: "Replay attempts detected by the replay store, by kind.",
+		Help: "Replay attempts detected by the replay store, by kind (code/refresh/consent/callback_state).",
 	}, []string{"kind"})
 
 	// ClientsRegistered counts dynamic client registrations (RFC 7591).

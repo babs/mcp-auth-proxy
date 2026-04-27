@@ -251,7 +251,7 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 			// `replay_store_unavailable` reason on the same denial counter
 			// the runbook tells operators to alert on (a Redis outage hits
 			// both the code and refresh paths under load).
-			logger.Error("replay_store_error", zap.Error(err))
+			logger.Error("replay_store_error", zap.String("op", "claim_authz_code"), zap.Error(err))
 			metrics.AccessDenied.WithLabelValues("replay_store_unavailable").Inc()
 			writeOAuthError(w, http.StatusServiceUnavailable, "server_error", "replay store unavailable", "replay_store_unavailable")
 			return
@@ -415,7 +415,7 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 		// path a client cancel could cut short.
 		revoked, alreadyClaimed, err := replayStore.ClaimOrCheckFamily(r.Context(), familyKey, claimKey, claimTTL, refreshTokenTTL)
 		if err != nil {
-			logger.Error("replay_store_error", zap.Error(err))
+			logger.Error("replay_store_error", zap.String("op", "claim_refresh_family"), zap.Error(err))
 			metrics.AccessDenied.WithLabelValues("replay_store_unavailable").Inc()
 			writeOAuthError(w, http.StatusServiceUnavailable, "server_error", "replay store unavailable", "replay_store_unavailable")
 			return
