@@ -19,6 +19,7 @@ the implementation are updated together.
 | RFC 7636 | S256 PKCE, verifier/challenge length and charset validation | `handlers/authorize.go`, `handlers/token.go` |
 | RFC 8707 | `resource` validation on `/authorize` and `/token`; resource binding sealed into issued tokens | `handlers/authorize.go`, `handlers/token.go`, `middleware/auth.go` |
 | OIDC Core | Upstream OIDC discovery, authorization-code exchange, ID token verification, nonce validation, `email_verified` enforcement when present | `main.go`, `handlers/callback.go` |
+| Proxy-rendered consent | Default behaviour; set `RENDER_CONSENT_PAGE=false` to opt out — `/authorize` stops after parameter validation and renders an HTML consent page; `POST /consent` carries the user's Approve / Deny decision back. Closes the silent-issuance phishing path where a malicious DCR client + an active IdP session = tokens issued without user interaction | `handlers/consent.go`, `handlers/consent_test.go`, `keycloak_e2e_test.go` |
 
 ## Intentional compatibility behavior
 

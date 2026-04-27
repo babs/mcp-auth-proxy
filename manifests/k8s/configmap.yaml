@@ -57,6 +57,14 @@ data:
   # REVOKE_BEFORE: ""                    # RFC3339 bulk-revocation cutoff
   COMPAT_ALLOW_STATELESS: "false"
 
+  # Consent page on /authorize is ON by default at the code level
+  # (RENDER_CONSENT_PAGE defaults to true). Uncomment the line below
+  # ONLY if you must fall back to the legacy silent-redirect path —
+  # acceptable only when every caller is non-interactive and
+  # known-trusted (CI rigs, fully-headless agents). Browser-driven
+  # MCP clients render the consent form correctly.
+  # RENDER_CONSENT_PAGE: "false"
+
   # Strict-posture gate. Default (true) fails startup if any
   # compatibility flag weakens a security control (PKCE_REQUIRED=false,
   # COMPAT_ALLOW_STATELESS=true, REDIS_REQUIRED=false, REDIS_URL empty,

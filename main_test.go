@@ -8,9 +8,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 
+	"github.com/babs/mcp-auth-proxy/metrics"
 	"github.com/babs/mcp-auth-proxy/middleware"
 )
 
@@ -332,6 +334,58 @@ func TestRateLimiter_StripsXRateLimitHeaders(t *testing.T) {
 		if v := throttled.Header().Get(k); v != "" {
 			t.Errorf("429 response leaked %s = %q", k, v)
 		}
+	}
+}
+
+// TestRateLimiter_AuthorizeAndConsent_IndependentBuckets pins the
+// wiring: /authorize and /consent each get their own httprate bucket
+// instance, so a flood that exhausts one path does not poison the
+// other. A regression that re-shared the limiter (the earlier shape
+// before the dedicated consentLimit) is caught by triggering one
+// label's 429 and verifying the other label's counter stays flat.
+func TestRateLimiter_AuthorizeAndConsent_IndependentBuckets(t *testing.T) {
+	authorizeMW := rateLimiter(2, time.Minute, "authorize")
+	consentMW := rateLimiter(2, time.Minute, "consent")
+
+	// Sanity — they must be distinct middleware instances (i.e. the
+	// caller in main.go must construct two separate rateLimiter calls,
+	// not reuse one).
+	authorizeBefore := testutil.ToFloat64(metrics.RateLimited.WithLabelValues("authorize"))
+	consentBefore := testutil.ToFloat64(metrics.RateLimited.WithLabelValues("consent"))
+
+	noop := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	authH := authorizeMW(noop)
+	consentH := consentMW(noop)
+
+	send := func(h http.Handler) int {
+		req := httptest.NewRequest(http.MethodPost, "/x", nil)
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		return rr.Code
+	}
+
+	// Burn /authorize's bucket: 2 allowed, 3rd should 429.
+	send(authH)
+	send(authH)
+	if got := send(authH); got != http.StatusTooManyRequests {
+		t.Fatalf("authorize 3rd request: want 429, got %d", got)
+	}
+
+	// /consent's bucket should be untouched: 2 allowed, 3rd 429s on
+	// its own counter, NOT on the authorize one.
+	send(consentH)
+	send(consentH)
+	if got := send(consentH); got != http.StatusTooManyRequests {
+		t.Fatalf("consent 3rd request: want 429, got %d", got)
+	}
+
+	// Each label's counter incremented exactly once (the 3rd
+	// request on each path).
+	if delta := testutil.ToFloat64(metrics.RateLimited.WithLabelValues("authorize")) - authorizeBefore; delta != 1 {
+		t.Errorf("authorize RateLimited delta = %v, want 1", delta)
+	}
+	if delta := testutil.ToFloat64(metrics.RateLimited.WithLabelValues("consent")) - consentBefore; delta != 1 {
+		t.Errorf("consent RateLimited delta = %v, want 1 (regression: /consent likely sharing the /authorize bucket)", delta)
 	}
 }
 

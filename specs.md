@@ -99,10 +99,11 @@ On Redis failure the handler fails closed (503 `server_error` / `error_code: rep
 
 ### Migration notes (breaking changes since the previous spec)
 
-Two defaults were flipped to enforce the strict OAuth 2.1 / MCP posture by default. An operator pulling a new image without re-reading the config table will hit a hard `Fatal` at startup if either applies.
+Three defaults were flipped to enforce the strict OAuth 2.1 / MCP posture by default. An operator pulling a new image without re-reading the config table will hit a hard `Fatal` at startup for the first two; the third changes the shape of the `/authorize` response.
 
 - **`UPSTREAM_MCP_URL` now requires an explicit path.** Origin-only URLs (`http://backend`, `http://backend/`) used to be the only legal shape; they are now rejected. The path is the proxy's public mount AND the path forwarded upstream — pick what your upstream actually serves (FastMCP default: `/mcp`). The path is also restricted to RFC 3986 unreserved characters plus `/`, so `:`, `*`, `{`, `}`, `@`, `+` etc. are rejected — they would otherwise silently register chi router patterns instead of literal segments.
 - **`PROD_MODE` now defaults to `true`.** Was `false`. Strict mode rejects every relaxation flag (`PKCE_REQUIRED=false`, `COMPAT_ALLOW_STATELESS=true`, `REDIS_REQUIRED=false`, `REDIS_URL` empty, legacy `TRUST_PROXY_HEADERS=true` without `TRUSTED_PROXY_CIDRS`). Existing dev / single-replica deployments that depended on those flags must set `PROD_MODE=false` explicitly.
+- **`RENDER_CONSENT_PAGE` now defaults to `true`.** Was `false`. `/authorize` now returns a 200 HTML consent page instead of a 302 to the IdP; the user clicks Approve or Deny on a `<form action="/consent" method="POST">`. Closes the open-DCR-plus-active-IdP-session silent-issuance phishing class. Browser-driven MCP clients (claude.ai, Claude Code, Cursor, MCP Inspector, ChatGPT) follow the form transparently. **If you drive `/authorize` from a non-browser caller** (CI rig, scrape test, headless agent that expected a 302), you have two options: set `RENDER_CONSENT_PAGE=false` to keep the legacy silent redirect, or update the caller to handle a 200 HTML response with a `consent_token`-bearing form (see `keycloak_e2e_test.go::approveConsent` for the reference walk-through).
 
 All configuration is via environment variables.
 
@@ -291,7 +292,8 @@ Error responses use RFC 7591 §3.2.2 codes: `invalid_redirect_uri` for any redir
 **Behavior:**
 1. Validate all params; reject repeated singleton params (`resource` may appear more than once per RFC 8707); every `resource` value must match an accepted resource URI
 2. Decrypt the `client_id` → verify not expired, `redirect_uri` matched
-3. Encrypt the session with AES-GCM (10min TTL):
+3. **Consent fork.** The validated parameters are sealed into a `sealedConsent` blob (`PurposeConsent` AAD, audience-bound, 5-min TTL) and an HTML page is rendered showing the registered `client_name`, the parsed redirect host, and the resource. The user clicks Approve or Deny. The form POSTs to `/consent` (see below). Default behavior; setting `RENDER_CONSENT_PAGE=false` skips this step and runs the silent redirect at step 4 directly — only safe when every caller is non-interactive and known-trusted.
+4. Encrypt the session with AES-GCM (10min TTL):
    ```
    {
      client_id (internal UUID),
@@ -300,8 +302,8 @@ Error responses use RFC 7591 §3.2.2 codes: `invalid_redirect_uri` for any redir
      expires_at
    }
    ```
-4. Use the encrypted blob as the `state` parameter sent to the IdP
-5. Build the authorization URL from endpoints discovered via OIDC auto-discovery:
+5. Use the encrypted blob as the `state` parameter sent to the IdP
+6. Build the authorization URL from endpoints discovered via OIDC auto-discovery:
    ```
    {discovered_authorization_endpoint}
      ?client_id={OIDC_CLIENT_ID}
@@ -311,7 +313,28 @@ Error responses use RFC 7591 §3.2.2 codes: `invalid_redirect_uri` for any redir
      &state={encrypted_session}
      &response_mode=query
    ```
-6. Redirect 302 to the IdP
+7. Redirect 302 to the IdP
+
+---
+
+### POST `/consent`
+
+Always registered. Driven by the consent form rendered at step 3 of `/authorize` (default behaviour; bypassed only when the operator sets `RENDER_CONSENT_PAGE=false`).
+
+**Form fields:** `consent_token` (sealed blob from the GET-side render), `action` (`approve` or `deny`).
+
+**Guards (mirror `/token`):**
+- `r.URL.RawQuery != ""` → 400. The sealed token would otherwise leak into access logs / browser history / Referer.
+- `Authorization` header present → 401 `invalid_client` with a `WWW-Authenticate` challenge. The endpoint advertises no client-auth scheme.
+- Body capped at 1 MB; repeated `consent_token` / `action` fields rejected.
+
+**Behavior:**
+1. Open `consent_token` (`PurposeConsent` AAD); reject on bad shape, wrong purpose, audience mismatch, or expired (`5 min` TTL).
+2. **`action=deny`:** increment `mcp_auth_consent_decisions_total{decision="denied"}`, log `consent_denied`, redirect 302 to the registered `redirect_uri` with `error=access_denied` per RFC 6749 §4.1.2.1.
+3. **`action=approve`:** mint upstream OIDC `nonce` (random 32 hex) + upstream PKCE verifier, regenerate the H6 server-side PKCE pair if the consent blob recorded one, seal a `sealedSession` (same shape as step 4 of `/authorize`), redirect 302 to the IdP. Increment `mcp_auth_consent_decisions_total{decision="approved"}`.
+4. **Anything else:** 400 `invalid_request`.
+
+**Why no replay-store integration on `consent_token`:** within the 5-min TTL the token can be redeemed multiple times. Each Approve mints a *new* `sealedSession` (different `nonce` / verifier), and the IdP login still has to complete; each Deny just emits another `error=access_denied` to the registered `redirect_uri`. Neither path produces an effect the original user couldn't produce themselves by clicking again. Adding a Redis claim would be belt-and-braces against an attacker who exfiltrated the consent_token (a stronger compromise than this defense addresses) — accepted as a deliberate trade-off rather than a default.
 
 ---
 

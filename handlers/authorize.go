@@ -34,6 +34,26 @@ type AuthorizeConfig struct {
 	// hide behind the proxy. Either way the denial is counted under
 	// mcp_auth_access_denied_total{reason="state_missing"} for visibility.
 	CompatAllowStateless bool
+	// RenderConsentPage gates the proxy-side consent screen. When
+	// true, /authorize stops after parameter validation, seals the
+	// validated request as a sealedConsent, and renders an HTML
+	// page that requires an explicit user click before the upstream
+	// IdP redirect happens. Closes the silent-issuance phishing
+	// path where a malicious DCR client + an active upstream IdP
+	// session = a token issued without the user ever seeing the
+	// proxy.
+	//
+	// Production wiring (main.go) defaults this to true via the
+	// RENDER_CONSENT_PAGE env var. The struct zero-value is false
+	// so tests / callers wiring AuthorizeConfig directly default
+	// to the silent-redirect path and opt in explicitly.
+	RenderConsentPage bool
+	// ResourceName mirrors config.ResourceName so the consent page
+	// can show "{ClientName} wants to access {ResourceName}" rather
+	// than the raw mount URI when the operator has set a friendly
+	// name via MCP_RESOURCE_NAME. Falls back to CanonicalResource
+	// when empty.
+	ResourceName string
 }
 
 // Authorize handles GET /authorize (OAuth 2.1 PKCE authorization request).
@@ -193,6 +213,31 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 				return
 			}
 			state = hex.EncodeToString(b)
+		}
+
+		// Consent-page fork (default path; bypassed only when the
+		// operator sets RENDER_CONSENT_PAGE=false). All /authorize
+		// parameters have been validated, but the upstream IdP
+		// redirect MUST NOT happen yet — the user has to see and
+		// approve a proxy-rendered page first. Seal the validated
+		// shape into a short-lived sealedConsent and hand it to
+		// the consent renderer. The remainder of /authorize
+		// (nonce, upstream PKCE verifier, sealedSession, IdP
+		// redirect) replays from POST /consent on approval.
+		if authzCfg.RenderConsentPage {
+			renderConsent(w, r, tm, logger, baseURL, authzCfg.ResourceName, sealedConsent{
+				ClientID:              client.ID,
+				ClientName:            client.ClientName,
+				RedirectURI:           redirectURI,
+				OriginalState:         state,
+				CodeChallenge:         codeChallenge,
+				SvrChallengeRequested: !authzCfg.PKCERequired && codeChallenge == "",
+				Resource:              authzCfg.CanonicalResource,
+				Typ:                   token.PurposeConsent,
+				Audience:              baseURL,
+				ExpiresAt:             time.Now().Add(consentTTL),
+			})
+			return
 		}
 
 		// Upstream OIDC nonce (H3): random 32 hex, bound to this session,

@@ -100,6 +100,20 @@ var (
 		Help: "Requests rejected by the per-IP rate limiter, by endpoint.",
 	}, []string{"endpoint"})
 
+	// ConsentDecisions counts user clicks on the proxy-rendered
+	// consent page, labelled by outcome (approved / denied). Distinct
+	// from AccessDenied: a user clicking "Deny" is not a policy
+	// rejection — it's a normal expected interaction. Mixing it into
+	// AccessDenied would noise up the denial alerts operators wire
+	// against actual policy violations (group / audience / email_
+	// unverified / replay_store_unavailable / …). The approved arm
+	// closes the consent funnel so an operator can derive
+	// abandoned-after-approve = approved − tokens_issued.
+	ConsentDecisions = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "mcp_auth_consent_decisions_total",
+		Help: "Consent-page decisions, by outcome (approved/denied). Approved is not a denial — see access_denied_total for those.",
+	}, []string{"decision"})
+
 	// GroupsClaimShapeMismatch counts id_tokens whose `groups` claim
 	// did not decode as []string. Distinct from AccessDenied because
 	// the request is NOT denied on this path — the proxy admits with

@@ -77,6 +77,7 @@ func main() {
 		zap.Bool("rate_limit_enabled", cfg.RateLimitEnabled),
 		zap.Bool("trust_proxy_headers", cfg.TrustProxyHeaders),
 		zap.Bool("compat_allow_stateless", cfg.CompatAllowStateless),
+		zap.Bool("render_consent_page", cfg.RenderConsentPage),
 		zap.Int64("per_subject_concurrency", cfg.PerSubjectConcurrency),
 		zap.String("groups_claim", cfg.GroupsClaim),
 		zap.Bool("allowed_groups_set", len(cfg.AllowedGroups) > 0),
@@ -291,6 +292,7 @@ func main() {
 	}
 	registerLimit := passthrough
 	authorizeLimit := passthrough
+	consentLimit := passthrough
 	callbackLimit := passthrough
 	tokenLimit := passthrough
 	mcpLimit := passthrough
@@ -298,6 +300,13 @@ func main() {
 	if cfg.RateLimitEnabled {
 		registerLimit = rateLimiter(10, time.Minute, "register", ipKeyFunc)
 		authorizeLimit = rateLimiter(30, time.Minute, "authorize", ipKeyFunc)
+		// /consent has its own bucket so the user-driven approve/deny
+		// click doesn't share a budget with /authorize gets — a flow
+		// is one /authorize + one /consent and both should fit. Same
+		// 30/min ceiling as /authorize keeps the per-flow shape
+		// symmetric while letting humans retry without poisoning the
+		// /authorize bucket.
+		consentLimit = rateLimiter(30, time.Minute, "consent", ipKeyFunc)
 		callbackLimit = rateLimiter(30, time.Minute, "callback", ipKeyFunc)
 		tokenLimit = rateLimiter(60, time.Minute, "token", ipKeyFunc)
 		// Authenticated MCP route: per-IP bucket. MCP traffic is all
@@ -334,7 +343,15 @@ func main() {
 		ResourceURIs:         []string{cfg.ProxyBaseURL + cfg.UpstreamMCPMountPath},
 		CanonicalResource:    cfg.ProxyBaseURL + cfg.UpstreamMCPMountPath,
 		CompatAllowStateless: cfg.CompatAllowStateless,
+		RenderConsentPage:    cfg.RenderConsentPage,
+		ResourceName:         cfg.ResourceName,
 	}))
+	// /consent has its own bucket (see consentLimit construction
+	// above): a single user-driven flow is /authorize GET +
+	// /consent POST, and the two consume from independent buckets
+	// so a human who clicks Approve quickly after Authorize doesn't
+	// halve the per-IP budget for either path.
+	r.With(consentLimit).Post("/consent", handlers.Consent(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, handlers.ConsentConfig{}))
 	r.With(callbackLimit).Get("/callback", handlers.Callback(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, idTokenVerifier, handlers.CallbackConfig{
 		AllowedGroups: cfg.AllowedGroups,
 		GroupsClaim:   cfg.GroupsClaim,

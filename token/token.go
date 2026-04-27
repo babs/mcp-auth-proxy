@@ -48,6 +48,12 @@ const (
 	PurposeCode    = "code"
 	PurposeAccess  = "access"
 	PurposeRefresh = "refresh"
+	// PurposeConsent guards the short-lived blob that carries
+	// validated /authorize parameters across the consent-page POST.
+	// Distinct from PurposeSession so a sealed session cannot be
+	// replayed as a consent token (or vice versa) — the AAD tag
+	// enforces it.
+	PurposeConsent = "consent"
 )
 
 // Claims represents the internal access token payload.

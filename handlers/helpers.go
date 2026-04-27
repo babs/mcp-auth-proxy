@@ -113,6 +113,35 @@ type sealedCode struct {
 	ExpiresAt   time.Time `json:"exp"`
 }
 
+// sealedConsent carries validated /authorize parameters across the
+// proxy-rendered consent screen. The blob is both the CSRF token
+// for the POST /consent submission and the data needed to replay
+// /authorize Phase 3 (mint nonce + upstream PKCE verifier, seal
+// sealedSession, redirect to IdP) without re-validating the
+// client_id and redirect_uri the user just saw on the screen.
+//
+// Lifetime is bounded to consentTTL (5 min — long enough for a
+// human to read the page, short enough to bound a stolen blob's
+// usefulness). AAD purpose binding keeps it from being opened as
+// any other sealed type.
+type sealedConsent struct {
+	ClientID      string `json:"cid"`
+	ClientName    string `json:"cn,omitempty"`
+	RedirectURI   string `json:"ru"`
+	OriginalState string `json:"os"`
+	CodeChallenge string `json:"cc,omitempty"`
+	// SvrChallengeRequested is true when /authorize is operating
+	// under PKCE_REQUIRED=false AND the client omitted
+	// code_challenge — POST /consent then mints the server-side
+	// PKCE pair (H6) so the issued code stays anchored to a
+	// verifier even though the client never participates.
+	SvrChallengeRequested bool      `json:"spkce,omitempty"`
+	Resource              string    `json:"res,omitempty"`
+	Typ                   string    `json:"typ"`
+	Audience              string    `json:"aud"`
+	ExpiresAt             time.Time `json:"exp"`
+}
+
 // sealedRefresh is the encrypted payload inside a refresh token.
 // IssuedAt enables REVOKE_BEFORE bulk revocation; without it, a compromised
 // refresh token would survive a cutoff and silently mint fresh access tokens.
