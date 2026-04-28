@@ -767,7 +767,7 @@ func TestLoad_ToolMetrics_Enabled(t *testing.T) {
 }
 
 func TestLoad_ToolMetrics_InvalidCardinality(t *testing.T) {
-	cases := []string{"0", "-1", "not-a-number"}
+	cases := []string{"-1", "not-a-number"}
 	for _, in := range cases {
 		t.Run(in, func(t *testing.T) {
 			setAllRequired(t)
@@ -780,6 +780,23 @@ func TestLoad_ToolMetrics_InvalidCardinality(t *testing.T) {
 				t.Errorf("error should mention the env var, got %q", err)
 			}
 		})
+	}
+}
+
+// TestLoad_ToolMetrics_ZeroDisablesCap pins the documented contract:
+// MCP_TOOL_METRICS_MAX_CARDINALITY=0 means "no cap" (the consumer at
+// metrics.ToolCardinality.ToolLabel reads MaxCardinality > 0 before
+// applying the cap). Operators following the docs were previously
+// rejected by the config validator — fixed.
+func TestLoad_ToolMetrics_ZeroDisablesCap(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("MCP_TOOL_METRICS_MAX_CARDINALITY", "0")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("0 should be accepted (disables the cap), got %v", err)
+	}
+	if cfg.ToolMetricsMaxCardinality != 0 {
+		t.Errorf("ToolMetricsMaxCardinality = %d, want 0 (disabled)", cfg.ToolMetricsMaxCardinality)
 	}
 }
 
