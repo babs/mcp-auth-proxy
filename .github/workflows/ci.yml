@@ -181,7 +181,9 @@ jobs:
           cache: true
 
       - name: install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+        # Pinned for reproducibility — bump deliberately when a new
+        # release advertises a vulndb improvement we want to consume.
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
 
       - name: govulncheck ./...
         # Fails the job on any known-exploitable vulnerability in the

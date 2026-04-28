@@ -445,8 +445,11 @@ func Load() (*Config, error) {
 	c.ToolMetricsMaxCardinality = 256
 	if v := os.Getenv("MCP_TOOL_METRICS_MAX_CARDINALITY"); v != "" {
 		n, err := strconv.Atoi(v)
-		if err != nil || n < 1 {
-			return nil, fmt.Errorf("MCP_TOOL_METRICS_MAX_CARDINALITY must be a positive integer, got %q", v)
+		// 0 is a documented sentinel meaning "disable the cap entirely"
+		// — only safe when the upstream enforces a tool allowlist.
+		// Negative values stay rejected (no semantic).
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("MCP_TOOL_METRICS_MAX_CARDINALITY must be a non-negative integer (0 disables the cap), got %q", v)
 		}
 		c.ToolMetricsMaxCardinality = n
 	}
