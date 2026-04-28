@@ -258,8 +258,9 @@ Compose with Keycloak (pre-seeded realm + admin user), Redis, a
 minimal MCP server, and the proxy itself wired end-to-end. The
 `manifests/k8s/` set is split between reference YAML templates and a
 production-oriented kustomize overlay at
-`manifests/overlays/production`. `scripts/generate-signing-secret.sh`
-emits a 32-byte random hex string suitable for `TOKEN_SIGNING_SECRET`.
+`manifests/overlays/production`. `manifests/scripts/generate-signing-secret.sh`
+emits a 64-character cryptographically-random base64 string suitable
+for `TOKEN_SIGNING_SECRET`.
 
 ---
 
