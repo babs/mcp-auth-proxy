@@ -181,8 +181,9 @@ type Config struct {
 	// env: UPSTREAM_AUTHORIZATION_HEADER. Treat as a secret in
 	// deployment (mount from a Secret, not a ConfigMap).
 	UpstreamAuthorization string
-	// secretWeakWarning is non-empty when TOKEN_SIGNING_SECRET has low
-	// byte-entropy (fewer than 16 distinct bytes). Exposed via
+	// secretWeakWarning is non-empty when TOKEN_SIGNING_SECRET matches
+	// an obvious-weakness pattern (all-same byte, or short repeating
+	// period). Exposed via
 	// SecretWeaknessWarning() so the caller can emit a structured log
 	// event at startup without Load() taking a *zap.Logger dependency.
 	secretWeakWarning string
@@ -248,20 +249,18 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("TOKEN_SIGNING_SECRET must be at least 32 bytes")
 	default:
 		c.TokenSigningSecret = []byte(secret)
-		// L1: count distinct bytes in the secret. A 32-byte string with <16
-		// unique byte values signals a human-picked or repeating pattern
-		// (e.g. "aaaaaaaa..."): the AES-GCM key derived from SHA-256 is
-		// still 256 bits wide, but the secret itself has far less effective
-		// entropy than its length suggests. Warn here unconditionally; the
-		// PROD_MODE violations block below promotes this to a hard error
-		// when strict mode is on, so dev / single-replica deployments that
-		// knowingly use a patterned secret keep working under
-		// PROD_MODE=false.
-		if distinct := distinctByteCount(c.TokenSigningSecret); distinct < 16 {
-			c.secretWeakWarning = fmt.Sprintf(
-				"TOKEN_SIGNING_SECRET has only %d distinct bytes (<16); effective entropy is much lower than its length suggests",
-				distinct,
-			)
+		// Detect obvious-weakness patterns (all-same byte, or short
+		// repeating period). The AES-GCM key derived via SHA-256 is
+		// still 256 bits wide, but the secret itself has near-zero
+		// effective entropy when it's `aaaa…` or `abcabc…`. Warn
+		// unconditionally; the PROD_MODE violations block below
+		// promotes it to a hard error when strict mode is on, so dev
+		// / single-replica work that knowingly uses a patterned
+		// secret keeps working under PROD_MODE=false. Use
+		// `manifests/scripts/generate-signing-secret.sh` to produce
+		// a known-good 64-char base64 value.
+		if reason := weakSecretReason(c.TokenSigningSecret); reason != "" {
+			c.secretWeakWarning = "TOKEN_SIGNING_SECRET " + reason
 		}
 	}
 
@@ -530,19 +529,18 @@ func Load() (*Config, error) {
 		if allowInsecureOIDCHTTP {
 			violations = append(violations, "OIDC_ALLOW_INSECURE_HTTP=true (cleartext OIDC exposes the client secret)")
 		}
-		// Promote the L1 low-entropy warning to a hard fail under
-		// PROD_MODE. A 32-byte secret with <16 distinct bytes signals
-		// a human-typed or repeating pattern; the AES-GCM key derived
-		// from SHA-256 stays 256 bits wide but the *secret* itself
-		// has far less effective entropy than its length suggests.
-		// Dev / single-replica work that intentionally uses a
-		// patterned secret should set PROD_MODE=false.
-		if d := distinctByteCount(c.TokenSigningSecret); d > 0 && d < 16 {
-			violations = append(violations, fmt.Sprintf("TOKEN_SIGNING_SECRET has %d distinct bytes (<16); patterned secret indicates a human-typed value", d))
+		// Promote the obvious-weakness warning to a hard fail under
+		// PROD_MODE. A patterned secret (all-same byte, or short
+		// repeating period) leaves the AES-GCM key derived from
+		// SHA-256 trivially recoverable. Dev / single-replica work
+		// that intentionally uses a patterned secret should set
+		// PROD_MODE=false.
+		if reason := weakSecretReason(c.TokenSigningSecret); reason != "" {
+			violations = append(violations, "TOKEN_SIGNING_SECRET "+reason)
 		}
 		for i, prev := range c.TokenSigningSecretsPrevious {
-			if d := distinctByteCount(prev); d > 0 && d < 16 {
-				violations = append(violations, fmt.Sprintf("TOKEN_SIGNING_SECRETS_PREVIOUS[%d] has %d distinct bytes (<16); rolling-rotation cutover would regress entropy floor", i, d))
+			if reason := weakSecretReason(prev); reason != "" {
+				violations = append(violations, fmt.Sprintf("TOKEN_SIGNING_SECRETS_PREVIOUS[%d] %s", i, reason))
 			}
 		}
 		if len(violations) > 0 {
@@ -567,17 +565,58 @@ func (c *Config) SecretWeaknessWarning() string {
 	return c.secretWeakWarning
 }
 
-// distinctByteCount returns the number of unique byte values in b.
-func distinctByteCount(b []byte) int {
+// weakSecretReason returns a non-empty human-readable reason when b
+// matches an obvious-weakness pattern, or "" when b looks sane.
+// Catches three classes:
+//
+//  1. All-same byte (period 1).
+//  2. Repeating period < len(b) — e.g. `abcabc…`,
+//     `0123456789abcdef0123456789abcdef`.
+//  3. Tiny alphabet (< 8 distinct bytes). Closes shapes that
+//     defeat the period check by having uneven run-lengths
+//     (`aaaa…b`, `aaaaabbbbbcccccddddd…`) but obviously cluster
+//     around a small symbol set.
+//
+// Threshold choice for class 3: 8 is the most defensive floor
+// that still has zero practical false-positive rate on real
+// random output. A 32-char hex secret over a 16-symbol alphabet
+// has expected ~14 distinct chars (P(<8 distinct in 64 chars) is
+// essentially zero); base64 (64 symbols) and raw bytes (256)
+// cluster even higher. 4 was the prior choice and accepted
+// shapes like 5-symbol clustered runs; 8 closes that and stays
+// well below the random-hex distribution.
+func weakSecretReason(b []byte) string {
+	if len(b) < 2 {
+		return ""
+	}
+	for period := 1; period*2 <= len(b); period++ {
+		repeats := true
+		for i := period; i < len(b); i++ {
+			if b[i] != b[i%period] {
+				repeats = false
+				break
+			}
+		}
+		if repeats {
+			if period == 1 {
+				return fmt.Sprintf("is %d copies of a single byte (effectively zero entropy)", len(b))
+			}
+			return fmt.Sprintf("repeats with period %d (truly random secrets are non-periodic; use manifests/scripts/generate-signing-secret.sh)", period)
+		}
+	}
+	const minDistinct = 8
 	var seen [256]bool
-	n := 0
+	distinct := 0
 	for _, v := range b {
 		if !seen[v] {
 			seen[v] = true
-			n++
+			distinct++
+			if distinct >= minDistinct {
+				return ""
+			}
 		}
 	}
-	return n
+	return fmt.Sprintf("uses only %d distinct byte values (use manifests/scripts/generate-signing-secret.sh)", distinct)
 }
 
 // validateRedisKeyPrefix enforces ASCII-printable only (no cluster-hash

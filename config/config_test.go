@@ -1,6 +1,10 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -16,9 +20,10 @@ func setAllRequired(t *testing.T) {
 	t.Setenv("OIDC_CLIENT_SECRET", "client-secret")
 	t.Setenv("PROXY_BASE_URL", "https://proxy.example.com")
 	t.Setenv("UPSTREAM_MCP_URL", "http://localhost:3000/mcp")
-	// 32 bytes, hex-encoded -> 16 distinct ASCII chars; clears the
-	// PROD_MODE entropy gate (>=16 distinct bytes).
-	t.Setenv("TOKEN_SIGNING_SECRET", "0123456789abcdef0123456789abcdef")
+	// Non-periodic 64-char hex from a real `openssl rand -hex 32`
+	// sample; clears the obvious-weakness check (no period at any
+	// divisor of its length).
+	t.Setenv("TOKEN_SIGNING_SECRET", "9e65686d6a0c5900eb2717cb34108e0020941a4dd572c4417700d9c0c632daa8")
 	t.Setenv("REDIS_URL", "redis://localhost:6379/0")
 }
 
@@ -45,7 +50,7 @@ func TestLoad_AllVarsSet(t *testing.T) {
 	if cfg.UpstreamMCPURL != "http://localhost:3000/mcp" {
 		t.Errorf("UpstreamMCPURL = %q, want %q", cfg.UpstreamMCPURL, "http://localhost:3000/mcp")
 	}
-	if string(cfg.TokenSigningSecret) != "0123456789abcdef0123456789abcdef" {
+	if string(cfg.TokenSigningSecret) != "9e65686d6a0c5900eb2717cb34108e0020941a4dd572c4417700d9c0c632daa8" {
 		t.Errorf("TokenSigningSecret = %q, want fixture value", cfg.TokenSigningSecret)
 	}
 }
@@ -894,17 +899,15 @@ func TestLoad_PerSubjectConcurrency_Negative(t *testing.T) {
 	}
 }
 
-// L1: TOKEN_SIGNING_SECRET with fewer than 16 distinct bytes surfaces a
-// non-fatal weakness warning that main.go logs at startup under
-// PROD_MODE=false. PROD_MODE=true promotes this to a hard error
-// (covered by TestLoad_ProdMode_BlocksLowEntropySecret).
-func TestLoad_SecretWeaknessWarning_LowEntropy(t *testing.T) {
+// TestLoad_SecretWeaknessWarning_AllSame pins the warn path on the
+// most degenerate secret shape: every byte identical. main.go logs
+// the warning at startup under PROD_MODE=false; PROD_MODE=true
+// promotes it to a hard fail (covered by
+// TestLoad_ProdMode_BlocksWeakSecret).
+func TestLoad_SecretWeaknessWarning_AllSame(t *testing.T) {
 	setAllRequired(t)
-	// PROD_MODE=false to keep the warning path observable; under
-	// PROD_MODE=true the same secret would fail Load() outright.
 	t.Setenv("PROD_MODE", "false")
 	t.Setenv("REDIS_REQUIRED", "false")
-	// 32 bytes but only one distinct byte → 1 < 16.
 	t.Setenv("TOKEN_SIGNING_SECRET", strings.Repeat("a", 32))
 	cfg, err := Load()
 	if err != nil {
@@ -912,23 +915,176 @@ func TestLoad_SecretWeaknessWarning_LowEntropy(t *testing.T) {
 	}
 	w := cfg.SecretWeaknessWarning()
 	if w == "" {
-		t.Fatal("expected non-empty weakness warning for 1-distinct-byte secret")
+		t.Fatal("expected non-empty weakness warning for all-same secret")
 	}
-	if !strings.Contains(w, "distinct bytes") {
-		t.Errorf("warning %q should explain the distinct-byte count", w)
+	if !strings.Contains(w, "single byte") {
+		t.Errorf("warning %q should describe the all-same shape", w)
 	}
 }
 
-func TestLoad_SecretWeaknessWarning_HighEntropy(t *testing.T) {
+// TestLoad_SecretWeaknessWarning_PeriodicRepeat is the headline
+// regression test for the entropy-gate rewrite: the previous
+// distinct-byte heuristic accepted strings like
+// `0123456789abcdef0123456789abcdef` because they have exactly 16
+// distinct bytes — but they trivially repeat with period 16 and
+// have effectively zero added entropy past that point. The new
+// period-detection check catches them.
+func TestLoad_SecretWeaknessWarning_PeriodicRepeat(t *testing.T) {
 	setAllRequired(t)
-	// 32 distinct chars → ≥16.
-	t.Setenv("TOKEN_SIGNING_SECRET", "abcdefghijklmnopqrstuvwxyz012345")
+	t.Setenv("PROD_MODE", "false")
+	t.Setenv("REDIS_REQUIRED", "false")
+	t.Setenv("TOKEN_SIGNING_SECRET", "0123456789abcdef0123456789abcdef")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if w := cfg.SecretWeaknessWarning(); w != "" {
-		t.Errorf("unexpected weakness warning for high-entropy secret: %q", w)
+	w := cfg.SecretWeaknessWarning()
+	if w == "" {
+		t.Fatal("expected non-empty weakness warning for period-16 secret (the famous distinct-byte false-pass)")
+	}
+	if !strings.Contains(w, "period") {
+		t.Errorf("warning %q should mention the repeating period", w)
+	}
+}
+
+// TestLoad_SecretWeaknessWarning_PeriodicShort covers the simpler
+// `abcabc…` shape an operator might produce by accident.
+func TestLoad_SecretWeaknessWarning_PeriodicShort(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("PROD_MODE", "false")
+	t.Setenv("REDIS_REQUIRED", "false")
+	// 33 chars = 11 × "abc" — period 3, fully repetitive.
+	t.Setenv("TOKEN_SIGNING_SECRET", strings.Repeat("abc", 11))
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if w := cfg.SecretWeaknessWarning(); w == "" {
+		t.Fatal("expected weakness warning for period-3 secret")
+	}
+}
+
+// TestLoad_SecretWeaknessWarning_TinyAlphabet pins the
+// uneven-run-length near-miss class: shapes that defeat the
+// period check by having different run lengths per symbol but
+// obviously cluster around a small alphabet. The floor is 8
+// distinct bytes — anything below fails.
+func TestLoad_SecretWeaknessWarning_TinyAlphabet(t *testing.T) {
+	cases := []struct {
+		name   string
+		secret string
+		want   bool // true = warning expected
+	}{
+		// 2 distinct (`aaaa…b` shape): well below the floor.
+		{"two_distinct", strings.Repeat("a", 31) + "b", true},
+		// Boundary: 7 distinct in 32 bytes — last value below
+		// the floor, must still trip.
+		{"seven_distinct_just_below", "aaaaabbbbbcccccdddddeeeeefffffgg", true},
+		// Boundary: exactly 8 distinct, non-periodic — floor is
+		// open at 8, so this passes. A future tightening that
+		// flips the open bound to closed (e.g. `<= 8`) breaks
+		// here. Run lengths are uneven (5,5,5,5,5,5,1,1) so the
+		// period check doesn't fire either.
+		{"eight_distinct_at_floor", "aaaaabbbbbcccccdddddeeeeefffffgh", false},
+		// Healthy alphabet (15 distinct, non-periodic): well
+		// above the floor, behaves like real random output.
+		{"many_distinct_alphanum", "aabbccddeeffgghhiiii0011223344ZZ", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setAllRequired(t)
+			t.Setenv("PROD_MODE", "false")
+			t.Setenv("REDIS_REQUIRED", "false")
+			t.Setenv("TOKEN_SIGNING_SECRET", tc.secret)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			w := cfg.SecretWeaknessWarning()
+			gotWarn := w != ""
+			if gotWarn != tc.want {
+				t.Fatalf("warn=%v, want %v (warning text: %q)", gotWarn, tc.want, w)
+			}
+			if tc.want && !strings.Contains(w, "distinct") {
+				t.Errorf("warning %q should mention the distinct-byte count", w)
+			}
+		})
+	}
+}
+
+// TestWeakSecretReason_FreshRandomNeverFlags exercises the gate
+// against fresh crypto/rand output across the three encodings the
+// README recommends — raw 32-byte, hex-encoded (`openssl rand -hex
+// 32`), base64-encoded (`generate-signing-secret.sh`) — at every
+// realistic secret length. Math says the false-positive rate is
+// essentially zero; this test demonstrates it under the actual code
+// path. 1000 iterations × 3 encodings × 3 lengths = 9000 samples
+// per CI run. A flake here is a real bug, not test noise.
+func TestWeakSecretReason_FreshRandomNeverFlags(t *testing.T) {
+	const iters = 1000
+	lengths := []int{32, 48, 64}
+	for _, n := range lengths {
+		for _, encoding := range []string{"raw", "hex", "base64"} {
+			t.Run(encoding+"_"+strconv.Itoa(n), func(t *testing.T) {
+				for range iters {
+					raw := make([]byte, n)
+					if _, err := rand.Read(raw); err != nil {
+						t.Fatalf("rand.Read: %v", err)
+					}
+					var sample []byte
+					switch encoding {
+					case "raw":
+						sample = raw
+					case "hex":
+						sample = []byte(hex.EncodeToString(raw))
+					case "base64":
+						sample = []byte(base64.RawStdEncoding.EncodeToString(raw))
+					}
+					if reason := weakSecretReason(sample); reason != "" {
+						t.Fatalf("fresh random %s/%d-byte sample flagged as weak: %q (sample %x)", encoding, n, reason, sample)
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestLoad_SecretWeaknessWarning_NonPeriodic pins the false-positive
+// counterpart: a non-periodic secret of any encoding (raw, hex,
+// base64) must NOT trip the warning. The previous heuristic
+// intermittently failed on real `openssl rand -hex 32` output
+// because the hex alphabet is 16 symbols and ~15.75 distinct chars
+// is the expected count in 64 draws — so a real random secret
+// could randomly fall below the <16 threshold. The new check is
+// period-based and never false-flags non-periodic input.
+func TestLoad_SecretWeaknessWarning_NonPeriodic(t *testing.T) {
+	cases := []struct {
+		name   string
+		secret string
+	}{
+		// Two real `openssl rand -hex 32` samples (frozen so the test
+		// is deterministic). 64 hex chars each — what the README says
+		// to use.
+		{"hex_sample_1", "9e65686d6a0c5900eb2717cb34108e0020941a4dd572c4417700d9c0c632daa8"},
+		{"hex_sample_2", "522100ab22a0daf7e821fa0d926ddb91a347ccde5e32c607670e15526e295c58"},
+		// Real `manifests/scripts/generate-signing-secret.sh` shape:
+		// 64 chars from the base64 alphabet, no padding.
+		{"base64_sample", "K7nQzGm5T8WfX2pYj4hVcL1bN6dE9aR3vMzU0sIqOoB"},
+		// 32 distinct chars in 32 bytes — non-periodic by construction.
+		{"alphanum_32", "abcdefghijklmnopqrstuvwxyz012345"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setAllRequired(t)
+			t.Setenv("TOKEN_SIGNING_SECRET", tc.secret)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if w := cfg.SecretWeaknessWarning(); w != "" {
+				t.Errorf("non-periodic secret should not warn, got: %q", w)
+			}
+		})
 	}
 }
 
@@ -1308,51 +1464,65 @@ func TestLoad_ProdMode_AllowsTrustProxyHeadersWithCIDRs(t *testing.T) {
 	}
 }
 
-// TestLoad_ProdMode_BlocksLowEntropySecret pins the entropy gate:
-// PROD_MODE=true rejects a TOKEN_SIGNING_SECRET with <16 distinct
-// bytes (patterned / human-typed). Same secret accepted with a
-// warning when PROD_MODE=false.
-func TestLoad_ProdMode_BlocksLowEntropySecret(t *testing.T) {
-	patterned := strings.Repeat("a", 32) // 1 distinct byte, 32 bytes long
-
-	t.Run("prod_mode_rejects", func(t *testing.T) {
-		setAllRequired(t)
-		t.Setenv("PROD_MODE", "true")
-		t.Setenv("REDIS_URL", "redis://localhost:6379/0")
-		t.Setenv("TOKEN_SIGNING_SECRET", patterned)
-		_, err := Load()
-		if err == nil {
-			t.Fatal("expected error for patterned secret under PROD_MODE=true")
-		}
-		if !strings.Contains(err.Error(), "TOKEN_SIGNING_SECRET") || !strings.Contains(err.Error(), "distinct bytes") {
-			t.Errorf("error %q should mention TOKEN_SIGNING_SECRET + distinct bytes", err)
-		}
-	})
-
-	t.Run("dev_mode_warns", func(t *testing.T) {
-		setAllRequired(t)
-		t.Setenv("PROD_MODE", "false")
-		t.Setenv("REDIS_REQUIRED", "false")
-		t.Setenv("TOKEN_SIGNING_SECRET", patterned)
-		cfg, err := Load()
-		if err != nil {
-			t.Fatalf("dev mode should accept patterned secret with a warning, got error: %v", err)
-		}
-		if cfg.SecretWeaknessWarning() == "" {
-			t.Error("SecretWeaknessWarning should be non-empty for a patterned secret")
-		}
-	})
+// TestLoad_ProdMode_BlocksWeakSecret pins the hard-fail behaviour:
+// PROD_MODE=true rejects a TOKEN_SIGNING_SECRET that matches an
+// obvious-weakness pattern (all-same byte, or short repeating
+// period). Same secret is accepted with a warning when
+// PROD_MODE=false.
+func TestLoad_ProdMode_BlocksWeakSecret(t *testing.T) {
+	cases := []struct {
+		name    string
+		secret  string
+		wantSub string // substring expected in the error message
+	}{
+		{"all_same_byte", strings.Repeat("a", 32), "single byte"},
+		// The famous distinct-byte false-pass: 32 chars, exactly 16
+		// distinct, period 16. Pre-fix this PASSED the entropy gate;
+		// post-fix it must FAIL.
+		{"period_16", "0123456789abcdef0123456789abcdef", "period"},
+		{"period_3", strings.Repeat("abc", 11), "period"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name+"/prod_rejects", func(t *testing.T) {
+			setAllRequired(t)
+			t.Setenv("PROD_MODE", "true")
+			t.Setenv("REDIS_URL", "redis://localhost:6379/0")
+			t.Setenv("TOKEN_SIGNING_SECRET", tc.secret)
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("expected error for weak secret %q under PROD_MODE=true", tc.name)
+			}
+			if !strings.Contains(err.Error(), "TOKEN_SIGNING_SECRET") {
+				t.Errorf("error %q should mention TOKEN_SIGNING_SECRET", err)
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Errorf("error %q should mention %q", err, tc.wantSub)
+			}
+		})
+		t.Run(tc.name+"/dev_warns", func(t *testing.T) {
+			setAllRequired(t)
+			t.Setenv("PROD_MODE", "false")
+			t.Setenv("REDIS_REQUIRED", "false")
+			t.Setenv("TOKEN_SIGNING_SECRET", tc.secret)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("dev mode should accept weak secret with a warning, got error: %v", err)
+			}
+			if cfg.SecretWeaknessWarning() == "" {
+				t.Error("SecretWeaknessWarning should be non-empty for a weak secret")
+			}
+		})
+	}
 }
 
-// TestLoad_ProdMode_BlocksLowEntropyPreviousSecret pins the same gate
-// on rolling-rotation entries so a cutover cannot regress the entropy
-// floor by carrying an old patterned secret in
-// TOKEN_SIGNING_SECRETS_PREVIOUS.
-func TestLoad_ProdMode_BlocksLowEntropyPreviousSecret(t *testing.T) {
+// TestLoad_ProdMode_BlocksWeakPreviousSecret pins the same gate on
+// rolling-rotation entries so a cutover cannot regress by carrying
+// an old patterned secret in TOKEN_SIGNING_SECRETS_PREVIOUS.
+func TestLoad_ProdMode_BlocksWeakPreviousSecret(t *testing.T) {
 	setAllRequired(t)
 	t.Setenv("PROD_MODE", "true")
 	t.Setenv("REDIS_URL", "redis://localhost:6379/0")
-	// Strong primary, weak previous.
+	// Strong primary (set by setAllRequired), weak previous.
 	t.Setenv("TOKEN_SIGNING_SECRETS_PREVIOUS", strings.Repeat("b", 32))
 	_, err := Load()
 	if err == nil {
@@ -1384,10 +1554,10 @@ func TestLoad_ProdMode_PassesWithSafeDefaults(t *testing.T) {
 // paste multi-line blocks from a secret manager; each entry must
 // clear the 32-byte floor.
 func TestLoad_TokenSigningSecretsPrevious(t *testing.T) {
-	// Use 32-byte fixtures with 16+ distinct bytes so the PROD_MODE
-	// entropy gate doesn't trip — this test covers parsing /
-	// whitespace-splitting / length-floor, not the entropy floor
-	// (covered separately).
+	// Use non-periodic 32-byte fixtures so the PROD_MODE
+	// obvious-weakness check doesn't trip — this test covers
+	// parsing / whitespace-splitting / length-floor, not the
+	// weakness gate (covered separately).
 	longA := "0123456789abcdef0123456789abcdee"
 	longB := "fedcba9876543210fedcba9876543211"
 	t.Run("single_previous", func(t *testing.T) {

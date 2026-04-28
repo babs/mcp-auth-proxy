@@ -19,7 +19,7 @@ secure production posture (`PROD_MODE=true`); flags listed here as
 | `OIDC_CLIENT_SECRET` | IdP client secret. |
 | `PROXY_BASE_URL` | Public URL of this proxy. Audience-bound into every sealed token — two deployments accidentally sharing `TOKEN_SIGNING_SECRET` but differing on `PROXY_BASE_URL` cannot replay each other's tokens. |
 | `UPSTREAM_MCP_URL` | Upstream MCP URL with explicit path, e.g. `http://mcp:8000/api/v1/mcp`. The path is the proxy's mount AND forwarded verbatim to the upstream. Origin-only (`http://backend`), lone-`/`, query, fragment, userinfo, and paths colliding with control-plane routes (`/healthz`, `/register`, `/authorize`, `/callback`, `/token`, `/.well-known`) are rejected at startup. |
-| `TOKEN_SIGNING_SECRET` | ≥ 32 bytes AES-GCM key. Byte-identical across replicas. `PROD_MODE=true` additionally rejects secrets with < 16 distinct bytes (patterned values like `aaaa…` or `0123…`). Generate with `openssl rand -hex 32` or `manifests/scripts/generate-signing-secret.sh`. |
+| `TOKEN_SIGNING_SECRET` | ≥ 32 bytes AES-GCM key. Byte-identical across replicas. **Generate with `manifests/scripts/generate-signing-secret.sh`** (a 64-char base64 value, no padding) — that's the canonical path. The validator runs an obvious-weakness check on every secret: all-same byte (`aaaa…`) and short repeating period (`abcabc…`, `0123456789abcdef0123456789abcdef`) both fail. Real random output of any encoding (raw, hex, base64) is non-periodic and passes. Under `PROD_MODE=true` a weak secret fails startup; under `PROD_MODE=false` it produces a startup warning instead. |
 
 ## Listeners and logging
 
