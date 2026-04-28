@@ -133,7 +133,7 @@ production posture.
 | **`OIDC_CLIENT_SECRET`** | IdP client secret |
 | **`PROXY_BASE_URL`** | Public URL of this proxy (audience-bound into every sealed token) |
 | **`UPSTREAM_MCP_URL`** | Upstream MCP URL with explicit path (`http://mcp:8000/mcp`); the path is the proxy's mount AND forwarded verbatim. Origin-only, fragment-bearing, or control-plane-colliding paths are rejected at startup |
-| **`TOKEN_SIGNING_SECRET`** | ≥ 32 bytes, AES-GCM key; byte-identical across replicas. **Generate with `manifests/scripts/generate-signing-secret.sh`** (64-char base64). The startup validator rejects all-same-byte and short-repeating-period values; under `PROD_MODE=true` weak secrets fail fast. Rotation procedure (with `TOKEN_SIGNING_SECRETS_PREVIOUS` for zero-downtime rollover) in [`docs/runbooks/key-rotation.md`](./docs/runbooks/key-rotation.md) |
+| **`TOKEN_SIGNING_SECRET`** | ≥ 32 bytes, AES-GCM key; byte-identical across replicas. **Generate with `manifests/scripts/generate-signing-secret.sh`** (64-char base64). The startup validator rejects three weak-secret shapes: all-same-byte, short-repeating-period, and tiny alphabet (< 8 distinct values). Under `PROD_MODE=true` weak secrets fail fast. Rotation procedure (with `TOKEN_SIGNING_SECRETS_PREVIOUS` for zero-downtime rollover) in [`docs/runbooks/key-rotation.md`](./docs/runbooks/key-rotation.md) |
 
 Optional knobs (rate limits, replay store tuning, header trust,
 observability, dev/compat) are documented in
