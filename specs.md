@@ -679,7 +679,7 @@ The `manifests/` folder ships a turn-key demo: a Docker Compose stack (Keycloak 
 `config.Load()` fails closed on the following config mistakes (fatal at startup):
 
 - `TOKEN_SIGNING_SECRET` shorter than 32 bytes.
-- `TOKEN_SIGNING_SECRET` with fewer than 16 distinct bytes (patterned / human-typed) when `PROD_MODE=true`. Same gate applies to every entry in `TOKEN_SIGNING_SECRETS_PREVIOUS` so a rolling rotation cannot regress the entropy floor. Under `PROD_MODE=false` the same secret triggers a non-fatal weakness warning instead.
+- `TOKEN_SIGNING_SECRET` matching an obvious-weakness pattern when `PROD_MODE=true`. Three rejection classes: (1) all-same byte (`aaaa…`); (2) short repeating period (`abcabc…`, `0123456789abcdef0123456789abcdef`); (3) tiny alphabet — fewer than 8 distinct byte values, catching uneven-run-length shapes (`aaaa…b`) that defeat the period and all-same checks. Same gate applies to every entry in `TOKEN_SIGNING_SECRETS_PREVIOUS` so a rolling rotation cannot regress. Under `PROD_MODE=false` the same secret triggers a non-fatal weakness warning instead. Real random output of any encoding (raw, hex, base64) is non-periodic AND has well over 8 distinct values in 32+ bytes, so it passes; canonical generator is `manifests/scripts/generate-signing-secret.sh`.
 - `SHUTDOWN_TIMEOUT` non-positive or greater than 15 minutes (L2).
 - `REDIS_KEY_PREFIX` containing `{`, `}`, `\r`, `\n`, or any byte outside the 0x20..0x7E ASCII-printable range (L3).
 - `PROXY_BASE_URL` with a scheme other than `https://` (or `http://` to a loopback host), a non-empty userinfo, a fragment, or a path beyond `/` (L8).
@@ -689,5 +689,5 @@ The `manifests/` folder ships a turn-key demo: a Docker Compose stack (Keycloak 
 
 Non-fatal startup warnings:
 
-- `token_signing_secret_weak` fires when the 32-byte secret has fewer than 16 distinct byte values — signals a human-typed / patterned secret whose effective entropy is well below its length (L1).
+- `token_signing_secret_weak` fires when the secret matches an obvious-weakness pattern (all-same byte, repeating period < length, or fewer than 8 distinct byte values) — signals a human-typed / patterned secret whose effective entropy is well below its length.
 - `token_seal_rotation_threshold` fires once after 2^28 successful seals per Manager, suggesting `TOKEN_SIGNING_SECRET` rotation before AES-GCM nonce-collision bounds matter (L6).
