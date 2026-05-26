@@ -206,6 +206,182 @@ func TestLoad_AllowedGroups_Empty(t *testing.T) {
 	}
 }
 
+// TestLoad_CSPFormActionExtra pins the validation contract for the
+// operator-supplied form-action allowlist: accepts scheme://host[:port]
+// entries (with whitespace tolerance and empty-entry skip), rejects
+// every common paste-error shape (path/query/fragment, userinfo,
+// missing scheme, bare wildcard, embedded wildcard). A misconfigured
+// allowlist MUST fail startup rather than silently regress Chromium
+// consent at first user click.
+func TestLoad_CSPFormActionExtra(t *testing.T) {
+	t.Run("unset is nil", func(t *testing.T) {
+		setAllRequired(t)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.CSPFormActionExtra != nil {
+			t.Errorf("CSPFormActionExtra = %v, want nil", cfg.CSPFormActionExtra)
+		}
+	})
+
+	t.Run("parses multiple with whitespace and empty skip", func(t *testing.T) {
+		setAllRequired(t)
+		t.Setenv("CSP_FORM_ACTION_EXTRA", " https://a.example , https://b.example:8443 , , https://c.example ")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := []string{"https://a.example", "https://b.example:8443", "https://c.example"}
+		if len(cfg.CSPFormActionExtra) != len(want) {
+			t.Fatalf("CSPFormActionExtra = %v, want %v", cfg.CSPFormActionExtra, want)
+		}
+		for i, w := range want {
+			if cfg.CSPFormActionExtra[i] != w {
+				t.Errorf("CSPFormActionExtra[%d] = %q, want %q", i, cfg.CSPFormActionExtra[i], w)
+			}
+		}
+	})
+
+	t.Run("commas-only collapses to nil", func(t *testing.T) {
+		// Operators paste-stripping the env value down to just
+		// commas (and incidentally whitespace) should land in the
+		// same place as unset — not a startup error, just no extras.
+		setAllRequired(t)
+		t.Setenv("CSP_FORM_ACTION_EXTRA", " , , , ")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.CSPFormActionExtra != nil {
+			t.Errorf("CSPFormActionExtra = %v, want nil", cfg.CSPFormActionExtra)
+		}
+	})
+
+	t.Run("accepts explicit default port", func(t *testing.T) {
+		// CSP source matching is default-port-aware per CSP3 §6.7.2,
+		// but operators sometimes paste the explicit port. The
+		// parser must accept it round-trip without trying to be
+		// clever (stripping :443 would be normalisation we don't owe).
+		setAllRequired(t)
+		t.Setenv("CSP_FORM_ACTION_EXTRA", "https://idp.example.com:443")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(cfg.CSPFormActionExtra) != 1 || cfg.CSPFormActionExtra[0] != "https://idp.example.com:443" {
+			t.Errorf("CSPFormActionExtra = %v, want [https://idp.example.com:443]", cfg.CSPFormActionExtra)
+		}
+	})
+
+	t.Run("accepts IPv6 bracketed host", func(t *testing.T) {
+		setAllRequired(t)
+		t.Setenv("CSP_FORM_ACTION_EXTRA", "https://[2001:db8::1]:8443")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(cfg.CSPFormActionExtra) != 1 || cfg.CSPFormActionExtra[0] != "https://[2001:db8::1]:8443" {
+			t.Errorf("CSPFormActionExtra = %v, want [https://[2001:db8::1]:8443]", cfg.CSPFormActionExtra)
+		}
+	})
+
+	t.Run("accepts http scheme", func(t *testing.T) {
+		// http:// is accepted at parse time — the gating for
+		// insecure schemes is OIDC_ALLOW_INSECURE_HTTP on the issuer
+		// URL, not a second gate here. An operator allowlisting an
+		// http origin in form-action is making an intentional dev
+		// choice.
+		setAllRequired(t)
+		t.Setenv("CSP_FORM_ACTION_EXTRA", "http://keycloak.dev.local:8080")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(cfg.CSPFormActionExtra) != 1 || cfg.CSPFormActionExtra[0] != "http://keycloak.dev.local:8080" {
+			t.Errorf("CSPFormActionExtra = %v, want [http://keycloak.dev.local:8080]", cfg.CSPFormActionExtra)
+		}
+	})
+
+	t.Run("preserves order and accepts many entries", func(t *testing.T) {
+		// Order matters for the CSP header readability (and grep
+		// when debugging) — a future micro-optimisation that
+		// sorts or dedups entries would break the operator's
+		// expectation that "what I configured is what I see".
+		setAllRequired(t)
+		t.Setenv("CSP_FORM_ACTION_EXTRA",
+			"https://e.example,https://d.example,https://c.example,https://b.example,https://a.example")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := []string{
+			"https://e.example",
+			"https://d.example",
+			"https://c.example",
+			"https://b.example",
+			"https://a.example",
+		}
+		if len(cfg.CSPFormActionExtra) != len(want) {
+			t.Fatalf("CSPFormActionExtra len = %d, want %d (got %v)", len(cfg.CSPFormActionExtra), len(want), cfg.CSPFormActionExtra)
+		}
+		for i, w := range want {
+			if cfg.CSPFormActionExtra[i] != w {
+				t.Errorf("CSPFormActionExtra[%d] = %q, want %q", i, cfg.CSPFormActionExtra[i], w)
+			}
+		}
+	})
+
+	t.Run("canonicalises case to lowercase", func(t *testing.T) {
+		// CSP3 §6.7.2.5 makes host-source matching case-insensitive;
+		// we lower-case on the way in so the emitted header is the
+		// form an operator would grep for.
+		setAllRequired(t)
+		t.Setenv("CSP_FORM_ACTION_EXTRA", "HTTPS://Foo.Example.COM:8443")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		const want = "https://foo.example.com:8443"
+		if len(cfg.CSPFormActionExtra) != 1 || cfg.CSPFormActionExtra[0] != want {
+			t.Errorf("CSPFormActionExtra = %v, want [%s]", cfg.CSPFormActionExtra, want)
+		}
+	})
+
+	for _, bad := range []struct {
+		name string
+		val  string
+	}{
+		{"path component", "https://idp.example.com/path"},
+		{"trailing slash", "https://idp.example.com/"},
+		{"query string", "https://idp.example.com?x=1"},
+		{"fragment", "https://idp.example.com#frag"},
+		{"userinfo", "https://user@idp.example.com"},
+		{"missing scheme", "idp.example.com"},
+		{"bare wildcard", "*"},
+		{"embedded wildcard", "https://*.example.com"},
+		{"empty scheme only", "https://"},
+		// CSP3 §2.4 host-char is ALPHA/DIGIT/'-' only — stricter
+		// than RFC 3986 reg-name. The remaining sub-delims would
+		// terminate the form-action directive when emitted, so the
+		// parser rejects them rather than letting a misconfigured
+		// allowlist silently weaken the consent page's CSP.
+		{"semicolon in host", "https://idp.example.com;injected"},
+		{"comma in host", "https://idp.example.com,injected"},
+		{"ampersand in host", "https://idp.example.com&injected"},
+		{"underscore in host", "https://host_name.example.com"},
+		{"space in value", "https://idp.example.com /path"},
+	} {
+		t.Run("rejects "+bad.name, func(t *testing.T) {
+			setAllRequired(t)
+			t.Setenv("CSP_FORM_ACTION_EXTRA", bad.val)
+			if _, err := Load(); err == nil {
+				t.Errorf("Load() unexpectedly succeeded for %q", bad.val)
+			}
+		})
+	}
+}
+
 func TestLoad_RevokeBefore(t *testing.T) {
 	setAllRequired(t)
 	t.Setenv("REVOKE_BEFORE", "2026-03-28T12:00:00Z")

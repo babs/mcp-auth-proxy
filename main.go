@@ -349,6 +349,7 @@ func main() {
 		CompatAllowStateless: cfg.CompatAllowStateless,
 		RenderConsentPage:    cfg.RenderConsentPage,
 		ResourceName:         cfg.ResourceName,
+		CSPFormActionExtra:   cfg.CSPFormActionExtra,
 	}))
 	// /consent has its own bucket (see consentLimit construction
 	// above): a single user-driven flow is /authorize GET +
@@ -875,9 +876,12 @@ func buildRPCMetrics(cfg *config.Config, logger *zap.Logger) *rpcMetrics {
 //     Referer header to a downstream resource).
 //   - Content-Security-Policy: default-src 'none'; frame-ancestors 'none'
 //     — JSON / redirect responses do not need any subresource; the
-//     stricter CSP is honest about that. /authorize ends in a 302 to
-//     the IdP whose own CSP applies on the IdP page; the redirect
-//     response itself has no body to which CSP applies.
+//     stricter CSP is honest about that. The consent page overrides
+//     this baseline in handlers/consent.go (it needs style-src
+//     'unsafe-inline' for the inline <style>, and its form-action
+//     source list explicitly names the upstream AuthURL origin —
+//     Chromium enforces form-action against the entire redirect
+//     chain following a form submit, not just the immediate action=).
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()

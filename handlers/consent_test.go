@@ -15,6 +15,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
+	"golang.org/x/oauth2"
 )
 
 // authorizeConsentEnabled mirrors the production wiring of /authorize
@@ -329,15 +331,168 @@ func TestConsent_RelaxedCSP(t *testing.T) {
 		t.Errorf("consent CSP must NOT relax script-src; the page is JS-free: got %q", csp)
 	}
 	// Other directives that lock down the page must still be present.
+	// form-action must include both 'self' (the proxy's /consent
+	// endpoint) AND the upstream IdP origin — Chromium enforces
+	// form-action against every URL in the redirect chain, so a
+	// 'self'-only list blocks the consent POST's 302 to the IdP
+	// client-side. testOAuth2Config()'s AuthURL is
+	// https://idp.example.com/authorize, so the expected origin is
+	// https://idp.example.com.
 	for _, want := range []string{
 		"default-src 'none'",
 		"frame-ancestors 'none'",
-		"form-action 'self'",
+		"form-action 'self' https://idp.example.com",
 		"base-uri 'none'",
 	} {
 		if !strings.Contains(csp, want) {
 			t.Errorf("consent CSP missing %q: got %q", want, csp)
 		}
+	}
+}
+
+// TestBuildConsentCSP_IdPOrigin pins buildConsentCSP's two-mode
+// contract: a valid AuthURL widens form-action to include its
+// origin (scheme://host[:port]); a missing/invalid AuthURL falls
+// back to 'self' only and signals !idpOriginOK so the caller can
+// log a startup warning. Non-default ports must be preserved
+// (operators self-host IdPs on arbitrary ports).
+func TestBuildConsentCSP_IdPOrigin(t *testing.T) {
+	cases := []struct {
+		name         string
+		authURL      string
+		extra        []string
+		wantFormAct  string
+		wantOriginOK bool
+	}{
+		{
+			name:         "standard https IdP",
+			authURL:      "https://login.microsoftonline.com/abc/oauth2/v2.0/authorize",
+			wantFormAct:  "form-action 'self' https://login.microsoftonline.com",
+			wantOriginOK: true,
+		},
+		{
+			name:         "non-default port preserved",
+			authURL:      "https://keycloak.example.com:8443/realms/x/protocol/openid-connect/auth",
+			wantFormAct:  "form-action 'self' https://keycloak.example.com:8443",
+			wantOriginOK: true,
+		},
+		{
+			name:         "empty AuthURL falls back to self",
+			authURL:      "",
+			wantFormAct:  "form-action 'self';",
+			wantOriginOK: false,
+		},
+		{
+			name:         "malformed AuthURL falls back to self",
+			authURL:      "::not-a-url::",
+			wantFormAct:  "form-action 'self';",
+			wantOriginOK: false,
+		},
+		{
+			name:         "extra origins appended after IdP origin",
+			authURL:      "https://login.microsoftonline.com/abc/oauth2/v2.0/authorize",
+			extra:        []string{"https://tenant.b2clogin.com", "https://login.live.com"},
+			wantFormAct:  "form-action 'self' https://login.microsoftonline.com https://tenant.b2clogin.com https://login.live.com",
+			wantOriginOK: true,
+		},
+		{
+			name:         "extra origins still appended when IdP origin fell back",
+			authURL:      "",
+			extra:        []string{"https://adfs.customer.example"},
+			wantFormAct:  "form-action 'self' https://adfs.customer.example;",
+			wantOriginOK: false,
+		},
+		{
+			// IPv6 hosts must round-trip with brackets intact —
+			// url.Parse returns Host="[::1]:8443" verbatim, and CSP
+			// source-list syntax accepts bracketed IPv6 per spec.
+			name:         "IPv6 host preserved with brackets",
+			authURL:      "https://[::1]:8443/authorize",
+			wantFormAct:  "form-action 'self' https://[::1]:8443",
+			wantOriginOK: true,
+		},
+		{
+			// http:// is accepted (OIDC dev / Docker-compose Keycloak
+			// demo) — the gating happens upstream at OIDC discovery
+			// (OIDC_ALLOW_INSECURE_HTTP), not here.
+			name:         "http scheme accepted",
+			authURL:      "http://keycloak.dev.local:8080/realms/x/protocol/openid-connect/auth",
+			wantFormAct:  "form-action 'self' http://keycloak.dev.local:8080",
+			wantOriginOK: true,
+		},
+		{
+			// CSP3 §6.7.2.5 makes host-source matching
+			// case-insensitive — we lower-case so the emitted header
+			// reads the way an operator would grep for it. Same
+			// canonicalisation as config.Load applies to extras.
+			name:         "case canonicalised to lowercase",
+			authURL:      "HTTPS://Foo.Example.COM/Auth",
+			wantFormAct:  "form-action 'self' https://foo.example.com",
+			wantOriginOK: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			csp, ok := buildConsentCSP(tc.authURL, tc.extra)
+			if ok != tc.wantOriginOK {
+				t.Errorf("idpOriginOK = %v, want %v (csp=%q)", ok, tc.wantOriginOK, csp)
+			}
+			if !strings.Contains(csp, tc.wantFormAct) {
+				t.Errorf("CSP missing %q: got %q", tc.wantFormAct, csp)
+			}
+		})
+	}
+}
+
+// TestAuthorize_ConsentCSPWarn pins the construction-time gate on
+// the `consent_csp_idp_origin_missing` warn: it fires when
+// RenderConsentPage=true AND OIDC discovery returned an unusable
+// AuthURL (the only state where the consent page will render with a
+// fallback CSP that breaks Chromium), and stays silent when the
+// consent page is disabled (silent-redirect deployments would never
+// hit the broken CSP anyway). Without this gate, every silent-mode
+// deployment with an oddly-shaped AuthURL would emit misleading
+// warns about a page it does not render.
+func TestAuthorize_ConsentCSPWarn(t *testing.T) {
+	tm := newTestTokenManager(t)
+	// oauth2.Config with empty AuthURL is the only state buildConsentCSP
+	// flags as !idpOriginOK from real call sites — every other shape
+	// would have failed OIDC discovery before Authorize is constructed.
+	brokenOAuth2 := &oauth2.Config{
+		ClientID:     "test-oidc-client",
+		ClientSecret: "test-oidc-secret",
+		RedirectURL:  "https://auth.example.com/callback",
+		Scopes:       []string{"openid", "email", "profile"},
+	}
+	cases := []struct {
+		name              string
+		renderConsentPage bool
+		wantWarn          bool
+	}{
+		{"consent page enabled fires warn", true, true},
+		{"consent page disabled stays silent", false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			core, logs := observer.New(zap.WarnLevel)
+			logger := zap.New(core)
+			// Construct only — handler not invoked. The gate fires
+			// at construction so the assertion is purely on the
+			// captured log buffer.
+			Authorize(tm, logger, testBaseURL, brokenOAuth2, AuthorizeConfig{
+				PKCERequired:      true,
+				ResourceURIs:      []string{testBaseURL + "/mcp"},
+				CanonicalResource: testBaseURL + "/mcp",
+				RenderConsentPage: tc.renderConsentPage,
+			})
+			got := logs.FilterMessage("consent_csp_idp_origin_missing").Len()
+			if tc.wantWarn && got != 1 {
+				t.Errorf("expected 1 consent_csp_idp_origin_missing warn, got %d entries (all logs: %v)", got, logs.All())
+			}
+			if !tc.wantWarn && got != 0 {
+				t.Errorf("expected silent-mode to skip the warn, got %d entries (all logs: %v)", got, logs.All())
+			}
+		})
 	}
 }
 

@@ -181,6 +181,20 @@ type Config struct {
 	// env: UPSTREAM_AUTHORIZATION_HEADER. Treat as a secret in
 	// deployment (mount from a Secret, not a ConfigMap).
 	UpstreamAuthorization string
+	// CSPFormActionExtra lists additional scheme://host[:port]
+	// origins appended to the consent page's CSP form-action source
+	// list, alongside 'self' and the discovered upstream authorize
+	// endpoint origin. Needed for IdP redirect chains that cross the
+	// authorize host: Entra B2C (*.b2clogin.com), personal Microsoft
+	// accounts (login.live.com), federated AD FS (customer-owned
+	// host), sovereign clouds (login.microsoftonline.us /
+	// .partner.microsoftonline.cn). Each entry is a single fixed
+	// origin — wildcards are intentionally not supported because the
+	// directive's role is an explicit allowlist defense-in-depth
+	// against HTML injection on the consent page. Empty for the
+	// common one-host-IdP case. env: CSP_FORM_ACTION_EXTRA,
+	// comma-separated.
+	CSPFormActionExtra []string
 	// secretWeakWarning is non-empty when TOKEN_SIGNING_SECRET matches
 	// an obvious-weakness pattern (all-same byte, or short repeating
 	// period). Exposed via
@@ -493,6 +507,20 @@ func Load() (*Config, error) {
 
 	c.UpstreamAuthorization = os.Getenv("UPSTREAM_AUTHORIZATION_HEADER")
 
+	if raw := os.Getenv("CSP_FORM_ACTION_EXTRA"); raw != "" {
+		for _, o := range strings.Split(raw, ",") {
+			o = strings.TrimSpace(o)
+			if o == "" {
+				continue
+			}
+			canon, err := canonicalCSPHostSource(o)
+			if err != nil {
+				return nil, fmt.Errorf("CSP_FORM_ACTION_EXTRA: %w", err)
+			}
+			c.CSPFormActionExtra = append(c.CSPFormActionExtra, canon)
+		}
+	}
+
 	c.PerSubjectConcurrency = 16
 	if v := os.Getenv("MCP_PER_SUBJECT_CONCURRENCY"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
@@ -664,6 +692,65 @@ func validateOIDCIssuerURL(raw string, allowInsecureHTTP bool) error {
 	default:
 		return fmt.Errorf("OIDC_ISSUER_URL must use https:// (or http:// to a loopback host), got scheme %q", u.Scheme)
 	}
+}
+
+// cspHostSourceHostPort matches the CSP3 host-source grammar's
+// host-part + optional port-part, minus wildcards (we reject those
+// upstream). See https://w3c.github.io/webappsec-csp/#grammardef-host-source
+//
+//	host-part = 1*host-char *( "." 1*host-char ) / IP-literal
+//	host-char = ALPHA / DIGIT / "-"
+//	IP-literal = "[" ( IPv6 / IPvFuture ) "]"   (from RFC 3986)
+//	port-part = ":" 1*DIGIT
+//
+// Intentionally stricter than RFC 3986 reg-name (which accepts
+// sub-delims like ";", ",", "&"): an operator-supplied origin that
+// round-trips through url.Parse may still contain CSP-meaningful
+// characters that break out of the directive when emitted into the
+// header ("https://host.com;foo" terminates form-action and starts
+// a bogus directive). Mirroring the CSP grammar verbatim closes
+// that header-injection foot-gun, which is operator-foot-gun rather
+// than RCE but still warrants fail-loud over fail-silent.
+var cspHostSourceHostPort = regexp.MustCompile(
+	`^(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*)(?::[0-9]+)?$`,
+)
+
+// canonicalCSPHostSource validates an operator-supplied CSP host-source
+// (scheme://host[:port]) and returns the lower-cased canonical form
+// suitable for emission into the consent page's CSP form-action
+// directive. Returns an error with the offending input quoted on any
+// validation failure.
+//
+// Canonicalisation: scheme and host are ASCII-lower-cased per CSP3
+// §6.7.2.5 (host-source matching is case-insensitive); operators
+// who paste `HTTPS://Foo.example.com` get `https://foo.example.com`
+// in the emitted header so a grep returns the form they expect.
+//
+// Rejection classes (paste-error shapes that should fail startup
+// rather than silently weaken the deployment's CSP):
+//   - wildcards (`*` anywhere — the directive's role is an explicit
+//     allowlist; smuggling wildcards in defeats it under a
+//     misleading name)
+//   - missing scheme (`host.com` with a `/` in it but no `://`)
+//   - any path / query / fragment / userinfo component
+//   - host containing any character outside the CSP host-char set
+//     (catches "https://host.com;foo", "https://host_name.com", and
+//     similar header-injection-shaped paste errors)
+func canonicalCSPHostSource(in string) (string, error) {
+	if in == "*" || strings.Contains(in, "*") {
+		return "", fmt.Errorf("%q wildcard sources are not supported; supply explicit origins", in)
+	}
+	if strings.Contains(in, "/") && !strings.Contains(in, "://") {
+		return "", fmt.Errorf("%q is not a valid origin (want scheme://host[:port])", in)
+	}
+	u, err := url.Parse(in)
+	if err != nil || u.Scheme == "" || u.Host == "" || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+		return "", fmt.Errorf("%q is not a valid origin (want scheme://host[:port], no path/query/fragment/userinfo)", in)
+	}
+	if !cspHostSourceHostPort.MatchString(u.Host) {
+		return "", fmt.Errorf("%q host component contains characters not allowed in a CSP host-source (must be ALPHA/DIGIT/'-'/'.' or [IPv6])", in)
+	}
+	return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host), nil
 }
 
 // validateUpstreamMCPURL enforces the shape the reverse-proxy relies
