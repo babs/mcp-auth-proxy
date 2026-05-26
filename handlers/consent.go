@@ -7,6 +7,7 @@ import (
 	"html/template"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/babs/mcp-auth-proxy/metrics"
@@ -118,6 +119,50 @@ var consentTmpl = template.Must(template.New("consent").Parse(`<!doctype html>
 </html>
 `))
 
+// buildConsentCSP returns the Content-Security-Policy header value
+// for the consent page, with form-action widened to include the
+// upstream IdP origin derived from authURL and any operator-supplied
+// extra origins.
+//
+// form-action is enforced against every URL in the redirect chain
+// initiated by a form submit on Blink-based browsers (Chrome, Edge,
+// Brave, Opera) — CSP §6.5 "form submission" check, "navigate"
+// algorithm. The consent POST 302s to oauth2Cfg.AuthCodeURL(...),
+// so 'self' alone blocks the redirect client-side and /callback
+// never fires. Firefox and Safari check only the immediate action=
+// URL, which is why the bug reproduces only in Chromium.
+//
+// authURL is the upstream OIDC authorization endpoint (set from
+// discovery at startup). On parse failure / empty value the
+// returned CSP falls back to 'self' only — the consent page will
+// be Chrome-broken but the proxy still serves; a startup log emits
+// the warning so deployments do not silently regress.
+//
+// extraOrigins are additional scheme://host[:port] entries appended
+// verbatim. Validated at config-load time (config.Load) so they are
+// trusted shape-wise here. Needed for IdP topologies whose redirect
+// chain crosses the authorize host — Entra B2C → *.b2clogin.com,
+// personal MS accounts → login.live.com, federated AD FS → customer
+// host, sovereign clouds → cloud-specific login domains. Each extra
+// is a single fixed origin, not a wildcard.
+func buildConsentCSP(authURL string, extraOrigins []string) (csp string, idpOriginOK bool) {
+	sources := make([]string, 0, 2+len(extraOrigins))
+	sources = append(sources, "'self'")
+	if authURL != "" {
+		if u, err := url.Parse(authURL); err == nil && u.Scheme != "" && u.Host != "" {
+			// Lower-case the canonical form per CSP3 §6.7.2.5
+			// (host-source matching is case-insensitive). Keeps
+			// the emitted header readable when an operator greps
+			// it, and matches the canonicalisation applied to
+			// extraOrigins at config.Load time.
+			sources = append(sources, strings.ToLower(u.Scheme)+"://"+strings.ToLower(u.Host))
+			idpOriginOK = true
+		}
+	}
+	sources = append(sources, extraOrigins...)
+	return "default-src 'none'; style-src 'unsafe-inline'; form-action " + strings.Join(sources, " ") + "; frame-ancestors 'none'; base-uri 'none'", idpOriginOK
+}
+
 // renderConsent seals the validated /authorize parameters into a
 // sealedConsent token and writes the consent HTML page. The token
 // is the only thing carried across the user click — POST /consent
@@ -128,7 +173,7 @@ var consentTmpl = template.Must(template.New("consent").Parse(`<!doctype html>
 // the registered redirect_uri (server_error, RFC 6749 §4.1.2.1)
 // rather than rendering a partial page — the client is already
 // trusted at this point in the flow.
-func renderConsent(w http.ResponseWriter, r *http.Request, tm *token.Manager, logger *zap.Logger, baseURL, resourceName string, consent sealedConsent) {
+func renderConsent(w http.ResponseWriter, r *http.Request, tm *token.Manager, logger *zap.Logger, baseURL, resourceName, csp string, consent sealedConsent) {
 	consentToken, err := tm.SealJSON(consent, token.PurposeConsent)
 	if err != nil {
 		logger.Error("consent_seal_failed", zap.Error(err))
@@ -160,8 +205,10 @@ func renderConsent(w http.ResponseWriter, r *http.Request, tm *token.Manager, lo
 	// style-src for this response only; script-src stays default
 	// (none) so the page remains JavaScript-free, and frame-ancestors
 	// stays none so the consent UI cannot be framed by an attacker
-	// origin.
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+	// origin. form-action also names the upstream IdP origin so the
+	// approve POST's 302 to the IdP is not blocked by Chromium's
+	// redirect-chain enforcement (see buildConsentCSP).
+	w.Header().Set("Content-Security-Policy", csp)
 	w.WriteHeader(http.StatusOK)
 	if err := consentTmpl.Execute(w, data); err != nil {
 		// Body already started — log only.
