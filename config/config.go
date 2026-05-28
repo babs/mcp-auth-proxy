@@ -513,7 +513,7 @@ func Load() (*Config, error) {
 			if o == "" {
 				continue
 			}
-			canon, err := canonicalCSPHostSource(o)
+			canon, err := CanonicalCSPHostSource(o)
 			if err != nil {
 				return nil, fmt.Errorf("CSP_FORM_ACTION_EXTRA: %w", err)
 			}
@@ -715,7 +715,7 @@ var cspHostSourceHostPort = regexp.MustCompile(
 	`^(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*)(?::[0-9]+)?$`,
 )
 
-// canonicalCSPHostSource validates an operator-supplied CSP host-source
+// CanonicalCSPHostSource validates an operator-supplied CSP host-source
 // (scheme://host[:port]) and returns the lower-cased canonical form
 // suitable for emission into the consent page's CSP form-action
 // directive. Returns an error with the offending input quoted on any
@@ -736,7 +736,7 @@ var cspHostSourceHostPort = regexp.MustCompile(
 //   - host containing any character outside the CSP host-char set
 //     (catches "https://host.com;foo", "https://host_name.com", and
 //     similar header-injection-shaped paste errors)
-func canonicalCSPHostSource(in string) (string, error) {
+func CanonicalCSPHostSource(in string) (string, error) {
 	if in == "*" || strings.Contains(in, "*") {
 		return "", fmt.Errorf("%q wildcard sources are not supported; supply explicit origins", in)
 	}
