@@ -350,13 +350,13 @@ func TestConsent_RelaxedCSP(t *testing.T) {
 	}
 }
 
-// TestBuildConsentCSP_IdPOrigin pins buildConsentCSP's two-mode
+// TestBuildConsentCSPSources_IdPOrigin pins buildConsentCSPSources's two-mode
 // contract: a valid AuthURL widens form-action to include its
 // origin (scheme://host[:port]); a missing/invalid AuthURL falls
 // back to 'self' only and signals !idpOriginOK so the caller can
 // log a startup warning. Non-default ports must be preserved
 // (operators self-host IdPs on arbitrary ports).
-func TestBuildConsentCSP_IdPOrigin(t *testing.T) {
+func TestBuildConsentCSPSources_IdPOrigin(t *testing.T) {
 	cases := []struct {
 		name         string
 		authURL      string
@@ -433,12 +433,130 @@ func TestBuildConsentCSP_IdPOrigin(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			csp, ok := buildConsentCSP(tc.authURL, tc.extra)
+			sources, ok := buildConsentCSPSources(tc.authURL, tc.extra)
+			csp := formatConsentCSP(zap.NewNop(), sources, "", "")
 			if ok != tc.wantOriginOK {
 				t.Errorf("idpOriginOK = %v, want %v (csp=%q)", ok, tc.wantOriginOK, csp)
 			}
 			if !strings.Contains(csp, tc.wantFormAct) {
 				t.Errorf("CSP missing %q: got %q", tc.wantFormAct, csp)
+			}
+		})
+	}
+}
+
+// TestFormatConsentCSP_RedirectURIOrigin pins the per-render
+// redirect_uri origin append. When the upstream IdP session is
+// already live, the consent POST's redirect chain stays in one
+// navigation all the way to the client's redirect_uri — without
+// that final origin in form-action, Chromium blocks the navigation
+// at the last hop (the proxy's /callback 302 to the client) and
+// surfaces a misleading "violates form-action 'self' <idp>" error
+// naming /consent. The chain in this case is:
+//
+//	POST /consent → IdP authorize → /callback → client redirect_uri
+//
+// when the user must log in, the IdP returns a 200 HTML login page,
+// form-action enforcement ends there, and the post-login callback
+// → client redirect_uri navigation is no longer governed by the
+// consent page's CSP.
+func TestFormatConsentCSP_RedirectURIOrigin(t *testing.T) {
+	base, _ := buildConsentCSPSources("https://login.microsoftonline.com/x/oauth2/v2.0/authorize", nil)
+	cases := []struct {
+		name        string
+		redirectURI string
+		wantSubstr  string
+		wantAbsent  string
+		wantWarn    bool
+	}{
+		{
+			name:        "cross-origin client redirect_uri appended",
+			redirectURI: "https://claude.ai/api/organizations/abc/mcp_callback",
+			wantSubstr:  "form-action 'self' https://login.microsoftonline.com https://claude.ai;",
+		},
+		{
+			name:        "redirect_uri sharing self origin is deduped",
+			redirectURI: "https://login.microsoftonline.com/somewhere",
+			wantSubstr:  "form-action 'self' https://login.microsoftonline.com;",
+			wantAbsent:  "https://login.microsoftonline.com https://login.microsoftonline.com",
+		},
+		{
+			name:        "loopback redirect with port preserved",
+			redirectURI: "http://127.0.0.1:51789/oauth/callback",
+			wantSubstr:  "http://127.0.0.1:51789",
+		},
+		{
+			name:        "IPv6 loopback redirect preserves brackets",
+			redirectURI: "http://[::1]:51789/oauth/callback",
+			wantSubstr:  "http://[::1]:51789",
+		},
+		{
+			name:        "case canonicalised to lowercase",
+			redirectURI: "HTTPS://Claude.AI/Callback",
+			wantSubstr:  "https://claude.ai",
+		},
+		{
+			name:        "empty redirect_uri leaves CSP unchanged",
+			redirectURI: "",
+			wantSubstr:  "form-action 'self' https://login.microsoftonline.com;",
+		},
+		{
+			name:        "malformed redirect_uri silently dropped",
+			redirectURI: "::not-a-url::",
+			wantSubstr:  "form-action 'self' https://login.microsoftonline.com;",
+		},
+		{
+			// H1 / CSP header-injection defence: a DCR client whose
+			// host smuggles a sub-delim (legal per RFC 3986 reg-name,
+			// illegal per CSP3 §2.4 host-source) must NOT widen the
+			// directive — the offending origin would terminate
+			// form-action early and inject a bogus directive.
+			name:        "sub-delim host rejected by CSP host-source check",
+			redirectURI: "https://evil.example;injected/cb",
+			wantSubstr:  "form-action 'self' https://login.microsoftonline.com;",
+			wantAbsent:  "evil.example",
+			wantWarn:    true,
+		},
+		{
+			// Underscore is valid in DNS resolution but not in CSP
+			// host-char (ALPHA/DIGIT/'-' only). Same defence as above.
+			name:        "underscore host rejected by CSP host-source check",
+			redirectURI: "https://host_underscore.example/cb",
+			wantSubstr:  "form-action 'self' https://login.microsoftonline.com;",
+			wantAbsent:  "host_underscore",
+			wantWarn:    true,
+		},
+	}
+	const testClientID = "client-uuid-under-test"
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			core, logs := observer.New(zap.WarnLevel)
+			logger := zap.New(core)
+			csp := formatConsentCSP(logger, base, testClientID, tc.redirectURI)
+			if !strings.Contains(csp, tc.wantSubstr) {
+				t.Errorf("CSP missing %q: got %q", tc.wantSubstr, csp)
+			}
+			if tc.wantAbsent != "" && strings.Contains(csp, tc.wantAbsent) {
+				t.Errorf("CSP unexpectedly contained %q: got %q", tc.wantAbsent, csp)
+			}
+			warnEntries := logs.FilterMessage("consent_csp_redirect_uri_skipped").All()
+			if tc.wantWarn && len(warnEntries) == 0 {
+				t.Errorf("expected consent_csp_redirect_uri_skipped warn, got none (logs=%v)", logs.All())
+			}
+			if !tc.wantWarn && len(warnEntries) != 0 {
+				t.Errorf("unexpected consent_csp_redirect_uri_skipped warn (logs=%v)", logs.All())
+			}
+			// When the warn fires, both client_id and redirect_uri
+			// must be present so an operator can alert/group by
+			// client_id without joining against client_registered.
+			if tc.wantWarn && len(warnEntries) > 0 {
+				fields := warnEntries[0].ContextMap()
+				if got, _ := fields["client_id"].(string); got != testClientID {
+					t.Errorf("warn client_id = %q, want %q", got, testClientID)
+				}
+				if got, _ := fields["redirect_uri"].(string); got != tc.redirectURI {
+					t.Errorf("warn redirect_uri = %q, want %q", got, tc.redirectURI)
+				}
 			}
 		})
 	}
@@ -455,7 +573,7 @@ func TestBuildConsentCSP_IdPOrigin(t *testing.T) {
 // warns about a page it does not render.
 func TestAuthorize_ConsentCSPWarn(t *testing.T) {
 	tm := newTestTokenManager(t)
-	// oauth2.Config with empty AuthURL is the only state buildConsentCSP
+	// oauth2.Config with empty AuthURL is the only state buildConsentCSPSources
 	// flags as !idpOriginOK from real call sites — every other shape
 	// would have failed OIDC discovery before Authorize is constructed.
 	brokenOAuth2 := &oauth2.Config{

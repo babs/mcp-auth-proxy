@@ -7,9 +7,11 @@ import (
 	"html/template"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/babs/mcp-auth-proxy/config"
 	"github.com/babs/mcp-auth-proxy/metrics"
 	"github.com/babs/mcp-auth-proxy/replay"
 	"github.com/babs/mcp-auth-proxy/token"
@@ -119,10 +121,12 @@ var consentTmpl = template.Must(template.New("consent").Parse(`<!doctype html>
 </html>
 `))
 
-// buildConsentCSP returns the Content-Security-Policy header value
-// for the consent page, with form-action widened to include the
-// upstream IdP origin derived from authURL and any operator-supplied
-// extra origins.
+// buildConsentCSPSources returns the static form-action source list
+// for the consent page CSP — 'self', the upstream IdP origin (when
+// derivable from authURL) and any operator-supplied extras. The
+// client's redirect_uri origin is NOT included here; it is appended
+// per-render in formatConsentCSP because each consent page is bound
+// to one validated redirect_uri.
 //
 // form-action is enforced against every URL in the redirect chain
 // initiated by a form submit on Blink-based browsers (Chrome, Edge,
@@ -134,9 +138,9 @@ var consentTmpl = template.Must(template.New("consent").Parse(`<!doctype html>
 //
 // authURL is the upstream OIDC authorization endpoint (set from
 // discovery at startup). On parse failure / empty value the
-// returned CSP falls back to 'self' only — the consent page will
-// be Chrome-broken but the proxy still serves; a startup log emits
-// the warning so deployments do not silently regress.
+// returned source list falls back to 'self' only — the consent page
+// will be Chrome-broken but the proxy still serves; a startup log
+// emits the warning so deployments do not silently regress.
 //
 // extraOrigins are additional scheme://host[:port] entries appended
 // verbatim. Validated at config-load time (config.Load) so they are
@@ -145,8 +149,8 @@ var consentTmpl = template.Must(template.New("consent").Parse(`<!doctype html>
 // personal MS accounts → login.live.com, federated AD FS → customer
 // host, sovereign clouds → cloud-specific login domains. Each extra
 // is a single fixed origin, not a wildcard.
-func buildConsentCSP(authURL string, extraOrigins []string) (csp string, idpOriginOK bool) {
-	sources := make([]string, 0, 2+len(extraOrigins))
+func buildConsentCSPSources(authURL string, extraOrigins []string) (sources []string, idpOriginOK bool) {
+	sources = make([]string, 0, 3+len(extraOrigins))
 	sources = append(sources, "'self'")
 	if authURL != "" {
 		if u, err := url.Parse(authURL); err == nil && u.Scheme != "" && u.Host != "" {
@@ -160,7 +164,70 @@ func buildConsentCSP(authURL string, extraOrigins []string) (csp string, idpOrig
 		}
 	}
 	sources = append(sources, extraOrigins...)
-	return "default-src 'none'; style-src 'unsafe-inline'; form-action " + strings.Join(sources, " ") + "; frame-ancestors 'none'; base-uri 'none'", idpOriginOK
+	return sources, idpOriginOK
+}
+
+// formatConsentCSP joins the precomputed source list with the
+// per-render redirect_uri origin and returns the full
+// Content-Security-Policy header value.
+//
+// The redirect_uri origin is added because Chromium's form-action
+// check covers the *entire* redirect chain a form submit triggers.
+// When the user already has a live session with the upstream IdP,
+// the chain doesn't terminate at the IdP login page (which would
+// end form-action enforcement at a 200 HTML response) — it stays in
+// one navigation: POST /consent → IdP authorize 302 → proxy
+// /callback 302 → client redirect_uri 302. The final hop crosses
+// to the client's origin (e.g. https://claude.ai), and without it
+// in form-action Chrome blocks the navigation at that step. The
+// error surfaces in DevTools as "Sending form data to /consent
+// violates form-action" — misleading; the form's action URL is
+// just what Chrome names in the message, the actual block is the
+// downstream hop.
+//
+// redirectURI has already been validated against the registered
+// sealedClient.RedirectURIs at /authorize. Skipped when empty,
+// when the parsed origin matches an entry already in baseSources
+// (same-host loopback / proxy-hosted clients), or when the origin
+// would not pass the CSP3 host-source ABNF check.
+//
+// The host-source check matters because RFC 3986 reg-name allows
+// sub-delim characters (`;`, `,`, `&`, `=`) that, while accepted by
+// Go's url.Parse, would terminate the form-action directive early
+// when emitted into the header — same header-injection foot-gun the
+// startup validator on CSP_FORM_ACTION_EXTRA closes for operator
+// input. A malicious DCR client cannot weaken its own consent
+// page's CSP by registering `https://evil.example;injected/cb`.
+// When the redirect_uri host fails the check, the consent page
+// renders with the unwidened CSP and a warn fires carrying the
+// offending redirect_uri AND the client_id so operators can
+// alert/group by client without a cross-grep against
+// client_registered. In Chromium this surfaces as the original
+// form-action block on the final redirect hop, but no header
+// smuggling occurs.
+func formatConsentCSP(logger *zap.Logger, baseSources []string, clientID, redirectURI string) string {
+	sources := baseSources
+	if redirectURI != "" {
+		if u, err := url.Parse(redirectURI); err == nil && u.Scheme != "" && u.Host != "" {
+			origin := strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host)
+			// Skip when already covered by 'self' / IdP origin /
+			// operator extras (proxy-hosted clients, same-IdP-tenant
+			// redirects). The dedup keeps the emitted header tight
+			// and matches the case-folded canonical form above.
+			if !slices.Contains(baseSources, origin) {
+				if _, err := config.CanonicalCSPHostSource(origin); err != nil {
+					logger.Warn("consent_csp_redirect_uri_skipped",
+						zap.String("client_id", clientID),
+						zap.String("redirect_uri", redirectURI),
+						zap.Error(err),
+					)
+				} else {
+					sources = slices.Concat(baseSources, []string{origin})
+				}
+			}
+		}
+	}
+	return "default-src 'none'; style-src 'unsafe-inline'; form-action " + strings.Join(sources, " ") + "; frame-ancestors 'none'; base-uri 'none'"
 }
 
 // renderConsent seals the validated /authorize parameters into a
@@ -173,7 +240,7 @@ func buildConsentCSP(authURL string, extraOrigins []string) (csp string, idpOrig
 // the registered redirect_uri (server_error, RFC 6749 §4.1.2.1)
 // rather than rendering a partial page — the client is already
 // trusted at this point in the flow.
-func renderConsent(w http.ResponseWriter, r *http.Request, tm *token.Manager, logger *zap.Logger, baseURL, resourceName, csp string, consent sealedConsent) {
+func renderConsent(w http.ResponseWriter, r *http.Request, tm *token.Manager, logger *zap.Logger, baseURL, resourceName string, cspSources []string, consent sealedConsent) {
 	consentToken, err := tm.SealJSON(consent, token.PurposeConsent)
 	if err != nil {
 		logger.Error("consent_seal_failed", zap.Error(err))
@@ -205,10 +272,13 @@ func renderConsent(w http.ResponseWriter, r *http.Request, tm *token.Manager, lo
 	// style-src for this response only; script-src stays default
 	// (none) so the page remains JavaScript-free, and frame-ancestors
 	// stays none so the consent UI cannot be framed by an attacker
-	// origin. form-action also names the upstream IdP origin so the
-	// approve POST's 302 to the IdP is not blocked by Chromium's
-	// redirect-chain enforcement (see buildConsentCSP).
-	w.Header().Set("Content-Security-Policy", csp)
+	// origin. form-action names the upstream IdP origin AND the
+	// client's redirect_uri origin so the approve POST's redirect
+	// chain (POST /consent → IdP authorize → /callback → client
+	// redirect_uri, when the upstream session is already live) is
+	// not blocked by Chromium's form-action enforcement at the final
+	// hop. See formatConsentCSP.
+	w.Header().Set("Content-Security-Policy", formatConsentCSP(logger, cspSources, consent.ClientID, consent.RedirectURI))
 	w.WriteHeader(http.StatusOK)
 	if err := consentTmpl.Execute(w, data); err != nil {
 		// Body already started — log only.

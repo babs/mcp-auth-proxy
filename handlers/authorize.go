@@ -78,22 +78,24 @@ type AuthorizeConfig struct {
 // front-loaded above the response_type / resource / PKCE / state
 // checks.
 func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg *oauth2.Config, authzCfg AuthorizeConfig) http.HandlerFunc {
-	// Precompute the consent page's CSP once at startup. The IdP
-	// origin in form-action must match the upstream AuthURL so the
-	// consent POST's 302 to the IdP is not blocked by Chromium's
-	// form-action redirect-chain enforcement. Extra operator-supplied
-	// origins (CSP_FORM_ACTION_EXTRA) cover IdP topologies whose
-	// redirect chain leaves the authorize host (Entra B2C, federated
-	// AD FS, personal MS accounts, sovereign clouds).
+	// Precompute the static form-action source list once at startup.
+	// The IdP origin in form-action must match the upstream AuthURL
+	// so the consent POST's 302 to the IdP is not blocked by
+	// Chromium's form-action redirect-chain enforcement. Extra
+	// operator-supplied origins (CSP_FORM_ACTION_EXTRA) cover IdP
+	// topologies whose redirect chain leaves the authorize host
+	// (Entra B2C, federated AD FS, personal MS accounts, sovereign
+	// clouds). The client's redirect_uri origin is appended per
+	// render — see formatConsentCSP.
 	//
 	// Skipped entirely when RenderConsentPage is false: the silent
-	// fork bypasses renderConsent, the precomputed CSP is unused, and
-	// a "consent CSP misconfigured" warn on a deployment that doesn't
-	// render the consent page would be misleading noise.
-	var consentCSP string
+	// fork bypasses renderConsent, the precomputed sources are
+	// unused, and a "consent CSP misconfigured" warn on a deployment
+	// that doesn't render the consent page would be misleading noise.
+	var consentCSPSources []string
 	if authzCfg.RenderConsentPage {
 		var idpOriginOK bool
-		consentCSP, idpOriginOK = buildConsentCSP(oauth2Cfg.Endpoint.AuthURL, authzCfg.CSPFormActionExtra)
+		consentCSPSources, idpOriginOK = buildConsentCSPSources(oauth2Cfg.Endpoint.AuthURL, authzCfg.CSPFormActionExtra)
 		if !idpOriginOK {
 			logger.Warn("consent_csp_idp_origin_missing",
 				zap.String("auth_url", oauth2Cfg.Endpoint.AuthURL),
@@ -264,7 +266,7 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 		// redirect) replays from POST /consent on approval.
 		if authzCfg.RenderConsentPage {
 			metrics.AuthorizeInitiated.WithLabelValues("consent").Inc()
-			renderConsent(w, r, tm, logger, baseURL, authzCfg.ResourceName, consentCSP, sealedConsent{
+			renderConsent(w, r, tm, logger, baseURL, authzCfg.ResourceName, consentCSPSources, sealedConsent{
 				// Per-render JTI: a fresh id every GET /authorize so
 				// back-button = re-consent (each render gets its own
 				// single-use claim slot) rather than dead-state errors.
