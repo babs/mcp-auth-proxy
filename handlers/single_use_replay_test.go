@@ -87,23 +87,42 @@ func mintConsentTokenWithJTI(t *testing.T, tm *token.Manager, jti string) string
 	return tok
 }
 
+// extractConsentToken pulls the consent_token hidden-input value out
+// of a rendered consent page. Substring search — the page is small
+// enough that an HTML parse buys nothing.
+func extractConsentToken(t *testing.T, body string) string {
+	t.Helper()
+	const marker = `name="consent_token" value="`
+	_, rest, found := strings.Cut(body, marker)
+	if !found {
+		t.Fatalf("consent_token input not found in body:\n%s", body)
+	}
+	tok, _, found := strings.Cut(rest, `"`)
+	if !found {
+		t.Fatalf("consent_token close-quote not found")
+	}
+	return tok
+}
+
 // TestConsent_SingleUse_ReplayDetected pins T1.2: when a replay store
 // is wired and the consent token carries a JTI, the second POST of
-// the same token is rejected with 400 invalid_request +
-// error_code=consent_replay, and mcp_auth_replay_detected_total{kind="consent"}
-// increments by exactly one.
+// the same token does NOT take a decision branch — it re-renders the
+// consent page with a FRESH JTI (new explicit click required), and
+// mcp_auth_replay_detected_total{kind="consent"} increments by
+// exactly one. The fresh token must itself be single-use.
 func TestConsent_SingleUse_ReplayDetected(t *testing.T) {
 	tm := newTestTokenManager(t)
 	store := replay.NewMemoryStore()
 	defer store.Close()
 
-	tok := mintConsentTokenWithJTI(t, tm, uuid.NewString())
+	jti := uuid.NewString()
+	tok := mintConsentTokenWithJTI(t, tm, jti)
 
 	before := testutil.ToFloat64(metrics.ReplayDetected.WithLabelValues("consent"))
 	approvedBefore := testutil.ToFloat64(metrics.ConsentDecisions.WithLabelValues("approved"))
 
-	post := func() *httptest.ResponseRecorder {
-		form := url.Values{"consent_token": {tok}, "action": {"approve"}}
+	post := func(consentToken string) *httptest.ResponseRecorder {
+		form := url.Values{"consent_token": {consentToken}, "action": {"approve"}}
 		req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/consent", strings.NewReader(form.Encode()))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		rr := httptest.NewRecorder()
@@ -111,47 +130,67 @@ func TestConsent_SingleUse_ReplayDetected(t *testing.T) {
 		return rr
 	}
 
-	first := post()
-	if first.Code != http.StatusFound {
-		t.Fatalf("first POST: want 302, got %d: %s", first.Code, first.Body.String())
+	first := post(tok)
+	if first.Code != http.StatusOK || !strings.Contains(first.Body.String(), `http-equiv="refresh"`) {
+		t.Fatalf("first POST: want 200 interstitial, got %d: %s", first.Code, first.Body.String())
 	}
 
-	second := post()
-	if second.Code != http.StatusBadRequest {
-		t.Fatalf("replayed POST: want 400, got %d: %s", second.Code, second.Body.String())
+	second := post(tok)
+	if second.Code != http.StatusOK {
+		t.Fatalf("replayed POST: want 200 re-render, got %d: %s", second.Code, second.Body.String())
 	}
-	var oauthErr OAuthError
-	if err := json.NewDecoder(second.Body).Decode(&oauthErr); err != nil {
-		t.Fatalf("decode: %v", err)
+	if strings.Contains(second.Body.String(), `http-equiv="refresh"`) {
+		t.Fatalf("replayed POST took the interstitial path — decision must not re-run on replay")
 	}
-	if oauthErr.Error != "invalid_request" {
-		t.Errorf("error = %q, want invalid_request", oauthErr.Error)
-	}
-	if oauthErr.ErrorCode != "consent_replay" {
-		t.Errorf("error_code = %q, want consent_replay", oauthErr.ErrorCode)
+	if !strings.Contains(second.Body.String(), "already processed") {
+		t.Errorf("re-rendered page missing the replay notice")
 	}
 
-	if got := testutil.ToFloat64(metrics.ReplayDetected.WithLabelValues("consent")); got-before != 1 {
-		t.Errorf("ReplayDetected{kind=consent} delta = %v, want 1", got-before)
+	freshTok := extractConsentToken(t, second.Body.String())
+	var fresh sealedConsent
+	if err := tm.OpenJSON(freshTok, &fresh, token.PurposeConsent); err != nil {
+		t.Fatalf("OpenJSON fresh consent: %v", err)
 	}
-	// First POST took the approve branch; only that one should
-	// have ticked the approved counter. Pins that the replay
-	// rejection sits BEFORE the decision counter so a flooded
-	// replay does not inflate consent-funnel metrics.
-	if got := testutil.ToFloat64(metrics.ConsentDecisions.WithLabelValues("approved")); got-approvedBefore != 1 {
-		t.Errorf("ConsentDecisions{decision=approved} delta = %v, want 1 (replay must not double-count)", got-approvedBefore)
+	if fresh.JTI == jti || fresh.JTI == "" {
+		t.Errorf("re-rendered JTI = %q, want fresh non-empty value != %q", fresh.JTI, jti)
+	}
+
+	// The fresh token must work exactly once: approve → interstitial
+	// to the IdP, then its own replay re-renders again (claim slot
+	// spent).
+	third := post(freshTok)
+	if third.Code != http.StatusOK || !strings.Contains(third.Body.String(), `http-equiv="refresh"`) {
+		t.Fatalf("fresh-token POST: want 200 interstitial, got %d: %s", third.Code, third.Body.String())
+	}
+	fourth := post(freshTok)
+	if fourth.Code != http.StatusOK || strings.Contains(fourth.Body.String(), `http-equiv="refresh"`) {
+		t.Fatalf("fresh-token replay: want 200 re-render (not interstitial), got %d", fourth.Code)
+	}
+
+	if got := testutil.ToFloat64(metrics.ReplayDetected.WithLabelValues("consent")); got-before != 2 {
+		t.Errorf("ReplayDetected{kind=consent} delta = %v, want 2 (one per replayed POST)", got-before)
+	}
+	// POSTs 1 and 3 took the approve branch; the two replays must
+	// not double-count. Pins that the replay re-render sits BEFORE
+	// the decision counter so a flooded replay does not inflate
+	// consent-funnel metrics.
+	if got := testutil.ToFloat64(metrics.ConsentDecisions.WithLabelValues("approved")); got-approvedBefore != 2 {
+		t.Errorf("ConsentDecisions{decision=approved} delta = %v, want 2 (replay must not double-count)", got-approvedBefore)
 	}
 }
 
 // TestConsent_SingleUse_ClaimsBeforeDeny pins that the JTI is
 // claimed BEFORE the deny branch — a captured token cannot be
-// replayed for either decision.
+// replayed for either decision; the replay re-renders the page
+// (fresh click required) instead of silently re-running deny.
 func TestConsent_SingleUse_ClaimsBeforeDeny(t *testing.T) {
 	tm := newTestTokenManager(t)
 	store := replay.NewMemoryStore()
 	defer store.Close()
 
 	tok := mintConsentTokenWithJTI(t, tm, uuid.NewString())
+
+	deniedBefore := testutil.ToFloat64(metrics.ConsentDecisions.WithLabelValues("denied"))
 
 	post := func(action string) *httptest.ResponseRecorder {
 		form := url.Values{"consent_token": {tok}, "action": {action}}
@@ -162,13 +201,18 @@ func TestConsent_SingleUse_ClaimsBeforeDeny(t *testing.T) {
 		return rr
 	}
 
-	if got := post("deny").Code; got != http.StatusFound {
-		t.Fatalf("first deny: want 302, got %d", got)
+	firstDeny := post("deny")
+	if firstDeny.Code != http.StatusOK || !strings.Contains(firstDeny.Body.String(), `http-equiv="refresh"`) {
+		t.Fatalf("first deny: want 200 interstitial, got %d: %s", firstDeny.Code, firstDeny.Body.String())
 	}
-	// Replayed deny — token already claimed; must be rejected.
+	// Replayed deny — token already claimed; must re-render the
+	// consent page, not take the deny branch again.
 	second := post("deny")
-	if second.Code != http.StatusBadRequest {
-		t.Fatalf("replayed deny: want 400, got %d: %s", second.Code, second.Body.String())
+	if second.Code != http.StatusOK || strings.Contains(second.Body.String(), `http-equiv="refresh"`) {
+		t.Fatalf("replayed deny: want 200 re-render (not interstitial), got %d: %s", second.Code, second.Body.String())
+	}
+	if got := testutil.ToFloat64(metrics.ConsentDecisions.WithLabelValues("denied")); got-deniedBefore != 1 {
+		t.Errorf("ConsentDecisions{decision=denied} delta = %v, want 1 (replay must not re-run deny)", got-deniedBefore)
 	}
 }
 
@@ -188,11 +232,13 @@ func TestConsent_SingleUse_NilStoreFallback(t *testing.T) {
 		Consent(tm, zap.NewNop(), testBaseURL, testOAuth2Config(), ConsentConfig{})(rr, req)
 		return rr
 	}
-	if got := post().Code; got != http.StatusFound {
-		t.Fatalf("first POST: want 302, got %d", got)
+	first := post()
+	if first.Code != http.StatusOK || !strings.Contains(first.Body.String(), `http-equiv="refresh"`) {
+		t.Fatalf("first POST: want 200 interstitial, got %d", first.Code)
 	}
-	if got := post().Code; got != http.StatusFound {
-		t.Fatalf("second POST (nil store): want 302, got %d", got)
+	second := post()
+	if second.Code != http.StatusOK || !strings.Contains(second.Body.String(), `http-equiv="refresh"`) {
+		t.Fatalf("second POST (nil store): want 200 interstitial, got %d", second.Code)
 	}
 }
 
@@ -214,8 +260,8 @@ func TestConsent_SingleUse_LegacyEmptyJTI(t *testing.T) {
 	rr := httptest.NewRecorder()
 	Consent(tm, zap.NewNop(), testBaseURL, testOAuth2Config(), ConsentConfig{ReplayStore: store})(rr, req)
 
-	if rr.Code != http.StatusFound {
-		t.Fatalf("legacy token (empty JTI): want 302, got %d: %s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `http-equiv="refresh"`) {
+		t.Fatalf("legacy token (empty JTI): want 200 interstitial, got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 

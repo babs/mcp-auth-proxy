@@ -181,19 +181,14 @@ type Config struct {
 	// env: UPSTREAM_AUTHORIZATION_HEADER. Treat as a secret in
 	// deployment (mount from a Secret, not a ConfigMap).
 	UpstreamAuthorization string
-	// CSPFormActionExtra lists additional scheme://host[:port]
-	// origins appended to the consent page's CSP form-action source
-	// list, alongside 'self' and the discovered upstream authorize
-	// endpoint origin. Needed for IdP redirect chains that cross the
-	// authorize host: Entra B2C (*.b2clogin.com), personal Microsoft
-	// accounts (login.live.com), federated AD FS (customer-owned
-	// host), sovereign clouds (login.microsoftonline.us /
-	// .partner.microsoftonline.cn). Each entry is a single fixed
-	// origin — wildcards are intentionally not supported because the
-	// directive's role is an explicit allowlist defense-in-depth
-	// against HTML injection on the consent page. Empty for the
-	// common one-host-IdP case. env: CSP_FORM_ACTION_EXTRA,
-	// comma-separated.
+	// CSPFormActionExtra is DEPRECATED and ignored. The consent POST
+	// is now answered with a same-origin navigation interstitial
+	// (handlers.renderNavInterstitial), which ends Chromium's
+	// form-action redirect-chain enforcement at the proxy — no IdP or
+	// client origin needs to be listed, so form-action is 'self'-only
+	// again. The variable is still parsed and validated so existing
+	// deployments keep starting; a startup warning flags it for
+	// removal. env: CSP_FORM_ACTION_EXTRA, comma-separated.
 	CSPFormActionExtra []string
 	// secretWeakWarning is non-empty when TOKEN_SIGNING_SECRET matches
 	// an obvious-weakness pattern (all-same byte, or short repeating

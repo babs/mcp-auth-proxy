@@ -66,6 +66,12 @@ func main() {
 		zap.String("project_url", ProjectURL),
 	)
 
+	if len(cfg.CSPFormActionExtra) > 0 {
+		logger.Warn("csp_form_action_extra_deprecated",
+			zap.String("hint", "ignored since the consent interstitial: form-action is 'self'-only; remove CSP_FORM_ACTION_EXTRA from the deployment"),
+		)
+	}
+
 	// Single structured line summarising the security-relevant runtime
 	// posture. Lets oncall grep one log event per pod start to audit
 	// which safety nets are active, without exposing secrets. Booleans
@@ -349,7 +355,6 @@ func main() {
 		CompatAllowStateless: cfg.CompatAllowStateless,
 		RenderConsentPage:    cfg.RenderConsentPage,
 		ResourceName:         cfg.ResourceName,
-		CSPFormActionExtra:   cfg.CSPFormActionExtra,
 	}))
 	// /consent has its own bucket (see consentLimit construction
 	// above): a single user-driven flow is /authorize GET +
@@ -357,7 +362,8 @@ func main() {
 	// so a human who clicks Approve quickly after Authorize doesn't
 	// halve the per-IP budget for either path.
 	r.With(consentLimit).Post("/consent", handlers.Consent(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, handlers.ConsentConfig{
-		ReplayStore: replayStore,
+		ReplayStore:  replayStore,
+		ResourceName: cfg.ResourceName,
 	}))
 	var idpExchangeLimiter *rate.Limiter
 	if cfg.IdPExchangeRatePerSec > 0 {

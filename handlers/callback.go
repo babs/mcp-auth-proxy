@@ -499,10 +499,24 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 // upstream, so a parse error here is an invariant violation rather
 // than attacker-controlled input.
 func redirectAuthzError(w http.ResponseWriter, r *http.Request, redirectURI, state, errCode, errDesc, audience string) {
-	u, err := url.Parse(redirectURI)
+	target, err := authzErrorURL(redirectURI, state, errCode, errDesc, audience)
 	if err != nil {
 		writeOAuthError(w, http.StatusBadRequest, errCode, errDesc)
 		return
+	}
+	http.Redirect(w, r, target, http.StatusFound)
+}
+
+// authzErrorURL builds the RFC 6749 §4.1.2.1 error envelope on the
+// client's redirect_uri. Split out of redirectAuthzError so POST
+// /consent responses can deliver the same envelope through the
+// navigation interstitial instead of a 302 — see
+// renderNavInterstitial for why a form POST must not answer with a
+// cross-origin redirect.
+func authzErrorURL(redirectURI, state, errCode, errDesc, audience string) (string, error) {
+	u, err := url.Parse(redirectURI)
+	if err != nil {
+		return "", err
 	}
 	q := u.Query()
 	q.Set("error", errCode)
@@ -516,5 +530,5 @@ func redirectAuthzError(w http.ResponseWriter, r *http.Request, redirectURI, sta
 	u.RawQuery = q.Encode()
 	u.Fragment = ""
 	u.RawFragment = ""
-	http.Redirect(w, r, u.String(), http.StatusFound)
+	return u.String(), nil
 }

@@ -7,11 +7,8 @@ import (
 	"html/template"
 	"net/http"
 	"net/url"
-	"slices"
-	"strings"
 	"time"
 
-	"github.com/babs/mcp-auth-proxy/config"
 	"github.com/babs/mcp-auth-proxy/metrics"
 	"github.com/babs/mcp-auth-proxy/replay"
 	"github.com/babs/mcp-auth-proxy/token"
@@ -43,6 +40,9 @@ type consentPageData struct {
 	ApproveURL     string
 	HasClientName  bool
 	HasResourceURI bool
+	// ReplayNotice is set when this render replaces a rejected
+	// replayed submit — the user sees why they are being asked again.
+	ReplayNotice bool
 }
 
 // consentTmpl is the proxy-rendered consent page. Plain HTML, no
@@ -80,11 +80,17 @@ var consentTmpl = template.Must(template.New("consent").Parse(`<!doctype html>
     .approve { background: #18181b; color: #fafafa; border: 1px solid #18181b; }
     .deny    { background: #fafafa; color: #18181b; border: 1px solid #d4d4d8; }
     .hint { font-size: 0.85rem; color: #52525b; margin-top: 1rem; }
+    .notice { background: #fef3c7; border: 1px solid #fcd34d; border-radius: 0.5rem;
+              padding: 0.75rem 1rem; font-size: 0.9rem; }
   </style>
 </head>
 <body>
 <main>
   <h1>Authorize this MCP client?</h1>
+  {{if .ReplayNotice}}
+  <p class="notice">Your previous response was already processed. If you
+  want to authorize this client again, please confirm below.</p>
+  {{end}}
   {{if .HasClientName}}
   <p><strong>{{.ClientName}}</strong> is requesting access to {{if .ResourceName}}<strong>{{.ResourceName}}</strong>{{else}}this MCP service{{end}}.</p>
   {{else}}
@@ -121,113 +127,88 @@ var consentTmpl = template.Must(template.New("consent").Parse(`<!doctype html>
 </html>
 `))
 
-// buildConsentCSPSources returns the static form-action source list
-// for the consent page CSP — 'self', the upstream IdP origin (when
-// derivable from authURL) and any operator-supplied extras. The
-// client's redirect_uri origin is NOT included here; it is appended
-// per-render in formatConsentCSP because each consent page is bound
-// to one validated redirect_uri.
+// consentPageCSP is the static CSP for the consent page. form-action
+// stays 'self'-only: the approve/deny POST is answered with a 200
+// same-origin interstitial (renderNavInterstitial) rather than a
+// redirect, which terminates Chromium's form-action enforcement of
+// the navigation chain. No IdP / client origin enumeration needed —
+// the header is independent of IdP topology and client redirect
+// targets (previously CSP_FORM_ACTION_EXTRA + per-render widening,
+// both obsoleted by the interstitial).
+const consentPageCSP = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+
+// navInterstitialTmpl carries the user from a /consent form POST to
+// the next location: the IdP authorize URL on approve, the client
+// redirect_uri error envelope on deny / server error.
 //
-// form-action is enforced against every URL in the redirect chain
-// initiated by a form submit on Blink-based browsers (Chrome, Edge,
-// Brave, Opera) — CSP §6.5 "form submission" check, "navigate"
-// algorithm. The consent POST 302s to oauth2Cfg.AuthCodeURL(...),
-// so 'self' alone blocks the redirect client-side and /callback
-// never fires. Firefox and Safari check only the immediate action=
-// URL, which is why the bug reproduces only in Chromium.
-//
-// authURL is the upstream OIDC authorization endpoint (set from
-// discovery at startup). On parse failure / empty value the
-// returned source list falls back to 'self' only — the consent page
-// will be Chrome-broken but the proxy still serves; a startup log
-// emits the warning so deployments do not silently regress.
-//
-// extraOrigins are additional scheme://host[:port] entries appended
-// verbatim. Validated at config-load time (config.Load) so they are
-// trusted shape-wise here. Needed for IdP topologies whose redirect
-// chain crosses the authorize host — Entra B2C → *.b2clogin.com,
-// personal MS accounts → login.live.com, federated AD FS → customer
-// host, sovereign clouds → cloud-specific login domains. Each extra
-// is a single fixed origin, not a wildcard.
-func buildConsentCSPSources(authURL string, extraOrigins []string) (sources []string, idpOriginOK bool) {
-	sources = make([]string, 0, 3+len(extraOrigins))
-	sources = append(sources, "'self'")
-	if authURL != "" {
-		if u, err := url.Parse(authURL); err == nil && u.Scheme != "" && u.Host != "" {
-			// Lower-case the canonical form per CSP3 §6.7.2.5
-			// (host-source matching is case-insensitive). Keeps
-			// the emitted header readable when an operator greps
-			// it, and matches the canonicalisation applied to
-			// extraOrigins at config.Load time.
-			sources = append(sources, strings.ToLower(u.Scheme)+"://"+strings.ToLower(u.Host))
-			idpOriginOK = true
-		}
+// WHY a 200 page instead of a 302: Chromium enforces the consent
+// page's form-action directive against EVERY hop of the redirect
+// chain a form submit initiates (CSP §6.5 "form submission" check,
+// "navigate" algorithm; Firefox and Safari check only the immediate
+// action= URL). With a live IdP session the chain runs POST /consent
+// → IdP authorize → /callback → client redirect_uri → any further
+// redirects the CLIENT performs (e.g. Power Platform's
+// global.consent.azure-apim.net hops onward to a regional UI
+// origin). Those client-side hops are unknowable in advance, so no
+// form-action source list can ever be complete — enumerating origins
+// (#33 IdP extras, #35 redirect_uri) was whack-a-mole. Terminating
+// the form navigation at this same-origin 200 ends form-action
+// enforcement; the meta refresh then starts a regular navigation
+// that form-action does not govern. Meta refresh needs no
+// JavaScript, so script-src stays 'none'.
+var navInterstitialTmpl = template.Must(template.New("nav").Parse(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta http-equiv="refresh" content="0;url={{.URL}}">
+  <title>Continuing&hellip;</title>
+  <style>
+    body { font: 16px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+           background: #f4f4f5; color: #18181b;
+           display: flex; align-items: center; justify-content: center;
+           min-height: 100vh; margin: 0; padding: 1.5rem; }
+  </style>
+</head>
+<body>
+<p>Continuing&hellip; If you are not redirected automatically,
+<a href="{{.URL}}">click here</a>.</p>
+</body>
+</html>
+`))
+
+// renderNavInterstitial answers a /consent form POST with the
+// same-origin chain-breaking page described on navInterstitialTmpl.
+func renderNavInterstitial(w http.ResponseWriter, logger *zap.Logger, targetURL string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// The target URL embeds a single-use sealed session (approve) or
+	// the client's error envelope — never serve it from a cache.
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	// No form on this page; meta-refresh / anchor navigation is not
+	// governed by any fetch or form-action directive, so everything
+	// stays locked down.
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'")
+	w.WriteHeader(http.StatusOK)
+	if err := navInterstitialTmpl.Execute(w, struct{ URL string }{targetURL}); err != nil {
+		// Body already started — log only.
+		logger.Warn("nav_interstitial_execute_failed", zap.Error(err))
 	}
-	sources = append(sources, extraOrigins...)
-	return sources, idpOriginOK
 }
 
-// formatConsentCSP joins the precomputed source list with the
-// per-render redirect_uri origin and returns the full
-// Content-Security-Policy header value.
-//
-// The redirect_uri origin is added because Chromium's form-action
-// check covers the *entire* redirect chain a form submit triggers.
-// When the user already has a live session with the upstream IdP,
-// the chain doesn't terminate at the IdP login page (which would
-// end form-action enforcement at a 200 HTML response) — it stays in
-// one navigation: POST /consent → IdP authorize 302 → proxy
-// /callback 302 → client redirect_uri 302. The final hop crosses
-// to the client's origin (e.g. https://claude.ai), and without it
-// in form-action Chrome blocks the navigation at that step. The
-// error surfaces in DevTools as "Sending form data to /consent
-// violates form-action" — misleading; the form's action URL is
-// just what Chrome names in the message, the actual block is the
-// downstream hop.
-//
-// redirectURI has already been validated against the registered
-// sealedClient.RedirectURIs at /authorize. Skipped when empty,
-// when the parsed origin matches an entry already in baseSources
-// (same-host loopback / proxy-hosted clients), or when the origin
-// would not pass the CSP3 host-source ABNF check.
-//
-// The host-source check matters because RFC 3986 reg-name allows
-// sub-delim characters (`;`, `,`, `&`, `=`) that, while accepted by
-// Go's url.Parse, would terminate the form-action directive early
-// when emitted into the header — same header-injection foot-gun the
-// startup validator on CSP_FORM_ACTION_EXTRA closes for operator
-// input. A malicious DCR client cannot weaken its own consent
-// page's CSP by registering `https://evil.example;injected/cb`.
-// When the redirect_uri host fails the check, the consent page
-// renders with the unwidened CSP and a warn fires carrying the
-// offending redirect_uri AND the client_id so operators can
-// alert/group by client without a cross-grep against
-// client_registered. In Chromium this surfaces as the original
-// form-action block on the final redirect hop, but no header
-// smuggling occurs.
-func formatConsentCSP(logger *zap.Logger, baseSources []string, clientID, redirectURI string) string {
-	sources := baseSources
-	if redirectURI != "" {
-		if u, err := url.Parse(redirectURI); err == nil && u.Scheme != "" && u.Host != "" {
-			origin := strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host)
-			// Skip when already covered by 'self' / IdP origin /
-			// operator extras (proxy-hosted clients, same-IdP-tenant
-			// redirects). The dedup keeps the emitted header tight
-			// and matches the case-folded canonical form above.
-			if !slices.Contains(baseSources, origin) {
-				if _, err := config.CanonicalCSPHostSource(origin); err != nil {
-					logger.Warn("consent_csp_redirect_uri_skipped",
-						zap.String("client_id", clientID),
-						zap.String("redirect_uri", redirectURI),
-						zap.Error(err),
-					)
-				} else {
-					sources = slices.Concat(baseSources, []string{origin})
-				}
-			}
-		}
+// consentNavError delivers redirectAuthzError's RFC 6749 §4.1.2.1
+// error envelope through the interstitial. Responses to the consent
+// form POST must not 302 cross-origin — Chromium would block the
+// redirect against the consent page's form-action 'self'. Same
+// parse-failure fallback as redirectAuthzError: proxy-hosted JSON.
+func consentNavError(w http.ResponseWriter, logger *zap.Logger, redirectURI, state, errCode, errDesc, audience string) {
+	target, err := authzErrorURL(redirectURI, state, errCode, errDesc, audience)
+	if err != nil {
+		writeOAuthError(w, http.StatusBadRequest, errCode, errDesc)
+		return
 	}
-	return "default-src 'none'; style-src 'unsafe-inline'; form-action " + strings.Join(sources, " ") + "; frame-ancestors 'none'; base-uri 'none'"
+	renderNavInterstitial(w, logger, target)
 }
 
 // renderConsent seals the validated /authorize parameters into a
@@ -236,15 +217,17 @@ func formatConsentCSP(logger *zap.Logger, baseSources []string, clientID, redire
 // reopens it, runs the original Phase-3 logic (mint nonce + upstream
 // PKCE verifier + sealedSession), and redirects to the IdP.
 //
-// On a seal failure we redirect the original error envelope back to
-// the registered redirect_uri (server_error, RFC 6749 §4.1.2.1)
-// rather than rendering a partial page — the client is already
-// trusted at this point in the flow.
-func renderConsent(w http.ResponseWriter, r *http.Request, tm *token.Manager, logger *zap.Logger, baseURL, resourceName string, cspSources []string, consent sealedConsent) {
+// On a seal failure we deliver the error envelope to the registered
+// redirect_uri (server_error, RFC 6749 §4.1.2.1) via the
+// interstitial rather than rendering a partial page — the client is
+// already trusted at this point in the flow. The interstitial (not
+// a 302) because this renderer also answers the POST /consent
+// replay path, where a cross-origin redirect would trip form-action.
+func renderConsent(w http.ResponseWriter, tm *token.Manager, logger *zap.Logger, baseURL, resourceName string, consent sealedConsent, replayNotice bool) {
 	consentToken, err := tm.SealJSON(consent, token.PurposeConsent)
 	if err != nil {
 		logger.Error("consent_seal_failed", zap.Error(err))
-		redirectAuthzError(w, r, consent.RedirectURI, consent.OriginalState, "server_error", "internal error", baseURL)
+		consentNavError(w, logger, consent.RedirectURI, consent.OriginalState, "server_error", "internal error", baseURL)
 		return
 	}
 
@@ -258,6 +241,7 @@ func renderConsent(w http.ResponseWriter, r *http.Request, tm *token.Manager, lo
 		RedirectHost:   host,
 		ConsentToken:   consentToken,
 		ApproveURL:     baseURL + "/consent",
+		ReplayNotice:   replayNotice,
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -272,13 +256,9 @@ func renderConsent(w http.ResponseWriter, r *http.Request, tm *token.Manager, lo
 	// style-src for this response only; script-src stays default
 	// (none) so the page remains JavaScript-free, and frame-ancestors
 	// stays none so the consent UI cannot be framed by an attacker
-	// origin. form-action names the upstream IdP origin AND the
-	// client's redirect_uri origin so the approve POST's redirect
-	// chain (POST /consent → IdP authorize → /callback → client
-	// redirect_uri, when the upstream session is already live) is
-	// not blocked by Chromium's form-action enforcement at the final
-	// hop. See formatConsentCSP.
-	w.Header().Set("Content-Security-Policy", formatConsentCSP(logger, cspSources, consent.ClientID, consent.RedirectURI))
+	// origin. form-action is 'self'-only — the POST is answered by
+	// the same-origin interstitial, see consentPageCSP.
+	w.Header().Set("Content-Security-Policy", consentPageCSP)
 	w.WriteHeader(http.StatusOK)
 	if err := consentTmpl.Execute(w, data); err != nil {
 		// Body already started — log only.
@@ -309,6 +289,10 @@ type ConsentConfig struct {
 	// most once. nil = stateless fallback (configured opt-out — the
 	// token is still audience- and TTL-bound).
 	ReplayStore replay.Store
+	// ResourceName mirrors the AuthorizeConfig field of the same
+	// name. Needed because a detected replay re-renders the consent
+	// page (fresh JTI) instead of returning a dead-end 400.
+	ResourceName string
 }
 
 // Consent handles POST /consent (consent-page approval submit).
@@ -336,6 +320,15 @@ type ConsentConfig struct {
 // slot); a stolen consent_token can be POSTed at most once. Empty
 // JTI (token sealed by an older binary still in flight during
 // rollout) falls through to the prior stateless behavior.
+//
+// A detected replay re-renders the consent page with a fresh JTI
+// instead of returning a dead-end 400. This loses nothing: the
+// protected action is the approval *decision* (the replayed blob
+// never auto-approves — a new explicit click is required), and
+// /authorize is unauthenticated, so anyone holding the client's
+// authorize URL can obtain a fresh consent page anyway. It fixes
+// the back-button / double-submit UX where the user's second
+// Approve used to land on a JSON error.
 func Consent(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg *oauth2.Config, cfg ConsentConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
@@ -417,7 +410,15 @@ func Consent(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg *o
 						zap.String("jti", consent.JTI),
 						zap.String("client_id", consent.ClientID),
 					)
-					writeOAuthError(w, http.StatusBadRequest, "invalid_request", "consent token already used", "consent_replay")
+					// Re-render with a fresh single-use slot rather
+					// than a dead-end 400 — the blob is authentic,
+					// unexpired and audience-bound (all checked
+					// above), only its JTI is spent. The fresh token
+					// still requires a new explicit click, so the
+					// single-use guarantee on the *decision* holds.
+					consent.JTI = uuid.New().String()
+					consent.ExpiresAt = time.Now().Add(consentTTL)
+					renderConsent(w, tm, logger, baseURL, cfg.ResourceName, consent, true)
 					return
 				}
 				// Reuse the same access_denied{replay_store_unavailable}
@@ -442,7 +443,7 @@ func Consent(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg *o
 				zap.String("client_id", consent.ClientID),
 				zap.String("client_name", consent.ClientName),
 			)
-			redirectAuthzError(w, r, consent.RedirectURI, consent.OriginalState, "access_denied", "user declined to authorize this client", baseURL)
+			consentNavError(w, logger, consent.RedirectURI, consent.OriginalState, "access_denied", "user declined to authorize this client", baseURL)
 			return
 		}
 		if action != "approve" {
@@ -460,7 +461,7 @@ func Consent(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg *o
 		// proxy used.
 		nonceBytes := make([]byte, 16)
 		if _, err := rand.Read(nonceBytes); err != nil {
-			redirectAuthzError(w, r, consent.RedirectURI, consent.OriginalState, "server_error", "internal error", baseURL)
+			consentNavError(w, logger, consent.RedirectURI, consent.OriginalState, "server_error", "internal error", baseURL)
 			return
 		}
 		nonce := hex.EncodeToString(nonceBytes)
@@ -498,7 +499,7 @@ func Consent(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg *o
 		internalState, err := tm.SealJSON(session, token.PurposeSession)
 		if err != nil {
 			logger.Error("session_seal_failed", zap.Error(err))
-			redirectAuthzError(w, r, consent.RedirectURI, consent.OriginalState, "server_error", "internal error", baseURL)
+			consentNavError(w, logger, consent.RedirectURI, consent.OriginalState, "server_error", "internal error", baseURL)
 			return
 		}
 
@@ -508,18 +509,22 @@ func Consent(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg *o
 			oauth2.S256ChallengeOption(upstreamVerifier),
 		)
 
-		// Counter + log + redirect together — none of the three can
-		// fail (oauth2Cfg.AuthCodeURL is a string-builder,
-		// http.Redirect just writes a 302), so the order is
-		// observability-only. Keeping increment immediately before
-		// the redirect call keeps the funnel-counter semantics
+		// Counter + log + interstitial together — none of the three
+		// can fail (oauth2Cfg.AuthCodeURL is a string-builder, the
+		// interstitial render only logs on template error), so the
+		// order is observability-only. Keeping increment immediately
+		// before the render call keeps the funnel-counter semantics
 		// unambiguous if a future change introduces failure between
 		// these two lines.
+		//
+		// 200 interstitial, NOT a 302: see navInterstitialTmpl — a
+		// redirect here would re-enter Chromium's form-action chain
+		// enforcement that the interstitial exists to terminate.
 		logger.Info("consent_approved",
 			zap.String("client_id", consent.ClientID),
 			zap.String("client_name", consent.ClientName),
 		)
 		metrics.ConsentDecisions.WithLabelValues("approved").Inc()
-		http.Redirect(w, r, authURL, http.StatusFound)
+		renderNavInterstitial(w, logger, authURL)
 	}
 }
