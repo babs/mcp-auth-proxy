@@ -66,6 +66,12 @@ func main() {
 		zap.String("project_url", ProjectURL),
 	)
 
+	if len(cfg.CSPFormActionExtra) > 0 {
+		logger.Warn("csp_form_action_extra_deprecated",
+			zap.String("hint", "ignored since the consent interstitial: form-action is 'self'-only; remove CSP_FORM_ACTION_EXTRA from the deployment"),
+		)
+	}
+
 	// Single structured line summarising the security-relevant runtime
 	// posture. Lets oncall grep one log event per pod start to audit
 	// which safety nets are active, without exposing secrets. Booleans
@@ -349,7 +355,6 @@ func main() {
 		CompatAllowStateless: cfg.CompatAllowStateless,
 		RenderConsentPage:    cfg.RenderConsentPage,
 		ResourceName:         cfg.ResourceName,
-		CSPFormActionExtra:   cfg.CSPFormActionExtra,
 	}))
 	// /consent has its own bucket (see consentLimit construction
 	// above): a single user-driven flow is /authorize GET +
@@ -357,7 +362,8 @@ func main() {
 	// so a human who clicks Approve quickly after Authorize doesn't
 	// halve the per-IP budget for either path.
 	r.With(consentLimit).Post("/consent", handlers.Consent(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, handlers.ConsentConfig{
-		ReplayStore: replayStore,
+		ReplayStore:  replayStore,
+		ResourceName: cfg.ResourceName,
 	}))
 	var idpExchangeLimiter *rate.Limiter
 	if cfg.IdPExchangeRatePerSec > 0 {
@@ -876,12 +882,13 @@ func buildRPCMetrics(cfg *config.Config, logger *zap.Logger) *rpcMetrics {
 //     Referer header to a downstream resource).
 //   - Content-Security-Policy: default-src 'none'; frame-ancestors 'none'
 //     — JSON / redirect responses do not need any subresource; the
-//     stricter CSP is honest about that. The consent page overrides
-//     this baseline in handlers/consent.go (it needs style-src
-//     'unsafe-inline' for the inline <style>, and its form-action
-//     source list explicitly names the upstream AuthURL origin —
-//     Chromium enforces form-action against the entire redirect
-//     chain following a form submit, not just the immediate action=).
+//     stricter CSP is honest about that. The consent page and the
+//     navigation interstitial override this baseline with their own
+//     self-contained headers in handlers/consent.go (style-src
+//     'unsafe-inline' for the inline <style>, form-action 'self' /
+//     'none' respectively — no origin enumeration since the
+//     interstitial terminates Chromium's form-action chain
+//     enforcement at the proxy).
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()

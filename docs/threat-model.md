@@ -46,13 +46,12 @@ rather than assuming they're already covered.
 - **Browser-side XSS in the consent page.** The page is JS-free and
   CSP-locked (`default-src 'none'`, `style-src 'unsafe-inline'`,
   `script-src` defaults to none, `frame-ancestors 'none'`,
-  `base-uri 'none'`). `form-action` is widened only to the upstream
-  IdP origin (from OIDC discovery), any `CSP_FORM_ACTION_EXTRA`
-  entries, and the current request's validated `redirect_uri` origin
-  — each of the three filtered through the CSP3 §2.4 host-source
-  ABNF check so a DCR-registered redirect_uri whose host smuggles a
-  sub-delim cannot break out of the directive. A browser-engine bug
-  that escapes contextual HTML escaping is not separately mitigated.
+  `base-uri 'none'`, `form-action 'self'`). The consent POST is
+  answered with a same-origin navigation interstitial (200 + meta
+  refresh), so `form-action` never needs to name the IdP or client
+  origins — an injected form cannot point anywhere but the proxy
+  itself. A browser-engine bug that escapes contextual HTML
+  escaping is not separately mitigated.
 - **Network-level MITM between proxy and IdP.** TLS verification is
   on by default in the `oauth2` library; an operator who disables
   it (or a CA compromise) lets a MITM observe the upstream code

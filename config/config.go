@@ -181,19 +181,14 @@ type Config struct {
 	// env: UPSTREAM_AUTHORIZATION_HEADER. Treat as a secret in
 	// deployment (mount from a Secret, not a ConfigMap).
 	UpstreamAuthorization string
-	// CSPFormActionExtra lists additional scheme://host[:port]
-	// origins appended to the consent page's CSP form-action source
-	// list, alongside 'self' and the discovered upstream authorize
-	// endpoint origin. Needed for IdP redirect chains that cross the
-	// authorize host: Entra B2C (*.b2clogin.com), personal Microsoft
-	// accounts (login.live.com), federated AD FS (customer-owned
-	// host), sovereign clouds (login.microsoftonline.us /
-	// .partner.microsoftonline.cn). Each entry is a single fixed
-	// origin — wildcards are intentionally not supported because the
-	// directive's role is an explicit allowlist defense-in-depth
-	// against HTML injection on the consent page. Empty for the
-	// common one-host-IdP case. env: CSP_FORM_ACTION_EXTRA,
-	// comma-separated.
+	// CSPFormActionExtra is DEPRECATED and ignored. The consent POST
+	// is now answered with a same-origin navigation interstitial
+	// (handlers.renderNavInterstitial), which ends Chromium's
+	// form-action redirect-chain enforcement at the proxy — no IdP or
+	// client origin needs to be listed, so form-action is 'self'-only
+	// again. The variable is still parsed and validated so existing
+	// deployments keep starting; a startup warning flags it for
+	// removal. env: CSP_FORM_ACTION_EXTRA, comma-separated.
 	CSPFormActionExtra []string
 	// secretWeakWarning is non-empty when TOKEN_SIGNING_SECRET matches
 	// an obvious-weakness pattern (all-same byte, or short repeating
@@ -716,10 +711,16 @@ var cspHostSourceHostPort = regexp.MustCompile(
 )
 
 // CanonicalCSPHostSource validates an operator-supplied CSP host-source
-// (scheme://host[:port]) and returns the lower-cased canonical form
-// suitable for emission into the consent page's CSP form-action
-// directive. Returns an error with the offending input quoted on any
-// validation failure.
+// (scheme://host[:port]) and returns the lower-cased canonical form.
+// Returns an error with the offending input quoted on any validation
+// failure.
+//
+// Since the consent interstitial removed form-action origin
+// enumeration, the only caller is the deprecated
+// CSP_FORM_ACTION_EXTRA parse path: the result is validated but
+// discarded (nothing emits it into a header anymore). Kept so a
+// malformed value still fails startup loud instead of silently
+// changing meaning; delete together with CSP_FORM_ACTION_EXTRA.
 //
 // Canonicalisation: scheme and host are ASCII-lower-cased per CSP3
 // §6.7.2.5 (host-source matching is case-insensitive); operators

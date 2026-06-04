@@ -37,6 +37,27 @@ var formActionRE = regexp.MustCompile(`(?is)<form[^>]*\saction=["']([^"']+)["']`
 // markup.
 var consentTokenInputRE = regexp.MustCompile(`(?is)<input[^>]*name=["']consent_token["'][^>]*value=["']([^"']+)["']`)
 
+// navRefreshRE extracts the meta-refresh target from the proxy's
+// navigation interstitial (POST /consent answers 200 + meta refresh
+// instead of 302 — see handlers.renderNavInterstitial). The captured
+// URL is HTML-attribute-escaped; unescape before use.
+var navRefreshRE = regexp.MustCompile(`(?is)<meta[^>]*content=["']0;url=([^"']+)["']`)
+
+// extractNavTarget pulls the navigation target out of an
+// interstitial response body.
+func extractNavTarget(t *testing.T, resp *http.Response) string {
+	t.Helper()
+	page, err := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
+	if err != nil {
+		t.Fatalf("read interstitial page: %v", err)
+	}
+	match := navRefreshRE.FindSubmatch(page)
+	if match == nil {
+		t.Fatalf("meta refresh not found in interstitial; first 500 bytes: %q", string(page[:min(len(page), 500)]))
+	}
+	return html.UnescapeString(string(match[1]))
+}
+
 func TestKeycloakE2EFullOAuthFlow(t *testing.T) {
 	proxyBaseURL := envOrDefaultForTest("KEYCLOAK_E2E_PROXY_BASE_URL", "http://localhost:8080")
 	keycloakBrowserBaseURL := envOrDefaultForTest("KEYCLOAK_BROWSER_BASE_URL", "http://localhost:8180")
@@ -149,7 +170,8 @@ func authorizeViaKeycloak(t *testing.T, client *http.Client, proxyBaseURL, keycl
 
 // approveConsent walks the proxy-rendered consent page on RENDER_CONSENT_PAGE=true:
 // reads the sealed consent_token from the form, POSTs action=approve to /consent,
-// and returns the Location header of the resulting 302 (which points at the IdP).
+// and returns the meta-refresh target of the resulting interstitial
+// (which points at the IdP).
 func approveConsent(t *testing.T, client *http.Client, resp *http.Response, proxyBaseURL string) string {
 	t.Helper()
 	consentToken := extractConsentToken(t, resp)
@@ -162,10 +184,10 @@ func approveConsent(t *testing.T, client *http.Client, resp *http.Response, prox
 		t.Fatalf("POST /consent: %v", err)
 	}
 	defer consentResp.Body.Close()
-	if consentResp.StatusCode != http.StatusFound {
-		t.Fatalf("POST /consent: got %d, want 302: %s", consentResp.StatusCode, readSnippet(consentResp.Body))
+	if consentResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /consent: got %d, want 200 interstitial: %s", consentResp.StatusCode, readSnippet(consentResp.Body))
 	}
-	return consentResp.Header.Get("Location")
+	return extractNavTarget(t, consentResp)
 }
 
 // extractConsentToken pulls the sealed consent_token value out of
@@ -392,9 +414,10 @@ func isRedirect(status int) bool {
 // helpers with the happy-path test above.
 
 // TestKeycloakE2E_ConsentDenied pins the denial branch of the
-// proxy-rendered consent page: POST action=deny redirects 302 to
-// the registered redirect_uri with error=access_denied per
-// RFC 6749 §4.1.2.1, and the IdP login is never reached.
+// proxy-rendered consent page: POST action=deny answers with the
+// navigation interstitial targeting the registered redirect_uri
+// with error=access_denied per RFC 6749 §4.1.2.1, and the IdP
+// login is never reached.
 //
 // This test diverges before the Keycloak redirect, so it
 // exercises only the proxy's consent-page flow + chi/middleware
@@ -443,16 +466,16 @@ func TestKeycloakE2E_ConsentDenied(t *testing.T) {
 		t.Fatalf("POST /consent action=deny: %v", err)
 	}
 	defer denyResp.Body.Close()
-	if denyResp.StatusCode != http.StatusFound {
-		t.Fatalf("deny: want 302, got %d: %s", denyResp.StatusCode, readSnippet(denyResp.Body))
+	if denyResp.StatusCode != http.StatusOK {
+		t.Fatalf("deny: want 200 interstitial, got %d: %s", denyResp.StatusCode, readSnippet(denyResp.Body))
 	}
-	loc := denyResp.Header.Get("Location")
+	loc := extractNavTarget(t, denyResp)
 	if !strings.HasPrefix(loc, redirectURI) {
-		t.Fatalf("deny redirect Location = %q, want prefix %q", loc, redirectURI)
+		t.Fatalf("deny nav target = %q, want prefix %q", loc, redirectURI)
 	}
 	u, err := url.Parse(loc)
 	if err != nil {
-		t.Fatalf("parse deny Location: %v", err)
+		t.Fatalf("parse deny nav target: %v", err)
 	}
 	if got := u.Query().Get("error"); got != "access_denied" {
 		t.Errorf("error = %q, want access_denied", got)

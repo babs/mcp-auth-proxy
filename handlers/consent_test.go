@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"html"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -15,9 +16,34 @@ import (
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
-	"go.uber.org/zap/zaptest/observer"
-	"golang.org/x/oauth2"
 )
+
+// extractNavTarget pulls the navigation target out of an
+// interstitial response (the meta-refresh URL — see
+// renderNavInterstitial). Fails the test when the body is not an
+// interstitial. html/template escapes the URL into the attribute, so
+// the &amp; entities are decoded back before parsing.
+func extractNavTarget(t *testing.T, rr *httptest.ResponseRecorder) *url.URL {
+	t.Helper()
+	if rr.Code != http.StatusOK {
+		t.Fatalf("interstitial: want 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	const marker = `content="0;url=`
+	_, rest, found := strings.Cut(body, marker)
+	if !found {
+		t.Fatalf("meta refresh not found in body:\n%s", body)
+	}
+	raw, _, found := strings.Cut(rest, `"`)
+	if !found {
+		t.Fatalf("meta refresh close-quote not found")
+	}
+	u, err := url.Parse(html.UnescapeString(raw))
+	if err != nil {
+		t.Fatalf("parse nav target %q: %v", raw, err)
+	}
+	return u
+}
 
 // authorizeConsentEnabled mirrors the production wiring of /authorize
 // with RenderConsentPage=true. Used to drive the GET /authorize →
@@ -146,13 +172,9 @@ func TestConsent_DenyRedirectsAccessDenied(t *testing.T) {
 	rr := httptest.NewRecorder()
 	Consent(tm, zap.NewNop(), testBaseURL, testOAuth2Config(), ConsentConfig{})(rr, req)
 
-	if rr.Code != http.StatusFound {
-		t.Fatalf("want 302, got %d: %s", rr.Code, rr.Body.String())
-	}
-	loc, err := url.Parse(rr.Header().Get("Location"))
-	if err != nil {
-		t.Fatalf("parse Location: %v", err)
-	}
+	// Deny answers with the 200 interstitial carrying the error
+	// envelope on the client redirect_uri — not a 302 (form-action).
+	loc := extractNavTarget(t, rr)
 	if loc.Query().Get("error") != "access_denied" {
 		t.Errorf("error = %q, want access_denied", loc.Query().Get("error"))
 	}
@@ -172,8 +194,9 @@ func TestConsent_DenyRedirectsAccessDenied(t *testing.T) {
 
 // TestConsent_ApproveRedirectsToIdP pins the approve path: POST
 // /consent with action=approve and a valid token replays Phase-3 of
-// /authorize and 302s to the upstream IdP authorize endpoint, NOT
-// to the client's redirect_uri. Also asserts the sealed session
+// /authorize and answers with the navigation interstitial targeting
+// the upstream IdP authorize endpoint, NOT the client's
+// redirect_uri. Also asserts the sealed session
 // inherits the consent blob's resource binding (RFC 8707) so a
 // regression that loses the binding through the consent fork is
 // caught here rather than far downstream at the bearer middleware.
@@ -190,18 +213,17 @@ func TestConsent_ApproveRedirectsToIdP(t *testing.T) {
 	rr := httptest.NewRecorder()
 	Consent(tm, zap.NewNop(), testBaseURL, testOAuth2Config(), ConsentConfig{})(rr, req)
 
-	if rr.Code != http.StatusFound {
-		t.Fatalf("want 302, got %d: %s", rr.Code, rr.Body.String())
-	}
-	loc, err := url.Parse(rr.Header().Get("Location"))
-	if err != nil {
-		t.Fatalf("parse Location: %v", err)
-	}
+	loc := extractNavTarget(t, rr)
 	// Upstream IdP host comes from testOAuth2Config().Endpoint.AuthURL.
 	// Anything other than the IdP origin (or the client's redirect)
 	// is a bug; check it's the IdP, not the client redirect.
 	if loc.Host == "app.example.com" {
-		t.Errorf("approve redirected to client redirect_uri, want IdP host")
+		t.Errorf("approve targeted client redirect_uri, want IdP host")
+	}
+	// The interstitial must keep form-action useless to an injected
+	// form and stay JS-free — pin the locked-down CSP.
+	if csp := rr.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "form-action 'none'") {
+		t.Errorf("interstitial CSP missing form-action 'none': %q", csp)
 	}
 	// state on the IdP redirect is the proxy's sealed session blob,
 	// NOT the client's state. The client's state is preserved
@@ -266,13 +288,7 @@ func TestConsent_ApproveSvrPKCE_H6(t *testing.T) {
 	rr := httptest.NewRecorder()
 	Consent(tm, zap.NewNop(), testBaseURL, testOAuth2Config(), ConsentConfig{})(rr, req)
 
-	if rr.Code != http.StatusFound {
-		t.Fatalf("want 302, got %d: %s", rr.Code, rr.Body.String())
-	}
-	loc, err := url.Parse(rr.Header().Get("Location"))
-	if err != nil {
-		t.Fatalf("parse Location: %v", err)
-	}
+	loc := extractNavTarget(t, rr)
 	idpState := loc.Query().Get("state")
 
 	var sess sealedSession
@@ -331,286 +347,20 @@ func TestConsent_RelaxedCSP(t *testing.T) {
 		t.Errorf("consent CSP must NOT relax script-src; the page is JS-free: got %q", csp)
 	}
 	// Other directives that lock down the page must still be present.
-	// form-action must include both 'self' (the proxy's /consent
-	// endpoint) AND the upstream IdP origin — Chromium enforces
-	// form-action against every URL in the redirect chain, so a
-	// 'self'-only list blocks the consent POST's 302 to the IdP
-	// client-side. testOAuth2Config()'s AuthURL is
-	// https://idp.example.com/authorize, so the expected origin is
-	// https://idp.example.com.
+	// form-action is 'self'-only: the consent POST is answered by the
+	// same-origin interstitial, so no IdP or client origin belongs in
+	// the source list anymore (see consentPageCSP). A regression that
+	// reintroduces origin enumeration would widen the attack surface
+	// an HTML injection could exfiltrate the form to.
 	for _, want := range []string{
 		"default-src 'none'",
 		"frame-ancestors 'none'",
-		"form-action 'self' https://idp.example.com",
+		"form-action 'self';",
 		"base-uri 'none'",
 	} {
 		if !strings.Contains(csp, want) {
 			t.Errorf("consent CSP missing %q: got %q", want, csp)
 		}
-	}
-}
-
-// TestBuildConsentCSPSources_IdPOrigin pins buildConsentCSPSources's two-mode
-// contract: a valid AuthURL widens form-action to include its
-// origin (scheme://host[:port]); a missing/invalid AuthURL falls
-// back to 'self' only and signals !idpOriginOK so the caller can
-// log a startup warning. Non-default ports must be preserved
-// (operators self-host IdPs on arbitrary ports).
-func TestBuildConsentCSPSources_IdPOrigin(t *testing.T) {
-	cases := []struct {
-		name         string
-		authURL      string
-		extra        []string
-		wantFormAct  string
-		wantOriginOK bool
-	}{
-		{
-			name:         "standard https IdP",
-			authURL:      "https://login.microsoftonline.com/abc/oauth2/v2.0/authorize",
-			wantFormAct:  "form-action 'self' https://login.microsoftonline.com",
-			wantOriginOK: true,
-		},
-		{
-			name:         "non-default port preserved",
-			authURL:      "https://keycloak.example.com:8443/realms/x/protocol/openid-connect/auth",
-			wantFormAct:  "form-action 'self' https://keycloak.example.com:8443",
-			wantOriginOK: true,
-		},
-		{
-			name:         "empty AuthURL falls back to self",
-			authURL:      "",
-			wantFormAct:  "form-action 'self';",
-			wantOriginOK: false,
-		},
-		{
-			name:         "malformed AuthURL falls back to self",
-			authURL:      "::not-a-url::",
-			wantFormAct:  "form-action 'self';",
-			wantOriginOK: false,
-		},
-		{
-			name:         "extra origins appended after IdP origin",
-			authURL:      "https://login.microsoftonline.com/abc/oauth2/v2.0/authorize",
-			extra:        []string{"https://tenant.b2clogin.com", "https://login.live.com"},
-			wantFormAct:  "form-action 'self' https://login.microsoftonline.com https://tenant.b2clogin.com https://login.live.com",
-			wantOriginOK: true,
-		},
-		{
-			name:         "extra origins still appended when IdP origin fell back",
-			authURL:      "",
-			extra:        []string{"https://adfs.customer.example"},
-			wantFormAct:  "form-action 'self' https://adfs.customer.example;",
-			wantOriginOK: false,
-		},
-		{
-			// IPv6 hosts must round-trip with brackets intact —
-			// url.Parse returns Host="[::1]:8443" verbatim, and CSP
-			// source-list syntax accepts bracketed IPv6 per spec.
-			name:         "IPv6 host preserved with brackets",
-			authURL:      "https://[::1]:8443/authorize",
-			wantFormAct:  "form-action 'self' https://[::1]:8443",
-			wantOriginOK: true,
-		},
-		{
-			// http:// is accepted (OIDC dev / Docker-compose Keycloak
-			// demo) — the gating happens upstream at OIDC discovery
-			// (OIDC_ALLOW_INSECURE_HTTP), not here.
-			name:         "http scheme accepted",
-			authURL:      "http://keycloak.dev.local:8080/realms/x/protocol/openid-connect/auth",
-			wantFormAct:  "form-action 'self' http://keycloak.dev.local:8080",
-			wantOriginOK: true,
-		},
-		{
-			// CSP3 §6.7.2.5 makes host-source matching
-			// case-insensitive — we lower-case so the emitted header
-			// reads the way an operator would grep for it. Same
-			// canonicalisation as config.Load applies to extras.
-			name:         "case canonicalised to lowercase",
-			authURL:      "HTTPS://Foo.Example.COM/Auth",
-			wantFormAct:  "form-action 'self' https://foo.example.com",
-			wantOriginOK: true,
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			sources, ok := buildConsentCSPSources(tc.authURL, tc.extra)
-			csp := formatConsentCSP(zap.NewNop(), sources, "", "")
-			if ok != tc.wantOriginOK {
-				t.Errorf("idpOriginOK = %v, want %v (csp=%q)", ok, tc.wantOriginOK, csp)
-			}
-			if !strings.Contains(csp, tc.wantFormAct) {
-				t.Errorf("CSP missing %q: got %q", tc.wantFormAct, csp)
-			}
-		})
-	}
-}
-
-// TestFormatConsentCSP_RedirectURIOrigin pins the per-render
-// redirect_uri origin append. When the upstream IdP session is
-// already live, the consent POST's redirect chain stays in one
-// navigation all the way to the client's redirect_uri — without
-// that final origin in form-action, Chromium blocks the navigation
-// at the last hop (the proxy's /callback 302 to the client) and
-// surfaces a misleading "violates form-action 'self' <idp>" error
-// naming /consent. The chain in this case is:
-//
-//	POST /consent → IdP authorize → /callback → client redirect_uri
-//
-// when the user must log in, the IdP returns a 200 HTML login page,
-// form-action enforcement ends there, and the post-login callback
-// → client redirect_uri navigation is no longer governed by the
-// consent page's CSP.
-func TestFormatConsentCSP_RedirectURIOrigin(t *testing.T) {
-	base, _ := buildConsentCSPSources("https://login.microsoftonline.com/x/oauth2/v2.0/authorize", nil)
-	cases := []struct {
-		name        string
-		redirectURI string
-		wantSubstr  string
-		wantAbsent  string
-		wantWarn    bool
-	}{
-		{
-			name:        "cross-origin client redirect_uri appended",
-			redirectURI: "https://claude.ai/api/organizations/abc/mcp_callback",
-			wantSubstr:  "form-action 'self' https://login.microsoftonline.com https://claude.ai;",
-		},
-		{
-			name:        "redirect_uri sharing self origin is deduped",
-			redirectURI: "https://login.microsoftonline.com/somewhere",
-			wantSubstr:  "form-action 'self' https://login.microsoftonline.com;",
-			wantAbsent:  "https://login.microsoftonline.com https://login.microsoftonline.com",
-		},
-		{
-			name:        "loopback redirect with port preserved",
-			redirectURI: "http://127.0.0.1:51789/oauth/callback",
-			wantSubstr:  "http://127.0.0.1:51789",
-		},
-		{
-			name:        "IPv6 loopback redirect preserves brackets",
-			redirectURI: "http://[::1]:51789/oauth/callback",
-			wantSubstr:  "http://[::1]:51789",
-		},
-		{
-			name:        "case canonicalised to lowercase",
-			redirectURI: "HTTPS://Claude.AI/Callback",
-			wantSubstr:  "https://claude.ai",
-		},
-		{
-			name:        "empty redirect_uri leaves CSP unchanged",
-			redirectURI: "",
-			wantSubstr:  "form-action 'self' https://login.microsoftonline.com;",
-		},
-		{
-			name:        "malformed redirect_uri silently dropped",
-			redirectURI: "::not-a-url::",
-			wantSubstr:  "form-action 'self' https://login.microsoftonline.com;",
-		},
-		{
-			// H1 / CSP header-injection defence: a DCR client whose
-			// host smuggles a sub-delim (legal per RFC 3986 reg-name,
-			// illegal per CSP3 §2.4 host-source) must NOT widen the
-			// directive — the offending origin would terminate
-			// form-action early and inject a bogus directive.
-			name:        "sub-delim host rejected by CSP host-source check",
-			redirectURI: "https://evil.example;injected/cb",
-			wantSubstr:  "form-action 'self' https://login.microsoftonline.com;",
-			wantAbsent:  "evil.example",
-			wantWarn:    true,
-		},
-		{
-			// Underscore is valid in DNS resolution but not in CSP
-			// host-char (ALPHA/DIGIT/'-' only). Same defence as above.
-			name:        "underscore host rejected by CSP host-source check",
-			redirectURI: "https://host_underscore.example/cb",
-			wantSubstr:  "form-action 'self' https://login.microsoftonline.com;",
-			wantAbsent:  "host_underscore",
-			wantWarn:    true,
-		},
-	}
-	const testClientID = "client-uuid-under-test"
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			core, logs := observer.New(zap.WarnLevel)
-			logger := zap.New(core)
-			csp := formatConsentCSP(logger, base, testClientID, tc.redirectURI)
-			if !strings.Contains(csp, tc.wantSubstr) {
-				t.Errorf("CSP missing %q: got %q", tc.wantSubstr, csp)
-			}
-			if tc.wantAbsent != "" && strings.Contains(csp, tc.wantAbsent) {
-				t.Errorf("CSP unexpectedly contained %q: got %q", tc.wantAbsent, csp)
-			}
-			warnEntries := logs.FilterMessage("consent_csp_redirect_uri_skipped").All()
-			if tc.wantWarn && len(warnEntries) == 0 {
-				t.Errorf("expected consent_csp_redirect_uri_skipped warn, got none (logs=%v)", logs.All())
-			}
-			if !tc.wantWarn && len(warnEntries) != 0 {
-				t.Errorf("unexpected consent_csp_redirect_uri_skipped warn (logs=%v)", logs.All())
-			}
-			// When the warn fires, both client_id and redirect_uri
-			// must be present so an operator can alert/group by
-			// client_id without joining against client_registered.
-			if tc.wantWarn && len(warnEntries) > 0 {
-				fields := warnEntries[0].ContextMap()
-				if got, _ := fields["client_id"].(string); got != testClientID {
-					t.Errorf("warn client_id = %q, want %q", got, testClientID)
-				}
-				if got, _ := fields["redirect_uri"].(string); got != tc.redirectURI {
-					t.Errorf("warn redirect_uri = %q, want %q", got, tc.redirectURI)
-				}
-			}
-		})
-	}
-}
-
-// TestAuthorize_ConsentCSPWarn pins the construction-time gate on
-// the `consent_csp_idp_origin_missing` warn: it fires when
-// RenderConsentPage=true AND OIDC discovery returned an unusable
-// AuthURL (the only state where the consent page will render with a
-// fallback CSP that breaks Chromium), and stays silent when the
-// consent page is disabled (silent-redirect deployments would never
-// hit the broken CSP anyway). Without this gate, every silent-mode
-// deployment with an oddly-shaped AuthURL would emit misleading
-// warns about a page it does not render.
-func TestAuthorize_ConsentCSPWarn(t *testing.T) {
-	tm := newTestTokenManager(t)
-	// oauth2.Config with empty AuthURL is the only state buildConsentCSPSources
-	// flags as !idpOriginOK from real call sites — every other shape
-	// would have failed OIDC discovery before Authorize is constructed.
-	brokenOAuth2 := &oauth2.Config{
-		ClientID:     "test-oidc-client",
-		ClientSecret: "test-oidc-secret",
-		RedirectURL:  "https://auth.example.com/callback",
-		Scopes:       []string{"openid", "email", "profile"},
-	}
-	cases := []struct {
-		name              string
-		renderConsentPage bool
-		wantWarn          bool
-	}{
-		{"consent page enabled fires warn", true, true},
-		{"consent page disabled stays silent", false, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			core, logs := observer.New(zap.WarnLevel)
-			logger := zap.New(core)
-			// Construct only — handler not invoked. The gate fires
-			// at construction so the assertion is purely on the
-			// captured log buffer.
-			Authorize(tm, logger, testBaseURL, brokenOAuth2, AuthorizeConfig{
-				PKCERequired:      true,
-				ResourceURIs:      []string{testBaseURL + "/mcp"},
-				CanonicalResource: testBaseURL + "/mcp",
-				RenderConsentPage: tc.renderConsentPage,
-			})
-			got := logs.FilterMessage("consent_csp_idp_origin_missing").Len()
-			if tc.wantWarn && got != 1 {
-				t.Errorf("expected 1 consent_csp_idp_origin_missing warn, got %d entries (all logs: %v)", got, logs.All())
-			}
-			if !tc.wantWarn && got != 0 {
-				t.Errorf("expected silent-mode to skip the warn, got %d entries (all logs: %v)", got, logs.All())
-			}
-		})
 	}
 }
 
@@ -632,8 +382,8 @@ func TestConsent_DecisionCounters(t *testing.T) {
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		rr := httptest.NewRecorder()
 		Consent(tm, zap.NewNop(), testBaseURL, testOAuth2Config(), ConsentConfig{})(rr, req)
-		if rr.Code != http.StatusFound {
-			t.Fatalf("%s: want 302, got %d: %s", action, rr.Code, rr.Body.String())
+		if rr.Code != http.StatusOK {
+			t.Fatalf("%s: want 200 interstitial, got %d: %s", action, rr.Code, rr.Body.String())
 		}
 	}
 
@@ -759,6 +509,89 @@ func registerClientNamed(t *testing.T, tm *token.Manager, redirectURIs []string,
 		t.Fatalf("SealJSON: %v", err)
 	}
 	return enc, internalUUID
+}
+
+// TestConsent_NavErrorParseFailureFallback pins consentNavError's
+// fallback: when the sealed redirect_uri does not url.Parse (an
+// invariant breach — DCR validates the shape — but the branch must
+// stay fail-safe), the error envelope is served as proxy-hosted
+// JSON 400 instead of an interstitial targeting a garbage URL.
+func TestConsent_NavErrorParseFailureFallback(t *testing.T) {
+	tm := newTestTokenManager(t)
+	// Space in host fails url.Parse.
+	consentToken := mintConsentToken(t, tm, "https://bad host.example.com/cb", "s")
+
+	form := url.Values{
+		"consent_token": {consentToken},
+		"action":        {"deny"},
+	}
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/consent", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rr := httptest.NewRecorder()
+	Consent(tm, zap.NewNop(), testBaseURL, testOAuth2Config(), ConsentConfig{})(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("want 400 JSON fallback, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var oauthErr OAuthError
+	if err := json.NewDecoder(rr.Body).Decode(&oauthErr); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if oauthErr.Error != "access_denied" {
+		t.Errorf("error = %q, want access_denied", oauthErr.Error)
+	}
+}
+
+// TestConsent_InterstitialEscapesTargetURL pins the escaping
+// round-trip the extraction helpers rely on: the target URL is
+// HTML-attribute-escaped in the raw body (& → &amp;) in BOTH the
+// meta-refresh content attribute and the anchor-href fallback, and
+// unescaping restores a parseable multi-param URL. A regression to
+// template.HTML (raw &) or a divergence between the two attributes
+// fails here.
+func TestConsent_InterstitialEscapesTargetURL(t *testing.T) {
+	tm := newTestTokenManager(t)
+	consentToken := mintConsentToken(t, tm, "https://app.example.com/cb", "s")
+
+	form := url.Values{
+		"consent_token": {consentToken},
+		"action":        {"approve"},
+	}
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/consent", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rr := httptest.NewRecorder()
+	Consent(tm, zap.NewNop(), testBaseURL, testOAuth2Config(), ConsentConfig{})(rr, req)
+
+	body := rr.Body.String()
+	const marker = `content="0;url=`
+	_, rest, found := strings.Cut(body, marker)
+	if !found {
+		t.Fatalf("meta refresh not found:\n%s", body)
+	}
+	rawAttr, _, found := strings.Cut(rest, `"`)
+	if !found {
+		t.Fatalf("meta refresh close-quote not found")
+	}
+	// The IdP authorize URL always carries multiple query params, so
+	// the escaped form MUST contain &amp; and the raw form must not
+	// leak a bare & into the attribute.
+	if !strings.Contains(rawAttr, "&amp;") {
+		t.Errorf("meta refresh attribute not HTML-escaped (no &amp;): %q", rawAttr)
+	}
+	if strings.Contains(html.UnescapeString(rawAttr), "&amp;") {
+		t.Errorf("double-escaped meta refresh attribute: %q", rawAttr)
+	}
+	u, err := url.Parse(html.UnescapeString(rawAttr))
+	if err != nil {
+		t.Fatalf("unescaped target does not parse: %v", err)
+	}
+	if len(u.Query()) < 2 {
+		t.Errorf("expected multi-param IdP URL, got %q", u.String())
+	}
+	// Anchor fallback must carry the identical escaped URL.
+	if !strings.Contains(body, `<a href="`+rawAttr+`"`) {
+		t.Errorf("anchor href does not match the meta refresh target")
+	}
 }
 
 func mintConsentToken(t *testing.T, tm *token.Manager, redirectURI, state string) string {
