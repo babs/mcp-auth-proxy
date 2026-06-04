@@ -46,11 +46,12 @@ type consentPageData struct {
 }
 
 // consentTmpl is the proxy-rendered consent page. Plain HTML, no
-// JavaScript, CSP-tight (default-src 'none' from the
-// security-headers middleware) — the only interactivity is the two
-// submit buttons on the embedded form. Keeping the page free of
-// remote subresources also keeps the operator from having to relax
-// CSP just to render consent.
+// JavaScript, CSP-tight (consentPageCSP, set self-contained by
+// renderConsent — it overrides the security-headers middleware
+// baseline) — the only interactivity is the two submit buttons on
+// the embedded form. Keeping the page free of remote subresources
+// also keeps the operator from having to relax CSP just to render
+// consent.
 var consentTmpl = template.Must(template.New("consent").Parse(`<!doctype html>
 <html lang="en">
 <head>
@@ -127,15 +128,28 @@ var consentTmpl = template.Must(template.New("consent").Parse(`<!doctype html>
 </html>
 `))
 
-// consentPageCSP is the static CSP for the consent page. form-action
-// stays 'self'-only: the approve/deny POST is answered with a 200
-// same-origin interstitial (renderNavInterstitial) rather than a
-// redirect, which terminates Chromium's form-action enforcement of
-// the navigation chain. No IdP / client origin enumeration needed —
-// the header is independent of IdP topology and client redirect
-// targets (previously CSP_FORM_ACTION_EXTRA + per-render widening,
-// both obsoleted by the interstitial).
-const consentPageCSP = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+// Consent-flow CSP headers, sharing one base so the two
+// security-critical literals cannot drift apart — the single
+// intentional difference is the form-action source.
+//
+// consentPageCSP (form-action 'self'): the approve/deny POST is
+// answered with a 200 same-origin interstitial
+// (renderNavInterstitial) rather than a redirect, which terminates
+// Chromium's form-action enforcement of the navigation chain. No
+// IdP / client origin enumeration needed — the header is
+// independent of IdP topology and client redirect targets
+// (previously CSP_FORM_ACTION_EXTRA + per-render widening, both
+// obsoleted by the interstitial).
+//
+// navInterstitialCSP (form-action 'none'): the interstitial carries
+// no form; meta-refresh / anchor navigation is not governed by any
+// fetch or form-action directive, so everything stays locked down.
+const (
+	cspConsentPrefix   = "default-src 'none'; style-src 'unsafe-inline'; form-action "
+	cspConsentSuffix   = "; frame-ancestors 'none'; base-uri 'none'"
+	consentPageCSP     = cspConsentPrefix + "'self'" + cspConsentSuffix
+	navInterstitialCSP = cspConsentPrefix + "'none'" + cspConsentSuffix
+)
 
 // navInterstitialTmpl carries the user from a /consent form POST to
 // the next location: the IdP authorize URL on approve, the client
@@ -156,6 +170,13 @@ const consentPageCSP = "default-src 'none'; style-src 'unsafe-inline'; form-acti
 // enforcement; the meta refresh then starts a regular navigation
 // that form-action does not govern. Meta refresh needs no
 // JavaScript, so script-src stays 'none'.
+//
+// {{.URL}} in the content attribute relies on the upstream
+// builders for `;`-safety: html/template HTML-escapes the
+// attribute (quotes, <, &) but leaves `;` raw, and the meta-refresh
+// parse algorithm takes everything after "url=" as the URL — safe
+// because both producers (oauth2Cfg.AuthCodeURL, authzErrorURL's
+// q.Encode) percent-encode `;` in query values.
 var navInterstitialTmpl = template.Must(template.New("nav").Parse(`<!doctype html>
 <html lang="en">
 <head>
@@ -186,10 +207,7 @@ func renderNavInterstitial(w http.ResponseWriter, logger *zap.Logger, targetURL 
 	// the client's error envelope — never serve it from a cache.
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Pragma", "no-cache")
-	// No form on this page; meta-refresh / anchor navigation is not
-	// governed by any fetch or form-action directive, so everything
-	// stays locked down.
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'")
+	w.Header().Set("Content-Security-Policy", navInterstitialCSP)
 	w.WriteHeader(http.StatusOK)
 	if err := navInterstitialTmpl.Execute(w, struct{ URL string }{targetURL}); err != nil {
 		// Body already started — log only.
@@ -223,6 +241,10 @@ func consentNavError(w http.ResponseWriter, logger *zap.Logger, redirectURI, sta
 // already trusted at this point in the flow. The interstitial (not
 // a 302) because this renderer also answers the POST /consent
 // replay path, where a cross-origin redirect would trip form-action.
+//
+// replayNotice=true adds the "previous response already processed"
+// banner — set only by the POST /consent replay re-render; the
+// GET /authorize first render passes false.
 func renderConsent(w http.ResponseWriter, tm *token.Manager, logger *zap.Logger, baseURL, resourceName string, consent sealedConsent, replayNotice bool) {
 	consentToken, err := tm.SealJSON(consent, token.PurposeConsent)
 	if err != nil {
@@ -299,15 +321,17 @@ type ConsentConfig struct {
 //
 // Replays /authorize Phase 3 on approval: opens the sealedConsent,
 // mints the upstream OIDC nonce and PKCE verifier, seals a
-// sealedSession, and 302s to the IdP. The original sealedClient is
-// NOT reopened here — the consent blob carries only the inner
-// client_id UUID, not the sealed registration handle, so a
-// re-validation would have nothing to re-validate against. The
-// audience + TTL + AAD-purpose triple binding on the consent blob
-// is the integrity check.
+// sealedSession, and answers with the navigation interstitial
+// targeting the IdP (see renderNavInterstitial for why not a 302).
+// The original sealedClient is NOT reopened here — the consent blob
+// carries only the inner client_id UUID, not the sealed
+// registration handle, so a re-validation would have nothing to
+// re-validate against. The audience + TTL + AAD-purpose triple
+// binding on the consent blob is the integrity check.
 //
-// On deny: redirects 302 to the user's registered redirect_uri
-// with `error=access_denied` per RFC 6749 §4.1.2.1.
+// On deny: answers with the interstitial targeting the user's
+// registered redirect_uri carrying `error=access_denied` per
+// RFC 6749 §4.1.2.1.
 //
 // CSRF: the sealedConsent itself is the CSRF token (audience- and
 // purpose-bound, 5-min TTL). A POST without a valid consent_token
@@ -416,8 +440,12 @@ func Consent(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg *o
 					// above), only its JTI is spent. The fresh token
 					// still requires a new explicit click, so the
 					// single-use guarantee on the *decision* holds.
+					// ExpiresAt is deliberately NOT refreshed: the
+					// consentTTL window counts from the original
+					// /authorize render, otherwise replay→re-render
+					// cycles would keep a captured blob alive
+					// indefinitely.
 					consent.JTI = uuid.New().String()
-					consent.ExpiresAt = time.Now().Add(consentTTL)
 					renderConsent(w, tm, logger, baseURL, cfg.ResourceName, consent, true)
 					return
 				}

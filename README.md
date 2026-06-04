@@ -234,7 +234,9 @@ ordering) live in [`specs.md`](./specs.md).
   - `mcp_auth_consent_decisions_total{decision}` — funnel approve/deny
   - `mcp_auth_access_denied_total{reason}` — every denial bucket
   - `mcp_auth_replay_detected_total{kind}` — `code` / `refresh` /
-    `consent` / `callback_state`
+    `consent` / `callback_state`. `consent` also counts benign
+    double-submits (replay answers with a re-rendered consent page,
+    not a 4xx) — alert on sustained rate, not single ticks
   - `mcp_auth_rate_limited_total{endpoint}` — pre-auth httprate 429s
   - `mcp_auth_idp_exchange_throttled_total` — outbound bucket denials
   - `mcp_auth_clients_registered_total`, `mcp_auth_token_seals_total{purpose}`,

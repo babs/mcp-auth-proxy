@@ -711,10 +711,16 @@ var cspHostSourceHostPort = regexp.MustCompile(
 )
 
 // CanonicalCSPHostSource validates an operator-supplied CSP host-source
-// (scheme://host[:port]) and returns the lower-cased canonical form
-// suitable for emission into the consent page's CSP form-action
-// directive. Returns an error with the offending input quoted on any
-// validation failure.
+// (scheme://host[:port]) and returns the lower-cased canonical form.
+// Returns an error with the offending input quoted on any validation
+// failure.
+//
+// Since the consent interstitial removed form-action origin
+// enumeration, the only caller is the deprecated
+// CSP_FORM_ACTION_EXTRA parse path: the result is validated but
+// discarded (nothing emits it into a header anymore). Kept so a
+// malformed value still fails startup loud instead of silently
+// changing meaning; delete together with CSP_FORM_ACTION_EXTRA.
 //
 // Canonicalisation: scheme and host are ASCII-lower-cased per CSP3
 // §6.7.2.5 (host-source matching is case-insensitive); operators

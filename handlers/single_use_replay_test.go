@@ -179,6 +179,106 @@ func TestConsent_SingleUse_ReplayDetected(t *testing.T) {
 	}
 }
 
+// TestConsent_Replay_DenyThenApproveFreshToken pins the cross-action
+// chain: a token claimed via DENY, then replayed, yields a fresh
+// token that can APPROVE. The re-rendered slot is decision-neutral —
+// the user changing their mind after a double-submitted deny is the
+// expected outcome, not a privilege bug (the fresh click is the
+// authorization).
+func TestConsent_Replay_DenyThenApproveFreshToken(t *testing.T) {
+	tm := newTestTokenManager(t)
+	store := replay.NewMemoryStore()
+	defer store.Close()
+
+	tok := mintConsentTokenWithJTI(t, tm, uuid.NewString())
+	approvedBefore := testutil.ToFloat64(metrics.ConsentDecisions.WithLabelValues("approved"))
+	deniedBefore := testutil.ToFloat64(metrics.ConsentDecisions.WithLabelValues("denied"))
+
+	post := func(consentToken, action string) *httptest.ResponseRecorder {
+		form := url.Values{"consent_token": {consentToken}, "action": {action}}
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/consent", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rr := httptest.NewRecorder()
+		Consent(tm, zap.NewNop(), testBaseURL, testOAuth2Config(), ConsentConfig{ReplayStore: store})(rr, req)
+		return rr
+	}
+
+	if rr := post(tok, "deny"); rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `http-equiv="refresh"`) {
+		t.Fatalf("deny: want 200 interstitial, got %d", rr.Code)
+	}
+	replayed := post(tok, "deny")
+	if replayed.Code != http.StatusOK || strings.Contains(replayed.Body.String(), `http-equiv="refresh"`) {
+		t.Fatalf("replayed deny: want 200 re-render, got %d", replayed.Code)
+	}
+	fresh := extractConsentToken(t, replayed.Body.String())
+
+	approve := post(fresh, "approve")
+	if approve.Code != http.StatusOK || !strings.Contains(approve.Body.String(), `http-equiv="refresh"`) {
+		t.Fatalf("approve with fresh token: want 200 interstitial, got %d: %s", approve.Code, approve.Body.String())
+	}
+
+	if got := testutil.ToFloat64(metrics.ConsentDecisions.WithLabelValues("denied")); got-deniedBefore != 1 {
+		t.Errorf("ConsentDecisions{denied} delta = %v, want 1", got-deniedBefore)
+	}
+	if got := testutil.ToFloat64(metrics.ConsentDecisions.WithLabelValues("approved")); got-approvedBefore != 1 {
+		t.Errorf("ConsentDecisions{approved} delta = %v, want 1", got-approvedBefore)
+	}
+}
+
+// TestConsent_Replay_DoesNotExtendExpiry pins that the re-rendered
+// consent token keeps the ORIGINAL ExpiresAt: the consentTTL window
+// counts from the /authorize render, so replay→re-render cycles
+// cannot keep a captured blob alive past its 5-minute budget.
+func TestConsent_Replay_DoesNotExtendExpiry(t *testing.T) {
+	tm := newTestTokenManager(t)
+	store := replay.NewMemoryStore()
+	defer store.Close()
+
+	// Seal a consent expiring in 30s — far from a fresh consentTTL,
+	// so an accidental refresh is unambiguous in the assertion.
+	shortExpiry := time.Now().Add(30 * time.Second)
+	consent := sealedConsent{
+		JTI:           uuid.NewString(),
+		ClientID:      uuid.New().String(),
+		ClientName:    "Friendly App",
+		RedirectURI:   "https://app.example.com/cb",
+		OriginalState: "client-state",
+		CodeChallenge: pkceChallenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+		Resource:      testBaseURL + "/mcp",
+		Typ:           token.PurposeConsent,
+		Audience:      testBaseURL,
+		ExpiresAt:     shortExpiry,
+	}
+	tok, err := tm.SealJSON(consent, token.PurposeConsent)
+	if err != nil {
+		t.Fatalf("SealJSON: %v", err)
+	}
+
+	post := func() *httptest.ResponseRecorder {
+		form := url.Values{"consent_token": {tok}, "action": {"approve"}}
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/consent", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rr := httptest.NewRecorder()
+		Consent(tm, zap.NewNop(), testBaseURL, testOAuth2Config(), ConsentConfig{ReplayStore: store})(rr, req)
+		return rr
+	}
+
+	post() // claims the JTI
+	second := post()
+	if second.Code != http.StatusOK {
+		t.Fatalf("replayed POST: want 200 re-render, got %d", second.Code)
+	}
+
+	var fresh sealedConsent
+	if err := tm.OpenJSON(extractConsentToken(t, second.Body.String()), &fresh, token.PurposeConsent); err != nil {
+		t.Fatalf("OpenJSON fresh consent: %v", err)
+	}
+	// Allow sub-second JSON time round-trip jitter, nothing more.
+	if fresh.ExpiresAt.After(shortExpiry.Add(time.Second)) {
+		t.Errorf("re-rendered ExpiresAt = %v, want original %v (replay must not extend the consent window)", fresh.ExpiresAt, shortExpiry)
+	}
+}
+
 // TestConsent_SingleUse_ClaimsBeforeDeny pins that the JTI is
 // claimed BEFORE the deny branch — a captured token cannot be
 // replayed for either decision; the replay re-renders the page
@@ -566,20 +666,7 @@ func TestAuthorize_RenderConsent_PopulatesJTI(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d", rr.Code)
 	}
-	body := rr.Body.String()
-	// Extract the consent_token from the form. The page is small
-	// enough that a substring search is cheaper than an HTML parse.
-	const marker = `name="consent_token" value="`
-	idx := strings.Index(body, marker)
-	if idx < 0 {
-		t.Fatalf("consent_token input not found in body")
-	}
-	rest := body[idx+len(marker):]
-	end := strings.Index(rest, `"`)
-	if end < 0 {
-		t.Fatalf("consent_token close-quote not found")
-	}
-	tok := rest[:end]
+	tok := extractConsentToken(t, rr.Body.String())
 
 	var consent sealedConsent
 	if err := tm.OpenJSON(tok, &consent, token.PurposeConsent); err != nil {

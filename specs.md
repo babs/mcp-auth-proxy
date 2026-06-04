@@ -332,11 +332,13 @@ Always registered. Driven by the consent form rendered at step 3 of `/authorize`
 
 **Behavior:**
 1. Open `consent_token` (`PurposeConsent` AAD); reject on bad shape, wrong purpose, audience mismatch, or expired (`5 min` TTL).
-2. **`action=deny`:** increment `mcp_auth_consent_decisions_total{decision="denied"}`, log `consent_denied`, redirect 302 to the registered `redirect_uri` with `error=access_denied` per RFC 6749 §4.1.2.1.
-3. **`action=approve`:** mint upstream OIDC `nonce` (random 32 hex) + upstream PKCE verifier, regenerate the H6 server-side PKCE pair if the consent blob recorded one, seal a `sealedSession` (same shape as step 4 of `/authorize`), redirect 302 to the IdP. Increment `mcp_auth_consent_decisions_total{decision="approved"}`.
+2. **`action=deny`:** increment `mcp_auth_consent_decisions_total{decision="denied"}`, log `consent_denied`, answer with the **navigation interstitial** (200 HTML, `meta http-equiv="refresh"`, no JS) targeting the registered `redirect_uri` with `error=access_denied` per RFC 6749 §4.1.2.1.
+3. **`action=approve`:** mint upstream OIDC `nonce` (random 32 hex) + upstream PKCE verifier, regenerate the H6 server-side PKCE pair if the consent blob recorded one, seal a `sealedSession` (same shape as step 4 of `/authorize`), answer with the navigation interstitial targeting the IdP authorize URL. Increment `mcp_auth_consent_decisions_total{decision="approved"}`.
 4. **Anything else:** 400 `invalid_request`.
 
-**Single-use replay defense on `consent_token`:** when a replay store is wired (`REDIS_URL`), the consent token's `jti` is claimed atomically before either branch runs — a captured `consent_token` can be redeemed at most once for either Approve or Deny. Each GET `/authorize` render mints a fresh `jti`, so the back-button case still works (a re-render gets a new claim slot, the prior one is dead once redeemed). On replay: 400 `invalid_request` with `error_code=consent_replay`, `mcp_auth_replay_detected_total{kind="consent"}` increments. With no replay store wired (configured opt-out) the handler falls back to the prior stateless behavior (token unique, audience-bound, TTL-bounded, but replayable within the 5-min window).
+**Why an interstitial, not a 302:** Chromium enforces the consent page's CSP `form-action` directive against every hop of the redirect chain a form submit initiates — including redirects the OAuth *client* performs after receiving the code, which are unknowable in advance. Terminating the form navigation at a same-origin 200 ends that enforcement; the meta refresh starts a regular navigation that `form-action` does not govern. This keeps the consent page CSP at `form-action 'self'` with no origin enumeration. The interstitial's own CSP is fully locked (`form-action 'none'`, no scripts) and `Cache-Control: no-store`. Server-error paths (seal failure, nonce failure) deliver the RFC 6749 error envelope through the same interstitial; only the replay-store-unavailable 503 and pre-validation 4xx remain JSON (same-origin, no redirect to block).
+
+**Single-use replay defense on `consent_token`:** when a replay store is wired (`REDIS_URL`), the consent token's `jti` is claimed atomically before either branch runs — the *decision* (Approve or Deny) executes at most once per token. Each GET `/authorize` render mints a fresh `jti`, so the back-button case still works. **On replay** (double-submit, back-button re-POST, captured token): the proxy re-renders the consent page (200) with a notice, a **fresh `jti`**, and the **original `ExpiresAt`** — replay→re-render cycles cannot extend a captured blob's life past the original 5-minute window, and a new explicit click is always required, so nothing auto-approves. `mcp_auth_replay_detected_total{kind="consent"}` increments **once per replayed POST** — note this now also counts benign double-submits, not only adversarial replays; do not page on low counts of this kind (see Metrics). The re-render loop is bounded by the per-IP `/consent` rate bucket. With no replay store wired (configured opt-out) the handler falls back to the prior stateless behavior (token unique, audience-bound, TTL-bounded, but replayable within the 5-min window).
 
 ---
 
@@ -590,7 +592,7 @@ Operator-load-bearing invariants that are not surfaced by the env table or the e
 - **Business metrics** (under `/metrics` on `METRICS_ADDR`):
   - `mcp_auth_tokens_issued_total{grant_type}`
   - `mcp_auth_access_denied_total{reason}` — see README for the enumerated reasons
-  - `mcp_auth_replay_detected_total{kind}` (`code` / `refresh`)
+  - `mcp_auth_replay_detected_total{kind}` (`code` / `refresh` / `consent` / `callback_state`) — `code`, `refresh` and `callback_state` are rejected requests (security signal); `consent` counts replayed consent POSTs that were answered with a re-rendered consent page, which includes benign double-submits / back-button re-POSTs — alert on sustained rate, not single ticks
   - `mcp_auth_rate_limited_total{endpoint}`
   - `mcp_auth_clients_registered_total`
   - `mcp_auth_groups_claim_shape_mismatch_total` — IdP-schema-drift signal; user is admitted with empty groups, so it's NOT a denial

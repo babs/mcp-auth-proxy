@@ -143,7 +143,9 @@ The proxy's Prom counters surface Redis-related behavior:
   counts 503s returned because Redis errored.
 - `mcp_auth_replay_detected_total{kind="code"|"refresh"}` — counts
   legitimate replay-detection events. A spike may be an attack, or a
-  broken client that retries with the same code.
+  broken client that retries with the same code. The `consent` kind
+  is softer: a replayed consent POST is answered with a re-rendered
+  consent page, so it also counts benign double-submits.
 - `/readyz` on the metrics port — probes Redis with a cached
   `Exists`. Feeds K8s readiness.
 

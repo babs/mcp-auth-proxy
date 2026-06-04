@@ -160,7 +160,9 @@ sum(mcp_auth_consent_decisions_total{decision="approved"})
     refresh-rotation outcomes.
 - `mcp_auth_replay_detected_total{kind}` — `code` / `refresh` /
   `consent` / `callback_state` replays caught by the Redis-backed
-  store.
+  store. The `consent` kind answers with a re-rendered consent page
+  (200), so it also counts benign double-submits / back-button
+  re-POSTs — not a pure attack signal.
 - `mcp_auth_groups_claim_shape_mismatch_total` — id_token `groups`
   claim failed to decode as `[]string`. **No denial occurs** — user
   is admitted with empty groups; the counter surfaces an IdP schema

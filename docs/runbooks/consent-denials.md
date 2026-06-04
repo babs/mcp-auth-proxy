@@ -33,6 +33,11 @@ stays clean.
 3. **Automated test rig.** A CI job that drove `/authorize` and
    expected a 302 now sees a 200 HTML page; whatever scraped
    the form the wrong way looks like a denial in the logs.
+   Same trap one step later: `POST /consent` no longer 302s
+   either — approve/deny answer with a 200 navigation
+   interstitial whose `meta http-equiv="refresh"` carries the
+   next URL. Rigs must extract that target, not the `Location`
+   header.
 4. **Consent page rendering broken behind the ingress.** Strict
    CSP or content-rewriting at the L7 hop mangles the form;
    user can't click. Symptom: zero approves, zero denies, just

@@ -511,6 +511,89 @@ func registerClientNamed(t *testing.T, tm *token.Manager, redirectURIs []string,
 	return enc, internalUUID
 }
 
+// TestConsent_NavErrorParseFailureFallback pins consentNavError's
+// fallback: when the sealed redirect_uri does not url.Parse (an
+// invariant breach — DCR validates the shape — but the branch must
+// stay fail-safe), the error envelope is served as proxy-hosted
+// JSON 400 instead of an interstitial targeting a garbage URL.
+func TestConsent_NavErrorParseFailureFallback(t *testing.T) {
+	tm := newTestTokenManager(t)
+	// Space in host fails url.Parse.
+	consentToken := mintConsentToken(t, tm, "https://bad host.example.com/cb", "s")
+
+	form := url.Values{
+		"consent_token": {consentToken},
+		"action":        {"deny"},
+	}
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/consent", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rr := httptest.NewRecorder()
+	Consent(tm, zap.NewNop(), testBaseURL, testOAuth2Config(), ConsentConfig{})(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("want 400 JSON fallback, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var oauthErr OAuthError
+	if err := json.NewDecoder(rr.Body).Decode(&oauthErr); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if oauthErr.Error != "access_denied" {
+		t.Errorf("error = %q, want access_denied", oauthErr.Error)
+	}
+}
+
+// TestConsent_InterstitialEscapesTargetURL pins the escaping
+// round-trip the extraction helpers rely on: the target URL is
+// HTML-attribute-escaped in the raw body (& → &amp;) in BOTH the
+// meta-refresh content attribute and the anchor-href fallback, and
+// unescaping restores a parseable multi-param URL. A regression to
+// template.HTML (raw &) or a divergence between the two attributes
+// fails here.
+func TestConsent_InterstitialEscapesTargetURL(t *testing.T) {
+	tm := newTestTokenManager(t)
+	consentToken := mintConsentToken(t, tm, "https://app.example.com/cb", "s")
+
+	form := url.Values{
+		"consent_token": {consentToken},
+		"action":        {"approve"},
+	}
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/consent", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rr := httptest.NewRecorder()
+	Consent(tm, zap.NewNop(), testBaseURL, testOAuth2Config(), ConsentConfig{})(rr, req)
+
+	body := rr.Body.String()
+	const marker = `content="0;url=`
+	_, rest, found := strings.Cut(body, marker)
+	if !found {
+		t.Fatalf("meta refresh not found:\n%s", body)
+	}
+	rawAttr, _, found := strings.Cut(rest, `"`)
+	if !found {
+		t.Fatalf("meta refresh close-quote not found")
+	}
+	// The IdP authorize URL always carries multiple query params, so
+	// the escaped form MUST contain &amp; and the raw form must not
+	// leak a bare & into the attribute.
+	if !strings.Contains(rawAttr, "&amp;") {
+		t.Errorf("meta refresh attribute not HTML-escaped (no &amp;): %q", rawAttr)
+	}
+	if strings.Contains(html.UnescapeString(rawAttr), "&amp;") {
+		t.Errorf("double-escaped meta refresh attribute: %q", rawAttr)
+	}
+	u, err := url.Parse(html.UnescapeString(rawAttr))
+	if err != nil {
+		t.Fatalf("unescaped target does not parse: %v", err)
+	}
+	if len(u.Query()) < 2 {
+		t.Errorf("expected multi-param IdP URL, got %q", u.String())
+	}
+	// Anchor fallback must carry the identical escaped URL.
+	if !strings.Contains(body, `<a href="`+rawAttr+`"`) {
+		t.Errorf("anchor href does not match the meta refresh target")
+	}
+}
+
 func mintConsentToken(t *testing.T, tm *token.Manager, redirectURI, state string) string {
 	t.Helper()
 	consent := sealedConsent{

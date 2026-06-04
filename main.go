@@ -882,12 +882,13 @@ func buildRPCMetrics(cfg *config.Config, logger *zap.Logger) *rpcMetrics {
 //     Referer header to a downstream resource).
 //   - Content-Security-Policy: default-src 'none'; frame-ancestors 'none'
 //     — JSON / redirect responses do not need any subresource; the
-//     stricter CSP is honest about that. The consent page overrides
-//     this baseline in handlers/consent.go (it needs style-src
-//     'unsafe-inline' for the inline <style>, and its form-action
-//     source list explicitly names the upstream AuthURL origin —
-//     Chromium enforces form-action against the entire redirect
-//     chain following a form submit, not just the immediate action=).
+//     stricter CSP is honest about that. The consent page and the
+//     navigation interstitial override this baseline with their own
+//     self-contained headers in handlers/consent.go (style-src
+//     'unsafe-inline' for the inline <style>, form-action 'self' /
+//     'none' respectively — no origin enumeration since the
+//     interstitial terminates Chromium's form-action chain
+//     enforcement at the proxy).
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
