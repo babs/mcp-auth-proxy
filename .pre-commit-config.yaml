@@ -20,3 +20,15 @@ repos:
     rev: v2.11.4
     hooks:
       - id: golangci-lint
+
+  - repo: local
+    hooks:
+      # Security: surface known stdlib/dependency CVEs before they land
+      # in a commit instead of failing later in CI's govulncheck job.
+      # Requires: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - id: govulncheck
+        name: govulncheck
+        entry: govulncheck ./...
+        language: system
+        types: [go]
+        pass_filenames: false
