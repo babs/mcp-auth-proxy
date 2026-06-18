@@ -8,7 +8,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/babs/mcp-auth-proxy/metrics"
 	"github.com/babs/mcp-auth-proxy/token"
+	"go.uber.org/zap"
 )
 
 // OAuthError represents an RFC 6749 error response.
@@ -249,6 +251,32 @@ func hasOverlap(userGroups, allowed []string) bool {
 	return false
 }
 
+// recordClientDenial records a client_id-validation rejection: it
+// increments AccessDenied{reason} and emits a matching
+// access_denied_<reason> WARN log — the repo's denial-logging
+// convention (see callback.go / authorize.go state path). Pairing them
+// in one call keeps the metric series and the log in lockstep; the
+// caller still writes the (path-specific) RFC 6749 OAuth error and
+// returns. writeOAuthError is otherwise silent, so without this a stuck
+// client looping on e.g. expired registration shows up only as raw 4xx
+// access logs. Under a retry storm the log volume is bounded by the
+// per-IP rate limiter (main.go) plus zap's production sampling — keep
+// both enabled.
+func recordClientDenial(logger *zap.Logger, reason string, fields ...zap.Field) {
+	metrics.AccessDenied.WithLabelValues(reason).Inc()
+	logger.Warn("access_denied_"+reason, fields...)
+}
+
+// clientExpired reports whether a sealed client_id has passed its TTL.
+// A zero ExpiresAt means "never expires" (CLIENT_REGISTRATION_TTL=0) and
+// is never stale — the 0=never semantic mirrors RFC 7591 §3.2.1
+// client_secret_expires_at applied to our client_id_expires_at extension
+// field. Single source for this rule, shared by /authorize and /token so
+// the two validation sites cannot diverge.
+func clientExpired(c *sealedClient) bool {
+	return !c.ExpiresAt.IsZero() && time.Now().After(c.ExpiresAt)
+}
+
 // openAndValidateClient decodes a client_id sealed payload and runs
 // the four invariants both /token grant handlers need: AAD purpose
 // match, belt-and-braces typ discriminator, audience binding, and TTL.
@@ -257,21 +285,25 @@ func hasOverlap(userGroups, allowed []string) bool {
 // Factoring this out removes the near-identical 20-line block from
 // each grant handler; error shapes are preserved verbatim so the
 // existing test matrix against both paths keeps exercising them.
-func openAndValidateClient(w http.ResponseWriter, tm *token.Manager, clientIDStr, audience string) *sealedClient {
+func openAndValidateClient(w http.ResponseWriter, tm *token.Manager, logger *zap.Logger, clientIDStr, audience string) *sealedClient {
 	var client sealedClient
 	if err := tm.OpenJSON(clientIDStr, &client, token.PurposeClient); err != nil {
+		recordClientDenial(logger, "client_id_invalid", zap.Error(err))
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "invalid client_id")
 		return nil
 	}
 	if client.Typ != token.PurposeClient {
+		recordClientDenial(logger, "client_typ_mismatch")
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "invalid client_id")
 		return nil
 	}
 	if client.Audience != audience {
+		recordClientDenial(logger, "client_audience_mismatch", zap.String("internal_id", client.ID))
 		writeOAuthError(w, http.StatusBadRequest, "invalid_client", "client registered for a different audience")
 		return nil
 	}
-	if time.Now().After(client.ExpiresAt) {
+	if clientExpired(&client) {
+		recordClientDenial(logger, "client_registration_expired", zap.String("internal_id", client.ID), zap.Time("expired_at", client.ExpiresAt))
 		writeOAuthError(w, http.StatusBadRequest, "invalid_client", "client registration expired")
 		return nil
 	}

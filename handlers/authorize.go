@@ -103,28 +103,39 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 		// not receive an `error=` redirect — we'd be forwarding to whatever
 		// host an attacker chose. JSON 400 keeps these errors visible to
 		// the resource owner instead.
+		// Error shapes here differ from the /token path (invalid_client /
+		// invalid_request, not invalid_grant) per RFC 6749 §4.1.2.1, so
+		// the block stays inline rather than sharing openAndValidateClient;
+		// recordClientDenial keeps the metric+log observable (see its doc).
 		if clientIDStr == "" {
+			recordClientDenial(logger, "client_id_missing")
 			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "client_id is required")
 			return
 		}
 
 		var client sealedClient
 		if err := tm.OpenJSON(clientIDStr, &client, token.PurposeClient); err != nil {
+			recordClientDenial(logger, "client_id_invalid", zap.Error(err))
 			writeOAuthError(w, http.StatusBadRequest, "invalid_client", "unknown client_id")
 			return
 		}
 
 		if client.Typ != token.PurposeClient {
+			recordClientDenial(logger, "client_typ_mismatch")
 			writeOAuthError(w, http.StatusBadRequest, "invalid_client", "unknown client_id")
 			return
 		}
 
 		if client.Audience != baseURL {
+			recordClientDenial(logger, "client_audience_mismatch", zap.String("internal_id", client.ID))
 			writeOAuthError(w, http.StatusBadRequest, "invalid_client", "client registered for a different audience")
 			return
 		}
 
-		if time.Now().After(client.ExpiresAt) {
+		// clientExpired treats a zero ExpiresAt as never-expiring
+		// (CLIENT_REGISTRATION_TTL=0); shared with the /token path.
+		if clientExpired(&client) {
+			recordClientDenial(logger, "client_registration_expired", zap.String("internal_id", client.ID), zap.Time("expired_at", client.ExpiresAt))
 			writeOAuthError(w, http.StatusBadRequest, "invalid_client", "client registration expired")
 			return
 		}

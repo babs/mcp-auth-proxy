@@ -375,14 +375,21 @@ func Load() (*Config, error) {
 	// Hard cap at 90d — a longer envelope materially extends the
 	// window an exfiltrated client_id (which is unauthenticated
 	// metadata) can be reused.
+	//
+	// Set to 0 to disable expiry entirely (emits client_id_expires_at=0,
+	// "never expires" — mirroring RFC 7591 §3.2.1 client_secret_expires_at).
+	// Opt-in escape hatch for fleets whose MCP clients never re-run DCR
+	// on invalid_client (e.g. Azure APIM connectors) and would otherwise
+	// break on every TTL window. Trades away the reuse-window bound — see
+	// docs/runbooks/client-registration-expired.md.
 	c.ClientRegistrationTTL = 7 * 24 * time.Hour
 	if raw := os.Getenv("CLIENT_REGISTRATION_TTL"); raw != "" {
 		d, err := time.ParseDuration(raw)
 		if err != nil {
-			return nil, fmt.Errorf("CLIENT_REGISTRATION_TTL must be a Go duration (e.g. 168h, 24h, 720h): %w", err)
+			return nil, fmt.Errorf("CLIENT_REGISTRATION_TTL must be a Go duration (e.g. 168h, 24h, 720h, or 0 to never expire): %w", err)
 		}
-		if d <= 0 {
-			return nil, fmt.Errorf("CLIENT_REGISTRATION_TTL must be positive, got %s", d)
+		if d < 0 {
+			return nil, fmt.Errorf("CLIENT_REGISTRATION_TTL must not be negative (use 0 to never expire), got %s", d)
 		}
 		if d > 90*24*time.Hour {
 			return nil, fmt.Errorf("CLIENT_REGISTRATION_TTL exceeds 90d cap, got %s", d)

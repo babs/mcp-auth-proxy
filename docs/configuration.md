@@ -45,7 +45,7 @@ secure production posture (`PROD_MODE=true`); flags listed here as
 |---|---|---|
 | `TOKEN_SIGNING_SECRETS_PREVIOUS` | (empty) | Whitespace-separated retired signing secrets accepted on Open during a rolling rotation. New seals always use the primary `TOKEN_SIGNING_SECRET`; Open tries primary first, then each previous. See [`runbooks/key-rotation.md`](./runbooks/key-rotation.md). |
 | `REVOKE_BEFORE` | (empty) | RFC3339 timestamp. Bulk revocation cutoff: tokens with `iat` before this are rejected. Applies to access AND refresh tokens. |
-| `CLIENT_REGISTRATION_TTL` | `168h` (7d) | Lifetime of a sealed `client_id` minted by `POST /register`. Default matches the 7-day refresh-token TTL so a client holding a still-valid refresh can always exchange it; a shorter value silently kills long-running MCP clients (which treat DCR as one-shot at startup) the moment their access token first expires. Go duration syntax (`168h`, `720h`, …); capped at 90d. **Rolling-deploy note:** the TTL is sealed into each `client_id` at registration time, so bumping this env var only affects newly-issued client_ids — existing registrations stay on whatever TTL was in effect when they were minted. See [`runbooks/client-registration-expired.md`](./runbooks/client-registration-expired.md). |
+| `CLIENT_REGISTRATION_TTL` | `168h` (7d) | Lifetime of a sealed `client_id` minted by `POST /register`. Default matches the 7-day refresh-token TTL so a client holding a still-valid refresh can always exchange it; a shorter value silently kills long-running MCP clients (which treat DCR as one-shot at startup) the moment their access token first expires. Go duration syntax (`168h`, `720h`, …); capped at 90d. **Set to `0` to disable expiry entirely** (`client_id_expires_at=0`, "never expires" — mirroring RFC 7591 §3.2.1 `client_secret_expires_at`) — opt-in escape hatch for clients that never re-run DCR on `invalid_client` (e.g. Azure APIM connectors); trades away the reuse-window bound. **Rolling-deploy note:** the TTL is sealed into each `client_id` at registration time, so bumping this env var only affects newly-issued client_ids — existing registrations stay on whatever TTL was in effect when they were minted. See [`runbooks/client-registration-expired.md`](./runbooks/client-registration-expired.md). |
 
 ## Replay store (Redis)
 
@@ -158,6 +158,21 @@ sum(mcp_auth_consent_decisions_total{decision="approved"})
   - `state_missing` — `/authorize` without state in strict mode.
   - `refresh_family_revoked` / `refresh_concurrent_submit` —
     refresh-rotation outcomes.
+  - `client_id_missing` — `/authorize` received a request with no
+    `client_id`. (`/token` folds a missing `client_id` into its generic
+    `invalid_request` "missing required parameters", unmetered.)
+  - `client_id_invalid` — `/authorize` or `/token` could not decode
+    the sealed `client_id` (tampered, truncated, or wrong key).
+  - `client_typ_mismatch` — the blob decoded but is not a client
+    registration (sealed-type-confusion defense; should not fire
+    absent tampering).
+  - `client_audience_mismatch` — sealed `client_id` was issued for a
+    different proxy deployment (distinct from `audience_mismatch`,
+    which is the access-token binding).
+  - `client_registration_expired` — sealed `client_id` outlived
+    `CLIENT_REGISTRATION_TTL`. Sustained counts = a client that
+    never re-runs DCR; see
+    [`runbooks/client-registration-expired.md`](./runbooks/client-registration-expired.md).
 - `mcp_auth_replay_detected_total{kind}` — `code` / `refresh` /
   `consent` / `callback_state` replays caught by the Redis-backed
   store. The `consent` kind answers with a re-rendered consent page

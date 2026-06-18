@@ -565,12 +565,32 @@ func TestLoad_ClientRegistrationTTL_Custom(t *testing.T) {
 	}
 }
 
-func TestLoad_ClientRegistrationTTL_RejectsNonPositive(t *testing.T) {
+// 0 is the documented opt-in for "never expires" (client_id_expires_at=0),
+// not an error: it must load cleanly as a zero duration. Both the
+// bare "0" (the natural operator input the docs imply) and "0s" are
+// accepted by time.ParseDuration and must both reach the sentinel.
+func TestLoad_ClientRegistrationTTL_ZeroMeansNever(t *testing.T) {
+	for _, raw := range []string{"0", "0s"} {
+		t.Run(raw, func(t *testing.T) {
+			setAllRequired(t)
+			t.Setenv("CLIENT_REGISTRATION_TTL", raw)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cfg.ClientRegistrationTTL != 0 {
+				t.Errorf("ClientRegistrationTTL = %v, want 0 (never expires)", cfg.ClientRegistrationTTL)
+			}
+		})
+	}
+}
+
+func TestLoad_ClientRegistrationTTL_RejectsNegative(t *testing.T) {
 	setAllRequired(t)
-	t.Setenv("CLIENT_REGISTRATION_TTL", "0s")
+	t.Setenv("CLIENT_REGISTRATION_TTL", "-1h")
 	_, err := Load()
-	if err == nil || !strings.Contains(err.Error(), "positive") {
-		t.Fatalf("want positive rejection, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "negative") {
+		t.Fatalf("want negative rejection, got %v", err)
 	}
 }
 
