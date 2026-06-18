@@ -257,7 +257,7 @@ PKCE-only proxy: no client secrets are validated. `scopes_supported` is an expli
 - OAuth 2.1 §2.3.1: each `redirect_uri` must use HTTPS, or HTTP when pointing at a loopback host. Loopback is recognized via `net.ParseIP().IsLoopback()` (covers the full 127/8 range, `::1`, `::ffff:127.0.0.1`, `::0.0.0.1`) plus the literal `localhost` / `localhost.`. Non-http(s) schemes (e.g. `ftp://`, `ldap://`, `file://`, custom app schemes) are rejected unconditionally even when the host is loopback
 - Generate an internal UUID for the client
 - Encrypt the whole `{ id, redirect_uris, client_name, expires_at }` with AES-GCM → this is the returned `client_id`
-- TTL embedded in the encrypted blob: 7d default, configurable via `CLIENT_REGISTRATION_TTL` (Go duration, capped at 90d). The 7d default matches `refreshTokenTTL` so a client holding a still-valid refresh token can always exchange it — a shorter TTL silently kills long-running MCP clients (which treat DCR as one-shot at startup) the moment their access token first expires.
+- TTL embedded in the encrypted blob: 7d default, configurable via `CLIENT_REGISTRATION_TTL` (Go duration, capped at 90d; `0` = never expires, sealing a zero `expires_at`). The 7d default matches `refreshTokenTTL` so a client holding a still-valid refresh token can always exchange it — a shorter TTL silently kills long-running MCP clients (which treat DCR as one-shot at startup) the moment their access token first expires. `0` is the opt-in escape hatch for clients that never re-run DCR on `invalid_client` (e.g. Azure APIM connectors); it trades away the reuse-window bound on an exfiltrated `client_id`.
 - Request body limited to 1 MB (`MaxBytesReader`)
 
 **Response 201 JSON:**
@@ -274,7 +274,7 @@ Headers: `Cache-Control: no-store`, `Pragma: no-cache`.
 }
 ```
 
-`client_id_expires_at` (RFC 7591 §3.2.1) is the UNIX timestamp at which the sealed `client_id` stops opening (default `client_id_issued_at + 7d`, configurable via `CLIENT_REGISTRATION_TTL`). Clients that cache the handle should re-register before this time to avoid a 400 on `/authorize` and on `/token` refresh-token rotations.
+`client_id_expires_at` (an RFC 7591 extension field — the spec defines `client_secret_expires_at`, not `client_id_expires_at`) is the UNIX timestamp at which the sealed `client_id` stops opening (default `client_id_issued_at + 7d`, configurable via `CLIENT_REGISTRATION_TTL`). Clients that cache the handle should re-register before this time to avoid a 400 on `/authorize` and on `/token` refresh-token rotations. When `CLIENT_REGISTRATION_TTL=0`, `client_id_expires_at` is emitted as `0` ("never expires", mirroring RFC 7591 §3.2.1 `client_secret_expires_at`) and the expiry check is skipped on every validation path.
 
 Error responses use RFC 7591 §3.2.2 codes: `invalid_redirect_uri` for any redirect_uri-shape defect (missing, over-count, over-length, malformed, opaque, hostless, fragment-bearing, userinfo-bearing, or non-https-non-loopback); `invalid_client_metadata` for unsupported `token_endpoint_auth_method`, over-length `client_name`, or `client_name` containing control bytes (NUL/CR/LF/TAB) or the X-User-Groups delimiter `,` (the field is sealed into the returned `client_id` and emitted to logs; raw control bytes would smuggle past zap's JSON-escaping when downstream code unsealed and parsed it); `invalid_request` for structural problems: 400 with `"invalid JSON body"` for a malformed body, 413 with `"request body exceeds the 1 MB cap"` when the body crosses `MaxBytesReader`.
 

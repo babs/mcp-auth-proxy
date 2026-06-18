@@ -183,7 +183,7 @@ alone remain replayable within their TTL.
 
 | Flow state | Encrypted into | TTL |
 |---|---|---|
-| Client registration | `client_id` | 7d (configurable via `CLIENT_REGISTRATION_TTL`) |
+| Client registration | `client_id` | 7d (configurable via `CLIENT_REGISTRATION_TTL`; `0` = never expires) |
 | Authorize session | IdP `state` parameter | 10min |
 | Authorization code | `code` parameter | 60s |
 | Access token | Opaque bearer | 1h |

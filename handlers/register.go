@@ -44,11 +44,13 @@ type registerResponse struct {
 	ClientID         string `json:"client_id"`
 	ClientIDIssuedAt int64  `json:"client_id_issued_at"`
 	// ClientIDExpiresAt is the UNIX timestamp at which the sealed
-	// client_id stops opening (RFC 7591 §3.2.1 OPTIONAL). Published
-	// so clients can proactively re-register before hitting a 400 on
-	// /authorize once the sealed TTL lapses (default 24h, see
-	// clientTTL). Value of 0 per §3.2.1 would mean "never expires";
-	// we always emit a real timestamp.
+	// client_id stops opening. It is an RFC 7591 extension field (the
+	// spec defines client_secret_expires_at, not client_id_expires_at);
+	// we publish it so clients can proactively re-register before hitting
+	// a 400 on /authorize once the sealed TTL lapses (default 7d, see
+	// clientTTL). Emitted as 0 ("never expires", mirroring §3.2.1
+	// client_secret_expires_at) when the operator sets
+	// CLIENT_REGISTRATION_TTL=0.
 	ClientIDExpiresAt int64    `json:"client_id_expires_at"`
 	RedirectURIs      []string `json:"redirect_uris"`
 	// ClientName is echoed only when the client actually submitted
@@ -201,13 +203,22 @@ func Register(tm *token.Manager, logger *zap.Logger, audience string, clientTTL 
 		}
 
 		now := time.Now()
+		// clientTTL of 0 means "never expires" (CLIENT_REGISTRATION_TTL=0;
+		// config rejects negatives, so 0 is the only non-positive value
+		// that reaches here): seal the zero time so the validation paths
+		// (openAndValidateClient / authorize) skip the expiry check, and
+		// emit client_id_expires_at=0 below.
+		var expiresAt time.Time
+		if clientTTL > 0 {
+			expiresAt = now.Add(clientTTL)
+		}
 		sc := sealedClient{
 			ID:           uuid.New().String(),
 			RedirectURIs: req.RedirectURIs,
 			ClientName:   req.ClientName,
 			Typ:          token.PurposeClient,
 			Audience:     audience,
-			ExpiresAt:    now.Add(clientTTL),
+			ExpiresAt:    expiresAt,
 		}
 
 		clientID, err := tm.SealJSON(sc, token.PurposeClient)
@@ -221,14 +232,21 @@ func Register(tm *token.Manager, logger *zap.Logger, audience string, clientTTL 
 		logger.Info("client_registered", zap.String("internal_id", sc.ID), zap.String("client_name", req.ClientName))
 
 		// RFC 7591 examples mark client information responses non-cacheable.
-		// Our client_id is a 24h bearer-like registration handle, so keep it
+		// Our client_id is a bearer-like registration handle (7d default
+		// TTL, or non-expiring when CLIENT_REGISTRATION_TTL=0), so keep it
 		// out of shared caches even though POST responses are rarely cached.
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Pragma", "no-cache")
+		// 0 = never expires; zero time must not be rendered via .Unix()
+		// (which yields a large negative epoch).
+		var clientIDExpiresAt int64
+		if !sc.ExpiresAt.IsZero() {
+			clientIDExpiresAt = sc.ExpiresAt.Unix()
+		}
 		writeJSON(w, http.StatusCreated, registerResponse{
 			ClientID:                clientID,
 			ClientIDIssuedAt:        now.Unix(),
-			ClientIDExpiresAt:       sc.ExpiresAt.Unix(),
+			ClientIDExpiresAt:       clientIDExpiresAt,
 			RedirectURIs:            req.RedirectURIs,
 			ClientName:              req.ClientName,
 			TokenEndpointAuthMethod: authMethod,

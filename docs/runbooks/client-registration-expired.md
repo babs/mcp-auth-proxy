@@ -14,13 +14,30 @@ re-register and the user sees the error directly.
 
 ## Signals
 
-- Per-client log line: `client_registration_expired`
-  (`handlers/helpers.go`, fired by `openAndValidateClient`).
-- Counter: `mcp_auth_access_denied_total{reason="invalid_client"}`
-  with `error_description="client registration expired"` in the
-  log line that accompanies it.
+- Counter: `mcp_auth_access_denied_total{reason="client_registration_expired"}`
+  — incremented on every rejection by both `/authorize` and
+  `/token` (`handlers/authorize.go`, `handlers/helpers.go`
+  `openAndValidateClient`). A tight, sustained rise = a stuck
+  client (e.g. an Azure APIM connector) looping on the 400 instead
+  of re-running DCR.
+- Log line: `access_denied_client_registration_expired` at WARN with
+  the client's `internal_id` and `expired_at` (same `access_denied_*`
+  family as every other denial — catchable by a `level>=warn` or
+  `event=~"access_denied_.*"` filter).
+- HTTP access log: repeated `GET /authorize` (and/or `POST
+  /token`) at **status 400** with a **77-byte** response body —
+  the 76-byte JSON
+  `{"error":"invalid_client","error_description":"client registration expired"}`
+  plus the encoder's trailing newline (`resp_bytes=77` on the wire).
 - User report: "MCP server stopped working after a few days of
   uptime, restart fixes it."
+
+> **Log volume:** the `access_denied_*` WARN lines are volume-bounded
+> by the default per-IP rate limiting plus zap's production sampling.
+> A stuck single-client storm is capped well before it reaches the
+> handler. If you run with `RATE_LIMIT_ENABLED=false` **and** the dev
+> (TTY) logger config (no sampling), an attacker- or bug-driven
+> rejection loop logs unbounded — keep rate limiting on in production.
 
 ## Why it happens
 
@@ -33,6 +50,19 @@ rejects with `invalid_client: client registration expired`.
 The lifetime is the `CLIENT_REGISTRATION_TTL` env var, default
 **7 days** (matches `refreshTokenTTL` so a client holding a
 still-valid refresh can always exchange it). Cap is 90 days.
+Setting it to **`0`** disables expiry entirely (never expires).
+
+## Known client-side root cause
+
+This is the server-side symptom of a widespread MCP client bug:
+the client caches its DCR `client_id` and **does not re-run DCR
+when it gets `invalid_client`**. The proxy is spec-correct — it
+advertises `client_id_expires_at` (an RFC 7591 extension field) and
+rejects a lapsed handle — but most clients ignore the field and never
+re-register. Notably **Azure APIM-backed connectors** loop on the
+400 indefinitely instead of reconnecting. Tracked across Claude
+Code, Cursor, LibreChat, et al. The MCP spec is itself moving away
+from DCR toward URL-based client IDs to retire this failure mode.
 
 ## Response
 
@@ -57,7 +87,16 @@ suggests they should:
    actual cause may be the token cutoff. Logs disambiguate.
 3. **Lengthen the TTL** for long-running deployments by setting
    `CLIENT_REGISTRATION_TTL=720h` (30d) or up to the 90d cap.
-4. **Consider Option 4** (auto-extend `client_id` on each
+4. **Disable expiry** with `CLIENT_REGISTRATION_TTL=0` when the
+   client provably never re-registers (e.g. Azure APIM connectors
+   that loop on the 400). This emits `client_id_expires_at=0` and
+   skips the expiry check on every validation path. It is the
+   correct fix when the alternative is a permanently-broken
+   connector — at the cost of the reuse-window bound below.
+   Reversible: unset the env var to restore the 7d default (only
+   newly-issued client_ids are affected, per the rolling-deploy
+   note).
+5. **Consider Option 4** (auto-extend `client_id` on each
    `/token` use) — see `misc/next-steps.md`. Not yet
    implemented as of this writing.
 
@@ -76,11 +115,20 @@ no matter what the env var says now. Plan accordingly:
 
 ## What NOT to do
 
-- **Don't disable `CLIENT_REGISTRATION_TTL` checks.** The TTL
-  bounds the residual reach of an exfiltrated `client_id`
+- **Don't reach for `CLIENT_REGISTRATION_TTL=0` by default.** The
+  TTL bounds the residual reach of an exfiltrated `client_id`
   (which is unauthenticated metadata sent in the clear on
-  `/authorize`). A 0 or near-infinite value silently extends
-  that window.
+  `/authorize`). `0` removes that bound — a leaked `client_id`
+  stays openable forever. It is a deliberate opt-in (see Response
+  step 4), justified only when a client provably never
+  re-registers; reserve it for that case rather than as a blanket
+  fix. Note a leaked `client_id` alone grants nothing: a full
+  OAuth flow with IdP consent is still required. Under `0` the only
+  per-`client_id` revocation lever is rotating `TOKEN_SIGNING_SECRET`,
+  which invalidates **every** sealed blob fleet-wide (all clients,
+  codes, and refresh tokens) — there is no per-client deny-list, so
+  losing the TTL backstop means a single bad client can only be
+  evicted with a fleet-wide rotation.
 - **Don't try to extend an existing `client_id` server-side.**
   The sealed payload is immutable. The only way to extend is
   re-issuing a fresh `client_id`.

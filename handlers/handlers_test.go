@@ -262,8 +262,8 @@ func TestRegister_Success(t *testing.T) {
 	if resp.ClientIDIssuedAt == 0 {
 		t.Error("client_id_issued_at should be non-zero")
 	}
-	// RFC 7591 §3.2.1 OPTIONAL `client_id_expires_at` — surfaced so
-	// clients know when the sealed handle stops opening (default 24h).
+	// `client_id_expires_at` (RFC 7591 extension field) — surfaced so
+	// clients know when the sealed handle stops opening (default 7d).
 	if resp.ClientIDExpiresAt <= resp.ClientIDIssuedAt {
 		t.Errorf("client_id_expires_at=%d must be > client_id_issued_at=%d",
 			resp.ClientIDExpiresAt, resp.ClientIDIssuedAt)
@@ -290,6 +290,95 @@ func TestRegister_Success(t *testing.T) {
 	}
 	if sc.ID == "" {
 		t.Error("sealed client should have a non-empty internal ID")
+	}
+}
+
+// CLIENT_REGISTRATION_TTL=0 is the opt-in for non-expiring client_ids:
+// the response must carry client_id_expires_at=0,
+// the sealed ExpiresAt must be the zero time, and the shared validator
+// (openAndValidateClient, used by both /token grants and mirrored by
+// /authorize) must NOT reject it as "client registration expired".
+func TestRegister_NeverExpires(t *testing.T) {
+	tm := newTestTokenManager(t)
+	body := `{"redirect_uris":["https://app.example.com/callback"],"client_name":"forever-app"}`
+
+	req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+
+	// clientTTL = 0 → never expires.
+	Register(tm, zap.NewNop(), testBaseURL, 0)(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp registerResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.ClientIDExpiresAt != 0 {
+		t.Errorf("client_id_expires_at = %d, want 0 (never expires)", resp.ClientIDExpiresAt)
+	}
+
+	var sc sealedClient
+	if err := tm.OpenJSON(resp.ClientID, &sc, token.PurposeClient); err != nil {
+		t.Fatalf("client_id is not a valid sealed client: %v", err)
+	}
+	if !sc.ExpiresAt.IsZero() {
+		t.Errorf("sealed ExpiresAt = %v, want zero time (never expires)", sc.ExpiresAt)
+	}
+
+	// The expiry guard must let a zero-ExpiresAt client through even
+	// though time.Now() is "after" the zero time.
+	vr := httptest.NewRecorder()
+	if got := openAndValidateClient(vr, tm, zap.NewNop(), resp.ClientID, testBaseURL); got == nil {
+		t.Fatalf("non-expiring client_id rejected: %d %s", vr.Code, vr.Body.String())
+	}
+}
+
+// Pins the AccessDenied{reason} increment for every client-validation
+// rejection on the shared /token-grant validator. A stuck client
+// looping on the 400 is invisible without the metric. The wrong-purpose
+// branch is the type-confusion defense (its own label, not folded into
+// client_id_invalid), so its observability matters most.
+func TestOpenAndValidateClient_RejectionMetrics(t *testing.T) {
+	tm := newTestTokenManager(t)
+	cb := []string{"https://app.example.com/callback"}
+	seal := func(sc sealedClient) string {
+		id, err := tm.SealJSON(sc, token.PurposeClient)
+		if err != nil {
+			t.Fatalf("SealJSON: %v", err)
+		}
+		return id
+	}
+	future := time.Now().Add(time.Hour)
+	past := time.Now().Add(-time.Hour)
+
+	cases := []struct {
+		name     string
+		clientID string
+		reason   string
+	}{
+		{"undecodable", "not-a-sealed-blob", "client_id_invalid"},
+		{"wrong_typ", seal(sealedClient{ID: "x", Typ: token.PurposeCode, Audience: testBaseURL, RedirectURIs: cb, ExpiresAt: future}), "client_typ_mismatch"},
+		{"audience", seal(sealedClient{ID: "x", Typ: token.PurposeClient, Audience: "https://other.example", RedirectURIs: cb, ExpiresAt: future}), "client_audience_mismatch"},
+		{"expired", seal(sealedClient{ID: "x", Typ: token.PurposeClient, Audience: testBaseURL, RedirectURIs: cb, ExpiresAt: past}), "client_registration_expired"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			before := testutil.ToFloat64(metrics.AccessDenied.WithLabelValues(tc.reason))
+			rr := httptest.NewRecorder()
+			if got := openAndValidateClient(rr, tm, zap.NewNop(), tc.clientID, testBaseURL); got != nil {
+				t.Fatal("expected rejection (nil), got a client")
+			}
+			if rr.Code != http.StatusBadRequest {
+				t.Errorf("status = %d, want 400", rr.Code)
+			}
+			if after := testutil.ToFloat64(metrics.AccessDenied.WithLabelValues(tc.reason)); after-before != 1 {
+				t.Errorf("AccessDenied{%s} delta = %v, want 1", tc.reason, after-before)
+			}
+		})
 	}
 }
 
@@ -741,6 +830,9 @@ func TestAuthorize_ExpiredClient(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/authorize?"+params.Encode(), nil)
 	rr := httptest.NewRecorder()
 
+	// Pin the metric on the /authorize path too: the guard here is a
+	// twin of openAndValidateClient and must stay observable.
+	before := testutil.ToFloat64(metrics.AccessDenied.WithLabelValues("client_registration_expired"))
 	Authorize(tm, logger, testBaseURL, testOAuth2Config(), AuthorizeConfig{PKCERequired: true})(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
@@ -753,6 +845,100 @@ func TestAuthorize_ExpiredClient(t *testing.T) {
 	}
 	if oauthErr.Error != "invalid_client" {
 		t.Errorf("expected error 'invalid_client', got %q", oauthErr.Error)
+	}
+	if after := testutil.ToFloat64(metrics.AccessDenied.WithLabelValues("client_registration_expired")); after-before != 1 {
+		t.Errorf("AccessDenied{client_registration_expired} delta = %v, want 1", after-before)
+	}
+}
+
+// The /authorize never-expire (zero ExpiresAt) branch is a twin of the
+// openAndValidateClient guard; without this test, inverting or dropping
+// the !IsZero() short-circuit in authorize.go would reject every
+// non-expiring client_id at /authorize and no test would fail.
+func TestAuthorize_NeverExpires(t *testing.T) {
+	tm := newTestTokenManager(t)
+	redirectURI := "https://app.example.com/callback"
+	// Zero ExpiresAt = never expires (CLIENT_REGISTRATION_TTL=0).
+	encClientID, err := tm.SealJSON(sealedClient{
+		ID:           "never-expires-authz",
+		RedirectURIs: []string{redirectURI},
+		ClientName:   "forever",
+		Typ:          token.PurposeClient,
+		Audience:     testBaseURL,
+	}, token.PurposeClient)
+	if err != nil {
+		t.Fatalf("SealJSON: %v", err)
+	}
+
+	params := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {encClientID},
+		"redirect_uri":          {redirectURI},
+		"code_challenge":        {pkceChallenge("verifier")},
+		"code_challenge_method": {"S256"},
+		"state":                 {"user-state-123"},
+	}
+	req := httptest.NewRequest(http.MethodGet, "/authorize?"+params.Encode(), nil)
+	rr := httptest.NewRecorder()
+
+	Authorize(tm, zap.NewNop(), testBaseURL, testOAuth2Config(), AuthorizeConfig{PKCERequired: true})(rr, req)
+
+	if rr.Code != http.StatusFound {
+		t.Fatalf("non-expiring client_id rejected at /authorize: expected 302, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// Pins the AccessDenied{reason} increment for every client-validation
+// rejection on the /authorize path. The feature's purpose is
+// observability; a silent rejection here is a regression.
+func TestAuthorize_ClientValidation_EmitsMetric(t *testing.T) {
+	tm := newTestTokenManager(t)
+	redirectURI := "https://app.example.com/callback"
+	seal := func(sc sealedClient) string {
+		id, err := tm.SealJSON(sc, token.PurposeClient)
+		if err != nil {
+			t.Fatalf("SealJSON: %v", err)
+		}
+		return id
+	}
+	future := time.Now().Add(time.Hour)
+
+	cases := []struct {
+		name     string
+		clientID string // empty → omit param entirely
+		reason   string
+	}{
+		{"missing", "", "client_id_missing"},
+		{"undecodable", "not-a-sealed-blob", "client_id_invalid"},
+		{"wrong_typ", seal(sealedClient{ID: "x", Typ: token.PurposeCode, Audience: testBaseURL, RedirectURIs: []string{redirectURI}, ExpiresAt: future}), "client_typ_mismatch"},
+		{"audience", seal(sealedClient{ID: "x", Typ: token.PurposeClient, Audience: "https://other.example", RedirectURIs: []string{redirectURI}, ExpiresAt: future}), "client_audience_mismatch"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			params := url.Values{
+				"response_type":         {"code"},
+				"redirect_uri":          {redirectURI},
+				"code_challenge":        {pkceChallenge("verifier")},
+				"code_challenge_method": {"S256"},
+				"state":                 {"s"},
+			}
+			if tc.clientID != "" {
+				params.Set("client_id", tc.clientID)
+			}
+			req := httptest.NewRequest(http.MethodGet, "/authorize?"+params.Encode(), nil)
+			rr := httptest.NewRecorder()
+
+			before := testutil.ToFloat64(metrics.AccessDenied.WithLabelValues(tc.reason))
+			Authorize(tm, zap.NewNop(), testBaseURL, testOAuth2Config(), AuthorizeConfig{PKCERequired: true})(rr, req)
+
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
+			}
+			if after := testutil.ToFloat64(metrics.AccessDenied.WithLabelValues(tc.reason)); after-before != 1 {
+				t.Errorf("AccessDenied{%s} delta = %v, want 1", tc.reason, after-before)
+			}
+		})
 	}
 }
 

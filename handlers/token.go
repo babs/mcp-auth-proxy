@@ -165,7 +165,7 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 		return
 	}
 
-	client := openAndValidateClient(w, tm, clientIDStr, audience)
+	client := openAndValidateClient(w, tm, logger, clientIDStr, audience)
 	if client == nil {
 		return
 	}
@@ -395,7 +395,7 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 		return
 	}
 
-	client := openAndValidateClient(w, tm, clientIDStr, audience)
+	client := openAndValidateClient(w, tm, logger, clientIDStr, audience)
 	if client == nil {
 		return
 	}
