@@ -2,8 +2,9 @@
 # Not intended for production: no non-root user, no hardened base image.
 FROM python:3.12-slim
 
-# Pin a version range so the streamable-http transport is available.
-RUN pip install --no-cache-dir "mcp[cli]>=1.9.0"
+# >=1.9.0 for the streamable-http transport; <2 because mcp 2.0.0
+# removes the mcp.server.fastmcp module server.py imports.
+RUN pip install --no-cache-dir "mcp[cli]>=1.9.0,<2"
 
 WORKDIR /app
 COPY server.py .
