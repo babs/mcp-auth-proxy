@@ -62,7 +62,7 @@ already wired up, see [Demo stack](#demo-stack).
 - **Public HTTPS** terminating at an ingress that reaches the proxy's
   `LISTEN_ADDR` (`:8080` by default). The IdP and the MCP clients both
   see `PROXY_BASE_URL` over the public network.
-- **Go 1.26+** if building from source. Container images are static
+- **Go 1.26.5+** (matches `go.mod`) if building from source. Container images are static
   (`CGO_ENABLED=0`).
 - **Kubernetes**: any conformant cluster. Sample manifests under
   [`manifests/`](./manifests). Production overlay enforces the safe
