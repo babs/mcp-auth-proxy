@@ -87,6 +87,7 @@ func main() {
 		zap.Bool("render_consent_page", cfg.RenderConsentPage),
 		zap.Int64("per_subject_concurrency", cfg.PerSubjectConcurrency),
 		zap.String("groups_claim", cfg.GroupsClaim),
+		zap.Int("groups_claim_max_bytes", cfg.GroupsClaimMaxBytes),
 		zap.Bool("allowed_groups_set", len(cfg.AllowedGroups) > 0),
 		zap.Bool("revoke_before_set", !cfg.RevokeBefore.IsZero()),
 		zap.Bool("upstream_authorization_set", cfg.UpstreamAuthorization != ""),
@@ -146,6 +147,7 @@ func main() {
 	// the warning even when fleet-wide cumulative seals do; the metric
 	// closes that gap via increase(metric[window]).
 	tm.SetLogger(logger)
+	tm.SetGroupsMaxBytes(cfg.GroupsClaimMaxBytes)
 	tm.SetSealMetric(func(purpose string) {
 		metrics.TokenSeals.WithLabelValues(purpose).Inc()
 	})

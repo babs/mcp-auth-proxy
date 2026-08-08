@@ -56,6 +56,7 @@ secure production posture (`PROD_MODE=true`); flags listed here as
 | `REDIS_KEY_PREFIX` | `mcp-auth-proxy:` | Key prefix for shared Redis. Set to empty to opt out of namespacing. |
 | `REFRESH_RACE_GRACE_SEC` | `2` | Grace window in seconds during which a refresh-rotation collision is treated as a benign concurrent submit (parallel-tab refresh, slow-network double-submit) and returns 429 `refresh_concurrent_submit` without revoking the family. Outside the window every collision still revokes. Range `[0, 10]`; `0` disables. The 10s ceiling is a security cap — wider windows are statistically attacker-shaped. |
 | `IDP_EXCHANGE_RATE_PER_SEC` | (disabled) | Cap on outbound proxy → IdP token-endpoint requests at `/callback`. Defense in depth: a flood of `/callback` hits that slips past the per-IP limiter (distributed sources, permissive XFF trust matrix) is bounded by this token bucket before reaching the IdP. Denied requests get 503 `temporarily_unavailable` + `error_code=idp_exchange_throttled` + `Retry-After` (2-4s, jittered so N replicas' rejected callers do not re-converge on one instant). Set to a positive number (e.g. `20`) to enable. **Per-replica scope:** an `N`-replica deployment admits up to `N × IDP_EXCHANGE_RATE_PER_SEC` to the IdP — divide your IdP-side ceiling by replica count. |
+| `GROUPS_CLAIM_MAX_BYTES` | `8192` | Byte budget for the `groups` claim sealed into an access token; the excess is dropped at mint time. Range `[1024, 10240]`. The ceiling is measured, not chosen: the seal expands the claim ~1.37x, so 12 KB of groups mints a 17 KB `Authorization` header that cannot fit the 16 KB block and 431s before any middleware runs. Raise it only if your directory uses long DNs **and** your MCP clients send few other headers; watch `mcp_auth_groups_claim_truncated_total`. |
 | `IDP_EXCHANGE_BURST` | `50` | Burst size for the IdP-exchange limiter when `IDP_EXCHANGE_RATE_PER_SEC > 0`. Higher burst absorbs a short spike (e.g. a deploy-time reconnect storm) without 503s; lower burst keeps the ceiling tighter. Ignored when `IDP_EXCHANGE_RATE_PER_SEC` is unset/zero. |
 
 ## Limits
@@ -67,6 +68,7 @@ meets in an incident.
 | --- | --- | --- |
 | Request headers (both listeners) | 16 KB total | `431 Request Header Fields Too Large`, answered by net/http **before** any middleware — so it appears in no access log and no metric |
 | Request body (POST endpoints) | 1 MB | `413` + `error_code=consent_body_too_large` on `/consent`; `invalid_request` elsewhere |
+| `groups` claim inside an access token | 8 KB default, `GROUPS_CLAIM_MAX_BYTES` | Truncated at mint time, keeping the user's own token inside the 16 KB header budget. At 8 KB that is ~73 long AD DNs, ~130 typical ones, ~221 Entra GUIDs or ~546 short names — the count depends on your directory's naming scheme, which is why it is tunable. **Authorization-visible:** the claim is forwarded upstream as `X-User-Groups`, and `ALLOWED_GROUPS` was already checked against the full list, so a truncated user passes this proxy and may still be refused by the MCP server. Non-zero `mcp_auth_groups_claim_truncated_total` warrants investigation; the `groups_claim_truncated` WARN names the subject |
 
 ## Rate limiting and proxy headers
 
@@ -214,6 +216,11 @@ instead of a rendered error).
   consent page and the interstitial fall back to the client's
   `redirect_uri` envelope. Zero in a healthy deploy; any increment is a
   template regression.
+- `mcp_auth_groups_claim_truncated_total` — access tokens minted with a
+  truncated `groups` claim (`GROUPS_CLAIM_MAX_BYTES`, see Limits). Authorization-visible: the
+  claim is forwarded upstream as `X-User-Groups`, so a truncated user
+  can pass `ALLOWED_GROUPS` here and still be refused by the MCP
+  server. The `groups_claim_truncated` WARN names the subject.
 - `mcp_auth_replay_detected_total{kind}` — `code` / `refresh` /
   `consent` / `callback_state` replays caught by the Redis-backed
   store. The `consent` kind answers with a re-rendered consent page

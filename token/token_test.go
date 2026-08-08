@@ -1,6 +1,7 @@
 package token
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -472,5 +473,41 @@ func TestNewManagerWithRotation_ShortSecretRejected(t *testing.T) {
 	short := make([]byte, 31)
 	if _, err := NewManagerWithRotation(primary, short); err == nil {
 		t.Fatal("31-byte secondary must be rejected")
+	}
+}
+
+// A group-heavy user must never mint a token their own requests cannot
+// carry: MaxHeaderBytes (main.go) caps the header block at 16 KB, and a
+// 431 is answered by net/http before any middleware, so it lands in no
+// access log and no metric. The cap turns that invisible per-user
+// outage into a bounded token.
+func TestIssue_CapsGroupsToHeaderBudget(t *testing.T) {
+	tm, err := NewManager([]byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mk := func(n int) []string {
+		g := make([]string, n)
+		for i := range g {
+			g[i] = fmt.Sprintf("CN=app-team-engineering-group-%03d,OU=Groups,DC=corp,DC=example", i)
+		}
+		return g
+	}
+	const headerBudget = 16 << 10
+	for _, n := range []int{0, 10, 60, 250, 2000} {
+		at, claims, err := tm.Issue("https://proxy.example", "sub", "user@example.com", "cid", mk(n), time.Hour, "https://proxy.example/mcp")
+		if err != nil {
+			t.Fatalf("groups=%d: %v", n, err)
+		}
+		line := len("Authorization: Bearer ") + len(at)
+		if line > headerBudget {
+			t.Errorf("groups=%d: Authorization header line = %d B, over the %d B server budget", n, line, headerBudget)
+		}
+		if n <= 120 && len(claims.Groups) != n {
+			t.Errorf("groups=%d: kept %d — a list inside the budget must not be truncated", n, len(claims.Groups))
+		}
+		if n == 2000 && len(claims.Groups) >= n {
+			t.Errorf("groups=%d: nothing was truncated", n)
+		}
 	}
 }

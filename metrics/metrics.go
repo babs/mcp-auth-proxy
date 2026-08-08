@@ -105,6 +105,15 @@ var (
 		Help: "Proxy-rendered page template execute failures, by page.",
 	}, []string{"page"})
 
+	// GroupsClaimTruncated counts access tokens minted with a truncated
+	// groups claim (token.maxGroupsBytes). Non-zero means some user's
+	// group list no longer fits a token their own requests can carry —
+	// investigate before it becomes an authorization surprise.
+	GroupsClaimTruncated = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "mcp_auth_groups_claim_truncated_total",
+		Help: "Access tokens minted with a truncated groups claim.",
+	})
+
 	// RateLimited counts requests that were throttled at the pre-auth
 	// httprate layer. Labelled by endpoint.
 	RateLimited = promauto.NewCounterVec(prometheus.CounterOpts{

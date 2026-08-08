@@ -4,6 +4,11 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
+	"fmt"
+	"github.com/babs/mcp-auth-proxy/token"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -1958,4 +1963,117 @@ func TestLoad_OIDCIssuerURL_RejectsCleartextAndHostless(t *testing.T) {
 			}
 		})
 	}
+}
+
+// GROUPS_CLAIM_MAX_BYTES is operator-tunable but bounded at both ends:
+// the ceiling is measured (TestGroupsCeilingFitsHeaderBudget), and the
+// floor stops a typo truncating every user's groups to nothing.
+func TestLoad_GroupsClaimMaxBytes(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		want    int
+		wantErr string
+	}{
+		{"default when unset", "", token.DefaultGroupsMaxBytes, ""},
+		{"accepted mid-range", "6144", 6144, ""},
+		{"accepted at floor", "1024", 1024, ""},
+		{"accepted at ceiling", "10240", 10240, ""},
+		{"below floor rejected", "512", 0, "must be >= 1024"},
+		{"above ceiling rejected", "12288", 0, "must be <= 10240"},
+		{"non-integer rejected", "8k", 0, "must be an integer"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setAllRequired(t)
+			if tc.raw != "" {
+				t.Setenv("GROUPS_CLAIM_MAX_BYTES", tc.raw)
+			}
+			cfg, err := Load()
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("GROUPS_CLAIM_MAX_BYTES=%q should fail startup", tc.raw)
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Errorf("error should contain %q, got %q", tc.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cfg.GroupsClaimMaxBytes != tc.want {
+				t.Errorf("GroupsClaimMaxBytes = %d, want %d", cfg.GroupsClaimMaxBytes, tc.want)
+			}
+		})
+	}
+}
+
+// The GROUPS_CLAIM_MAX_BYTES ceiling exists so a budget the config
+// accepts still mints a token that fits the server's header block. Both
+// bounds are DERIVED here, never restated: an earlier version of this
+// test carried its own copy of the ceiling and stayed green when the
+// real one moved, which is the exact failure it was written to prevent.
+func TestGroupsCeilingFitsHeaderBudget(t *testing.T) {
+	// Ceiling: probe what Load() actually accepts.
+	accepted := func(n int) bool {
+		setAllRequired(t)
+		t.Setenv("GROUPS_CLAIM_MAX_BYTES", strconv.Itoa(n))
+		_, err := Load()
+		return err == nil
+	}
+	lo, hi := 1024, 64<<10
+	if !accepted(lo) {
+		t.Fatalf("the documented floor %d is rejected — this test cannot find the ceiling", lo)
+	}
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		if accepted(mid) {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	ceiling := lo
+
+	// Header budget: read it from the server main actually builds.
+	src, err := os.ReadFile(filepath.Join("..", "main.go"))
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	m := regexp.MustCompile(`MaxHeaderBytes:\s+(\d+)\s*<<\s*(\d+)`).FindSubmatch(src)
+	if m == nil {
+		t.Fatal("no MaxHeaderBytes shift literal in main.go — this test went blind")
+	}
+	base, _ := strconv.Atoi(string(m[1]))
+	shift, _ := strconv.Atoi(string(m[2]))
+	maxHeaderBytes := base << shift
+
+	// Room the rest of a request's headers need beside the bearer token.
+	const otherHeaders = 1 << 10
+
+	tm, err := token.NewManager([]byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tm.SetGroupsMaxBytes(ceiling)
+	var groups []string
+	for total := 0; ; {
+		g := fmt.Sprintf("CN=application-platform-engineering-team-members-%04d,OU=Security Groups,OU=Corporate,DC=corp,DC=example,DC=com", len(groups))
+		if total+len(g)+1 > ceiling {
+			break
+		}
+		groups = append(groups, g)
+		total += len(g) + 1
+	}
+	at, _, err := tm.Issue("https://proxy.example", "subject-1234", "user@example.com", "client-uuid", groups, time.Hour, "https://proxy.example/mcp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := len("Authorization: Bearer ") + len(at)
+	if line+otherHeaders > maxHeaderBytes {
+		t.Errorf("at the config ceiling (%d B of groups) the Authorization header is %d B; with %d B for other headers that exceeds MaxHeaderBytes %d — lower the ceiling in config.go or raise MaxHeaderBytes in main.go",
+			ceiling, line, otherHeaders, maxHeaderBytes)
+	}
+	t.Logf("derived ceiling %d B, derived MaxHeaderBytes %d B -> Authorization %d B, %d B spare", ceiling, maxHeaderBytes, line, maxHeaderBytes-line)
 }

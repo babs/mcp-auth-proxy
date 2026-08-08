@@ -15,6 +15,8 @@ import (
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
+
+	"github.com/babs/mcp-auth-proxy/metrics"
 )
 
 // ErrTokenExpired is returned by Validate when the bearer's
@@ -94,6 +96,57 @@ type Claims struct {
 	ExpiresAt time.Time `json:"exp"`
 }
 
+// DefaultGroupsMaxBytes bounds the groups claim carried inside an
+// access token when the operator sets no explicit budget. The token
+// travels in an Authorization header, and the server's MaxHeaderBytes
+// (main.go) caps the whole header block at 16 KB — a group-heavy user
+// would otherwise mint a token their own requests cannot carry, failing
+// with a 431 that net/http answers before any middleware runs, so it
+// appears in no access log and no metric. Capping at mint time turns an
+// invisible per-user outage into a bounded token plus a WARN line.
+//
+// The budget is bytes, not a count, so how many groups survive depends
+// entirely on the directory's naming scheme — which is why operators
+// tune it with GROUPS_CLAIM_MAX_BYTES rather than inheriting a number
+// picked for someone else's. The per-shape counts live in the Limits
+// table of docs/configuration.md; deliberately not repeated here, since
+// two copies of a measured figure drift the moment the budget moves.
+const DefaultGroupsMaxBytes = 8 << 10
+
+// capGroups truncates the groups claim to maxBytes, preserving
+// order.
+//
+// Truncation is authorization-visible, not merely cosmetic: the proxy
+// forwards this claim to the upstream MCP server as X-User-Groups
+// (proxy/proxy.go), and ALLOWED_GROUPS was already evaluated against
+// the FULL list at /callback — so a truncated user passes this proxy's
+// own gate and can still be refused upstream. Hence the subject in the
+// log line: without it an operator sees that someone was truncated but
+// not who to ask about.
+func capGroups(groups []string, logger *zap.Logger, subject string, maxBytes int) []string {
+	if maxBytes <= 0 {
+		maxBytes = DefaultGroupsMaxBytes
+	}
+	total := 0
+	for i, g := range groups {
+		total += len(g) + 1
+		if total <= maxBytes {
+			continue
+		}
+		metrics.GroupsClaimTruncated.Inc()
+		if logger != nil {
+			logger.Warn("groups_claim_truncated",
+				zap.String("subject", subject),
+				zap.Int("kept", i),
+				zap.Int("dropped", len(groups)-i),
+				zap.Int("max_bytes", maxBytes),
+			)
+		}
+		return groups[:i]
+	}
+	return groups
+}
+
 // Manager handles AES-GCM encryption for all stateless tokens and sealed payloads.
 // All instances sharing the same secret can seal/open each other's payloads,
 // enabling horizontal scaling without shared storage.
@@ -131,6 +184,9 @@ type Manager struct {
 	// crossing — the counter will keep climbing, but flooding logs does
 	// not add information for the operator.
 	warnedOnce atomic.Bool
+	// groupsMaxBytes is the groups-claim budget; zero means
+	// DefaultGroupsMaxBytes. Set via SetGroupsMaxBytes.
+	groupsMaxBytes int
 	// logger is optional; when nil no warning is emitted (tests). Set via
 	// SetLogger after construction so existing callers stay ABI-compatible.
 	logger *zap.Logger
@@ -187,6 +243,13 @@ func buildAEAD(secret []byte) (cipher.AEAD, error) {
 		return nil, fmt.Errorf("cipher.NewGCM: %w", err)
 	}
 	return aead, nil
+}
+
+// SetGroupsMaxBytes sets the groups-claim budget (GROUPS_CLAIM_MAX_BYTES).
+// Zero leaves DefaultGroupsMaxBytes in force, so a Manager built without
+// it still caps rather than minting an unbounded token.
+func (m *Manager) SetGroupsMaxBytes(n int) {
+	m.groupsMaxBytes = n
 }
 
 // SetLogger attaches a zap logger for the one-shot seal-rotation warning.
@@ -322,6 +385,7 @@ func (m *Manager) OpenJSON(sealed string, v any, purpose string) error {
 // different mount (RFC 8707 §2.2). Pass "" when the caller does not
 // participate in the resource binding (legacy / non-MCP callers).
 func (m *Manager) Issue(audience, subject, email, clientID string, groups []string, ttl time.Duration, resource string) (string, *Claims, error) {
+	groups = capGroups(groups, m.logger, subject, m.groupsMaxBytes)
 	now := time.Now()
 	claims := &Claims{
 		TokenID:   uuid.New().String(),
