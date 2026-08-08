@@ -99,7 +99,7 @@ type Claims struct {
 // DefaultGroupsMaxBytes bounds the groups claim carried inside an
 // access token when the operator sets no explicit budget. The token
 // travels in an Authorization header, and the server's MaxHeaderBytes
-// (main.go) caps the whole header block at 16 KB — a group-heavy user
+// (main.go) caps the whole header block at 64 KB — a group-heavy user
 // would otherwise mint a token their own requests cannot carry, failing
 // with a 431 that net/http answers before any middleware runs, so it
 // appears in no access log and no metric. Capping at mint time turns an
@@ -111,7 +111,7 @@ type Claims struct {
 // picked for someone else's. The per-shape counts live in the Limits
 // table of docs/configuration.md; deliberately not repeated here, since
 // two copies of a measured figure drift the moment the budget moves.
-const DefaultGroupsMaxBytes = 8 << 10
+const DefaultGroupsMaxBytes = 32 << 10
 
 // capGroups truncates the groups claim to maxBytes, preserving
 // order.

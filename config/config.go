@@ -110,7 +110,7 @@ type Config struct {
 	// survive depends on the directory's naming scheme (per-shape counts
 	// in the Limits table of docs/configuration.md — not repeated here,
 	// since a measured figure copied twice drifts the moment the budget
-	// moves). Above ~10 KB the sealed token alone exceeds the 16 KB
+	// moves). Above ~40 KB the sealed token alone exceeds the 64 KB
 	// header block and every request 431s before any middleware runs.
 	// env: GROUPS_CLAIM_MAX_BYTES.
 	GroupsClaimMaxBytes int
@@ -353,10 +353,10 @@ func Load() (*Config, error) {
 		c.RefreshRaceGrace = time.Duration(n) * time.Second
 	}
 
-	// GROUPS_CLAIM_MAX_BYTES: default 8 KB, clamped to [1 KB, 10 KB].
+	// GROUPS_CLAIM_MAX_BYTES: default 32 KB, clamped to [1 KB, 40 KB].
 	// The ceiling is measured, not chosen: the seal expands the claim
-	// ~1.37x, so a 12 KB budget mints a 17 KB Authorization header that
-	// cannot fit the 16 KB block (TestGroupsCeilingFitsHeaderBudget).
+	// ~1.39x, so a 40 KB budget already mints a 57 KB Authorization
+	// header against a 64 KB block (TestGroupsCeilingFitsHeaderBudget).
 	// The floor keeps a typo from truncating every user to nothing.
 	c.GroupsClaimMaxBytes = token.DefaultGroupsMaxBytes
 	if raw := os.Getenv("GROUPS_CLAIM_MAX_BYTES"); raw != "" {
@@ -367,8 +367,8 @@ func Load() (*Config, error) {
 		if n < 1024 {
 			return nil, fmt.Errorf("GROUPS_CLAIM_MAX_BYTES must be >= 1024; got %d", n)
 		}
-		if n > 10240 {
-			return nil, fmt.Errorf("GROUPS_CLAIM_MAX_BYTES must be <= 10240; got %d (above that the sealed token alone exceeds the 16 KB header block and every request fails with 431 before any middleware runs)", n)
+		if n > 40960 {
+			return nil, fmt.Errorf("GROUPS_CLAIM_MAX_BYTES must be <= 40960; got %d (above that the sealed token no longer fits the 64 KB header block and every request fails with 431 before any middleware runs)", n)
 		}
 		c.GroupsClaimMaxBytes = n
 	}

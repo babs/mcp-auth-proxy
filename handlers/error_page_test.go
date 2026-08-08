@@ -788,10 +788,10 @@ func TestWantsHTML_NoCountOrLengthCap(t *testing.T) {
 
 // The real ceiling, asserted where it lives: a header at the server's
 // MaxHeaderBytes limit must stay cheap. Fails loudly if the scan ever
-// becomes super-linear — a quadratic scan on 16 KB is milliseconds, not
+// becomes super-linear — a quadratic scan on 64 KB is milliseconds, not
 // microseconds.
 func TestWantsHTML_WorstCaseAtHeaderCeiling(t *testing.T) {
-	const maxHeaderBytes = 16 << 10
+	const maxHeaderBytes = 64 << 10
 	worst := map[string]string{
 		"quoted_commas": `application/json;profile="` + strings.Repeat("a,", maxHeaderBytes/2-20) + `"`,
 		"all_semis":     "text/html;" + strings.Repeat("q=0.5;", maxHeaderBytes/6-10),

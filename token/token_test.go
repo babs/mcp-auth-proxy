@@ -477,7 +477,7 @@ func TestNewManagerWithRotation_ShortSecretRejected(t *testing.T) {
 }
 
 // A group-heavy user must never mint a token their own requests cannot
-// carry: MaxHeaderBytes (main.go) caps the header block at 16 KB, and a
+// carry: MaxHeaderBytes (main.go) caps the header block at 64 KB, and a
 // 431 is answered by net/http before any middleware, so it lands in no
 // access log and no metric. The cap turns that invisible per-user
 // outage into a bounded token.
@@ -493,7 +493,7 @@ func TestIssue_CapsGroupsToHeaderBudget(t *testing.T) {
 		}
 		return g
 	}
-	const headerBudget = 16 << 10
+	const headerBudget = 64 << 10
 	for _, n := range []int{0, 10, 60, 250, 2000} {
 		at, claims, err := tm.Issue("https://proxy.example", "sub", "user@example.com", "cid", mk(n), time.Hour, "https://proxy.example/mcp")
 		if err != nil {
