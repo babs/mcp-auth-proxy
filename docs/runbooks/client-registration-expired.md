@@ -10,7 +10,9 @@ invalid_client: client registration expired
 
 it has been alive longer than the sealed `client_id`'s TTL.
 DCR is one-shot for most MCP clients, so they don't auto-
-re-register and the user sees the error directly.
+re-register and the user sees the error directly. (Error codes are
+catalogued in the [specs.md error-code
+table](../../specs.md#oauth2-error-handling).)
 
 ## Signals
 
@@ -24,11 +26,18 @@ re-register and the user sees the error directly.
   the client's `internal_id` and `expired_at` (same `access_denied_*`
   family as every other denial — catchable by a `level>=warn` or
   `event=~"access_denied_.*"` filter).
-- HTTP access log: repeated `GET /authorize` (and/or `POST
-  /token`) at **status 400** with a **77-byte** response body —
-  the 76-byte JSON
-  `{"error":"invalid_client","error_description":"client registration expired"}`
-  plus the encoder's trailing newline (`resp_bytes=77` on the wire).
+- HTTP access log: repeated `GET /authorize` (and/or `POST /token`) at
+  **status 400**. Filter on status + path, and correlate with the WARN
+  line above — the access log carries no `error_code` field, and
+  `resp_bytes` is not a fingerprint: the JSON body is
+  `{"error":"invalid_client","error_description":"client registration expired","error_code":"client_registration_expired"}`
+  while a browser on `/authorize` gets the ~1.3 kB HTML error page —
+  same status, same `error_code` in the body, different size. The
+  `resp_content_type` field tells the two representations apart
+  (`application/json` vs `text/html; charset=utf-8`).
+- Browser users see the error page advising them to *reconnect this
+  service in your application* — the client-side fix below — before
+  falling back to the administrator.
 - User report: "MCP server stopped working after a few days of
   uptime, restart fixes it."
 

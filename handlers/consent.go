@@ -59,31 +59,7 @@ var consentTmpl = template.Must(template.New("consent").Parse(`<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
   <title>Authorize MCP client</title>
-  <style>
-    body { font: 16px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
-           background: #f4f4f5; color: #18181b;
-           display: flex; align-items: center; justify-content: center;
-           min-height: 100vh; margin: 0; padding: 1.5rem; }
-    main { max-width: 32rem; width: 100%; background: #fff;
-           border: 1px solid #e4e4e7; border-radius: 0.75rem;
-           padding: 2rem; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
-    h1 { font-size: 1.25rem; margin: 0 0 1rem; }
-    p  { margin: 0 0 0.75rem; }
-    dl { margin: 1rem 0; padding: 0.75rem 1rem; background: #f4f4f5;
-         border-radius: 0.5rem; }
-    dt { font-size: 0.85rem; color: #52525b; margin-top: 0.5rem; }
-    dt:first-child { margin-top: 0; }
-    dd { margin: 0 0 0.25rem; font-family: ui-monospace, "SFMono-Regular", monospace;
-         word-break: break-all; }
-    .actions { display: flex; gap: 0.5rem; margin-top: 1.5rem; }
-    button { flex: 1; padding: 0.75rem 1rem; font: inherit;
-             border-radius: 0.5rem; cursor: pointer; }
-    .approve { background: #18181b; color: #fafafa; border: 1px solid #18181b; }
-    .deny    { background: #fafafa; color: #18181b; border: 1px solid #d4d4d8; }
-    .hint { font-size: 0.85rem; color: #52525b; margin-top: 1rem; }
-    .notice { background: #fef3c7; border: 1px solid #fcd34d; border-radius: 0.5rem;
-              padding: 0.75rem 1rem; font-size: 0.9rem; }
-  </style>
+  <style>` + consentPageStyle + `</style>
 </head>
 <body>
 <main>
@@ -128,29 +104,6 @@ var consentTmpl = template.Must(template.New("consent").Parse(`<!doctype html>
 </html>
 `))
 
-// Consent-flow CSP headers, sharing one base so the two
-// security-critical literals cannot drift apart — the single
-// intentional difference is the form-action source.
-//
-// consentPageCSP (form-action 'self'): the approve/deny POST is
-// answered with a 200 same-origin interstitial
-// (renderNavInterstitial) rather than a redirect, which terminates
-// Chromium's form-action enforcement of the navigation chain. No
-// IdP / client origin enumeration needed — the header is
-// independent of IdP topology and client redirect targets
-// (previously CSP_FORM_ACTION_EXTRA + per-render widening, both
-// obsoleted by the interstitial).
-//
-// navInterstitialCSP (form-action 'none'): the interstitial carries
-// no form; meta-refresh / anchor navigation is not governed by any
-// fetch or form-action directive, so everything stays locked down.
-const (
-	cspConsentPrefix   = "default-src 'none'; style-src 'unsafe-inline'; form-action "
-	cspConsentSuffix   = "; frame-ancestors 'none'; base-uri 'none'"
-	consentPageCSP     = cspConsentPrefix + "'self'" + cspConsentSuffix
-	navInterstitialCSP = cspConsentPrefix + "'none'" + cspConsentSuffix
-)
-
 // navInterstitialTmpl carries the user from a /consent form POST to
 // the next location: the IdP authorize URL on approve, the client
 // redirect_uri error envelope on deny / server error.
@@ -185,12 +138,7 @@ var navInterstitialTmpl = template.Must(template.New("nav").Parse(`<!doctype htm
   <meta name="referrer" content="no-referrer">
   <meta http-equiv="refresh" content="0;url={{.URL}}">
   <title>Continuing&hellip;</title>
-  <style>
-    body { font: 16px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
-           background: #f4f4f5; color: #18181b;
-           display: flex; align-items: center; justify-content: center;
-           min-height: 100vh; margin: 0; padding: 1.5rem; }
-  </style>
+  <style>` + navInterstitialStyle + `</style>
 </head>
 <body>
 <p>Continuing&hellip; If you are not redirected automatically,
@@ -201,17 +149,12 @@ var navInterstitialTmpl = template.Must(template.New("nav").Parse(`<!doctype htm
 
 // renderNavInterstitial answers a /consent form POST with the
 // same-origin chain-breaking page described on navInterstitialTmpl.
-func renderNavInterstitial(w http.ResponseWriter, logger *zap.Logger, targetURL string) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+func renderNavInterstitial(w http.ResponseWriter, r *http.Request, logger *zap.Logger, targetURL string) {
 	// The target URL embeds a single-use sealed session (approve) or
-	// the client's error envelope — never serve it from a cache.
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Pragma", "no-cache")
-	w.Header().Set("Content-Security-Policy", navInterstitialCSP)
-	w.WriteHeader(http.StatusOK)
-	if err := navInterstitialTmpl.Execute(w, struct{ URL string }{targetURL}); err != nil {
-		// Body already started — log only.
+	// the client's error envelope — renderHTMLPage marks it no-store.
+	if err := renderHTMLPage(w, "interstitial", http.StatusOK, navInterstitialCSP, navInterstitialTmpl, struct{ URL string }{targetURL}); err != nil {
 		logger.Warn("nav_interstitial_execute_failed", zap.Error(err))
+		writeOAuthError(w, r, http.StatusInternalServerError, "server_error", "internal error", codeInterstitialFailed)
 	}
 }
 
@@ -219,14 +162,15 @@ func renderNavInterstitial(w http.ResponseWriter, logger *zap.Logger, targetURL 
 // error envelope through the interstitial. Responses to the consent
 // form POST must not 302 cross-origin — Chromium would block the
 // redirect against the consent page's form-action 'self'. Same
-// parse-failure fallback as redirectAuthzError: proxy-hosted JSON.
-func consentNavError(w http.ResponseWriter, logger *zap.Logger, redirectURI, state, errCode, errDesc, audience string) {
-	target, err := authzErrorURL(redirectURI, state, errCode, errDesc, audience)
+// parse-failure fallback as redirectAuthzError: a proxy-hosted error
+// response, negotiated (JSON, or the page on a browser-facing route).
+func consentNavError(w http.ResponseWriter, r *http.Request, logger *zap.Logger, consent sealedConsent, errCode, errDesc, audience string) {
+	target, err := authzErrorURL(consent.RedirectURI, consent.OriginalState, errCode, errDesc, audience)
 	if err != nil {
-		writeOAuthError(w, http.StatusBadRequest, errCode, errDesc)
+		writeOAuthError(w, r, http.StatusBadRequest, errCode, errDesc, codeRedirectURIMalformed)
 		return
 	}
-	renderNavInterstitial(w, logger, target)
+	renderNavInterstitial(w, r, logger, target)
 }
 
 // renderConsent seals the validated /authorize parameters into a
@@ -245,11 +189,11 @@ func consentNavError(w http.ResponseWriter, logger *zap.Logger, redirectURI, sta
 // replayNotice=true adds the "previous response already processed"
 // banner — set only by the POST /consent replay re-render; the
 // GET /authorize first render passes false.
-func renderConsent(w http.ResponseWriter, tm *token.Manager, logger *zap.Logger, baseURL, resourceName string, consent sealedConsent, replayNotice bool) {
+func renderConsent(w http.ResponseWriter, r *http.Request, tm *token.Manager, logger *zap.Logger, baseURL, resourceName string, consent sealedConsent, replayNotice bool) {
 	consentToken, err := tm.SealJSON(consent, token.PurposeConsent)
 	if err != nil {
 		logger.Error("consent_seal_failed", zap.Error(err))
-		consentNavError(w, logger, consent.RedirectURI, consent.OriginalState, "server_error", "internal error", baseURL)
+		consentNavError(w, r, logger, consent, "server_error", "internal error", baseURL)
 		return
 	}
 
@@ -266,12 +210,11 @@ func renderConsent(w http.ResponseWriter, tm *token.Manager, logger *zap.Logger,
 		ReplayNotice:   replayNotice,
 	}
 
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	// Consent page must not be cached: a back-button replay after a
 	// completed flow would re-show the form against a stale (and
-	// possibly already-redeemed) consent token.
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Pragma", "no-cache")
+	// possibly already-redeemed) consent token — renderHTMLPage marks
+	// it no-store.
+	//
 	// The shared securityHeaders middleware sets `default-src 'none'`
 	// which is right for every other public response (JSON / 302 /
 	// 4xx) but blocks the consent page's inline <style> block. Relax
@@ -280,11 +223,9 @@ func renderConsent(w http.ResponseWriter, tm *token.Manager, logger *zap.Logger,
 	// stays none so the consent UI cannot be framed by an attacker
 	// origin. form-action is 'self'-only — the POST is answered by
 	// the same-origin interstitial, see consentPageCSP.
-	w.Header().Set("Content-Security-Policy", consentPageCSP)
-	w.WriteHeader(http.StatusOK)
-	if err := consentTmpl.Execute(w, data); err != nil {
-		// Body already started — log only.
-		logger.Warn("consent_template_execute_failed", zap.Error(err))
+	if err := renderHTMLPage(w, "consent", http.StatusOK, consentPageCSP, consentTmpl, data); err != nil {
+		logger.Error("consent_template_execute_failed", zap.Error(err))
+		consentNavError(w, r, logger, consent, "server_error", "internal error", baseURL)
 	}
 }
 
@@ -363,7 +304,7 @@ func Consent(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg *o
 		// request rather than silently accepting via r.ParseForm
 		// merging URL and body into r.Form.
 		if r.URL.RawQuery != "" {
-			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "consent endpoint parameters must be in the request body, not the URL query")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "consent endpoint parameters must be in the request body, not the URL query", codeConsentQueryParamsForbidden)
 			return
 		}
 
@@ -371,47 +312,51 @@ func Consent(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg *o
 		// header on /consent is meaningless and lets a confused
 		// client believe the credential was honoured. Mirrors the
 		// /token guard.
+		// 400, not 401: RFC 7235 §3.1 makes WWW-Authenticate mandatory
+		// on every 401, and a challenge here would pop a browser
+		// credential dialog on an endpoint that rejects credentials by
+		// design. invalid_request fits — the request carries a header
+		// it must not.
 		if r.Header.Get("Authorization") != "" {
-			w.Header().Set("WWW-Authenticate", `Basic realm="consent", error="invalid_client", error_description="this consent endpoint does not authenticate clients"`)
-			writeOAuthError(w, http.StatusUnauthorized, "invalid_client", "this consent endpoint does not authenticate clients")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "this consent endpoint does not authenticate clients; retry without the Authorization header", codeConsentAuthHeaderPresent)
 			return
 		}
 
 		if err := r.ParseForm(); err != nil {
 			var maxErr *http.MaxBytesError
 			if errors.As(err, &maxErr) {
-				writeOAuthError(w, http.StatusRequestEntityTooLarge, "invalid_request", "request body exceeds the 1 MB cap")
+				writeOAuthError(w, r, http.StatusRequestEntityTooLarge, "invalid_request", "request body exceeds the 1 MB cap", codeConsentBodyTooLarge)
 				return
 			}
-			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "malformed form body")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "malformed form body", codeConsentFormMalformed)
 			return
 		}
-		if rejectRepeatedParams(w, r.Form, "consent_token", "action") {
+		if rejectRepeatedParams(w, r, r.Form, "consent_token", "action") {
 			return
 		}
 
 		consentTokenStr := r.FormValue("consent_token")
 		action := r.FormValue("action")
 		if consentTokenStr == "" {
-			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "consent_token is required")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "consent token is required", codeConsentTokenMissing)
 			return
 		}
 
 		var consent sealedConsent
 		if err := tm.OpenJSON(consentTokenStr, &consent, token.PurposeConsent); err != nil {
-			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "consent token invalid or expired")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "consent token invalid or expired", codeConsentTokenInvalid)
 			return
 		}
 		if consent.Typ != token.PurposeConsent {
-			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "consent token invalid or expired")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "consent token invalid or expired", codeConsentTokenInvalid)
 			return
 		}
 		if consent.Audience != baseURL {
-			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "consent token bound to a different audience")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "consent token bound to a different audience", codeConsentTokenAudienceMismatch)
 			return
 		}
 		if time.Now().After(consent.ExpiresAt) {
-			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "consent token expired")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "consent token expired", codeConsentTokenExpired)
 			return
 		}
 
@@ -446,7 +391,7 @@ func Consent(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg *o
 					// cycles would keep a captured blob alive
 					// indefinitely.
 					consent.JTI = uuid.New().String()
-					renderConsent(w, tm, logger, baseURL, cfg.ResourceName, consent, true)
+					renderConsent(w, r, tm, logger, baseURL, cfg.ResourceName, consent, true)
 					return
 				}
 				// Reuse the same access_denied{replay_store_unavailable}
@@ -455,7 +400,8 @@ func Consent(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg *o
 				// alerting rule on this counter covers all of them.
 				logger.Error("replay_store_error", zap.String("op", "claim_consent"), zap.Error(err))
 				metrics.AccessDenied.WithLabelValues("replay_store_unavailable").Inc()
-				writeOAuthError(w, http.StatusServiceUnavailable, "server_error", "replay store unavailable", "replay_store_unavailable")
+				retryAfterReplayStore(w.Header())
+				writeOAuthError(w, r, http.StatusServiceUnavailable, "server_error", "replay store unavailable", codeReplayStoreUnavailable)
 				return
 			}
 		}
@@ -471,11 +417,11 @@ func Consent(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg *o
 				zap.String("client_id", consent.ClientID),
 				zap.String("client_name", consent.ClientName),
 			)
-			consentNavError(w, logger, consent.RedirectURI, consent.OriginalState, "access_denied", "user declined to authorize this client", baseURL)
+			consentNavError(w, r, logger, consent, "access_denied", "user declined to authorize this client", baseURL)
 			return
 		}
 		if action != "approve" {
-			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "action must be approve or deny")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "action must be approve or deny", codeConsentActionInvalid)
 			return
 		}
 
@@ -489,7 +435,7 @@ func Consent(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg *o
 		// proxy used.
 		nonceBytes := make([]byte, 16)
 		if _, err := rand.Read(nonceBytes); err != nil {
-			consentNavError(w, logger, consent.RedirectURI, consent.OriginalState, "server_error", "internal error", baseURL)
+			consentNavError(w, r, logger, consent, "server_error", "internal error", baseURL)
 			return
 		}
 		nonce := hex.EncodeToString(nonceBytes)
@@ -527,7 +473,7 @@ func Consent(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg *o
 		internalState, err := tm.SealJSON(session, token.PurposeSession)
 		if err != nil {
 			logger.Error("session_seal_failed", zap.Error(err))
-			consentNavError(w, logger, consent.RedirectURI, consent.OriginalState, "server_error", "internal error", baseURL)
+			consentNavError(w, r, logger, consent, "server_error", "internal error", baseURL)
 			return
 		}
 
@@ -553,6 +499,6 @@ func Consent(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg *o
 			zap.String("client_name", consent.ClientName),
 		)
 		metrics.ConsentDecisions.WithLabelValues("approved").Inc()
-		renderNavInterstitial(w, logger, authURL)
+		renderNavInterstitial(w, r, logger, authURL)
 	}
 }

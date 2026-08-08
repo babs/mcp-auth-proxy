@@ -134,10 +134,20 @@ func sealRefresh(t *testing.T, tm *token.Manager, subject, email, clientUUID str
 func TestWriteOAuthError_OmitsErrorCodeByDefault(t *testing.T) {
 	rr := httptest.NewRecorder()
 
-	writeOAuthError(rr, http.StatusBadRequest, "invalid_request", "missing required parameters")
+	// nil request: no Accept to negotiate on, and the helper must not
+	// panic on the path that reports someone else's failure.
+	writeOAuthError(rr, nil, http.StatusBadRequest, "invalid_request", "missing required parameters")
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", rr.Code)
+	}
+
+	// Raw: decoding cannot see an `"error_code":""` key appearing on
+	// every code-less error, which is what dropping omitempty would do
+	// to the wire body of every MCP client.
+	const wantBody = `{"error":"invalid_request","error_description":"missing required parameters"}`
+	if got := strings.TrimSpace(rr.Body.String()); got != wantBody {
+		t.Errorf("body = %s\nwant %s", got, wantBody)
 	}
 
 	var oauthErr OAuthError
@@ -158,7 +168,7 @@ func TestWriteOAuthError_OmitsErrorCodeByDefault(t *testing.T) {
 func TestWriteOAuthError_IncludesOptionalErrorCode(t *testing.T) {
 	rr := httptest.NewRecorder()
 
-	writeOAuthError(rr, http.StatusBadGateway, "server_error", "id token verification failed", "id_token_verification_failed")
+	writeOAuthError(rr, httptest.NewRequest(http.MethodGet, "/", nil), http.StatusBadGateway, "server_error", "id token verification failed", "id_token_verification_failed")
 
 	if rr.Code != http.StatusBadGateway {
 		t.Fatalf("expected 502, got %d", rr.Code)
@@ -331,7 +341,7 @@ func TestRegister_NeverExpires(t *testing.T) {
 	// The expiry guard must let a zero-ExpiresAt client through even
 	// though time.Now() is "after" the zero time.
 	vr := httptest.NewRecorder()
-	if got := openAndValidateClient(vr, tm, zap.NewNop(), resp.ClientID, testBaseURL); got == nil {
+	if got := openAndValidateClient(vr, httptest.NewRequest(http.MethodPost, "/token", nil), tm, zap.NewNop(), resp.ClientID, testBaseURL); got == nil {
 		t.Fatalf("non-expiring client_id rejected: %d %s", vr.Code, vr.Body.String())
 	}
 }
@@ -355,21 +365,32 @@ func TestOpenAndValidateClient_RejectionMetrics(t *testing.T) {
 	past := time.Now().Add(-time.Hour)
 
 	cases := []struct {
-		name     string
-		clientID string
-		reason   string
+		name          string
+		clientID      string
+		reason        string
+		wantErrorCode string
 	}{
-		{"undecodable", "not-a-sealed-blob", "client_id_invalid"},
-		{"wrong_typ", seal(sealedClient{ID: "x", Typ: token.PurposeCode, Audience: testBaseURL, RedirectURIs: cb, ExpiresAt: future}), "client_typ_mismatch"},
-		{"audience", seal(sealedClient{ID: "x", Typ: token.PurposeClient, Audience: "https://other.example", RedirectURIs: cb, ExpiresAt: future}), "client_audience_mismatch"},
-		{"expired", seal(sealedClient{ID: "x", Typ: token.PurposeClient, Audience: testBaseURL, RedirectURIs: cb, ExpiresAt: past}), "client_registration_expired"},
+		// The first two answer with an identical description AND an
+		// identical code on purpose: telling "did not decrypt" from
+		// "decrypted, wrong purpose" would hand an unauthenticated
+		// caller a sealed-token oracle. One shared code leaks no more
+		// than the shared description and leaves the user something to
+		// quote; the metric labels stay distinct for the operator.
+		{"undecodable", "not-a-sealed-blob", "client_id_invalid", codeClientIDUnknown},
+		{"wrong_typ", seal(sealedClient{ID: "x", Typ: token.PurposeCode, Audience: testBaseURL, RedirectURIs: cb, ExpiresAt: future}), "client_typ_mismatch", codeClientIDUnknown},
+		// reason is the metric label (a literal by design — see
+		// recordClientDenial); wantErrorCode is the wire constant. They
+		// coincide on these two rows and must still be written as what
+		// they are.
+		{"audience", seal(sealedClient{ID: "x", Typ: token.PurposeClient, Audience: "https://other.example", RedirectURIs: cb, ExpiresAt: future}), "client_audience_mismatch", codeClientAudienceMismatch},
+		{"expired", seal(sealedClient{ID: "x", Typ: token.PurposeClient, Audience: testBaseURL, RedirectURIs: cb, ExpiresAt: past}), "client_registration_expired", codeClientRegistrationExpired},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			before := testutil.ToFloat64(metrics.AccessDenied.WithLabelValues(tc.reason))
 			rr := httptest.NewRecorder()
-			if got := openAndValidateClient(rr, tm, zap.NewNop(), tc.clientID, testBaseURL); got != nil {
+			if got := openAndValidateClient(rr, httptest.NewRequest(http.MethodPost, "/token", nil), tm, zap.NewNop(), tc.clientID, testBaseURL); got != nil {
 				t.Fatal("expected rejection (nil), got a client")
 			}
 			if rr.Code != http.StatusBadRequest {
@@ -377,6 +398,16 @@ func TestOpenAndValidateClient_RejectionMetrics(t *testing.T) {
 			}
 			if after := testutil.ToFloat64(metrics.AccessDenied.WithLabelValues(tc.reason)); after-before != 1 {
 				t.Errorf("AccessDenied{%s} delta = %v, want 1", tc.reason, after-before)
+			}
+			// The body error_code is a documented contract (specs.md, the
+			// expired-registration runbook) and is what a user quotes to
+			// support — the metric label alone does not pin it.
+			var oe OAuthError
+			if err := json.NewDecoder(rr.Body).Decode(&oe); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if oe.ErrorCode != tc.wantErrorCode {
+				t.Errorf("error_code = %q, want %q", oe.ErrorCode, tc.wantErrorCode)
 			}
 		})
 	}

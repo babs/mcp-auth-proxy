@@ -55,14 +55,24 @@ secure production posture (`PROD_MODE=true`); flags listed here as
 | `REDIS_REQUIRED` | `true` | Fail startup when `REDIS_URL` is unset. Set `false` only for dev / single-replica; stateless mode leaves codes / refresh tokens replayable within their TTL. Rejected by `PROD_MODE`. |
 | `REDIS_KEY_PREFIX` | `mcp-auth-proxy:` | Key prefix for shared Redis. Set to empty to opt out of namespacing. |
 | `REFRESH_RACE_GRACE_SEC` | `2` | Grace window in seconds during which a refresh-rotation collision is treated as a benign concurrent submit (parallel-tab refresh, slow-network double-submit) and returns 429 `refresh_concurrent_submit` without revoking the family. Outside the window every collision still revokes. Range `[0, 10]`; `0` disables. The 10s ceiling is a security cap — wider windows are statistically attacker-shaped. |
-| `IDP_EXCHANGE_RATE_PER_SEC` | (disabled) | Cap on outbound proxy → IdP token-endpoint requests at `/callback`. Defense in depth: a flood of `/callback` hits that slips past the per-IP limiter (distributed sources, permissive XFF trust matrix) is bounded by this token bucket before reaching the IdP. Denied requests get 503 `temporarily_unavailable` + `error_code=idp_exchange_throttled` + `Retry-After: 1`. Set to a positive number (e.g. `20`) to enable. **Per-replica scope:** an `N`-replica deployment admits up to `N × IDP_EXCHANGE_RATE_PER_SEC` to the IdP — divide your IdP-side ceiling by replica count. |
+| `IDP_EXCHANGE_RATE_PER_SEC` | (disabled) | Cap on outbound proxy → IdP token-endpoint requests at `/callback`. Defense in depth: a flood of `/callback` hits that slips past the per-IP limiter (distributed sources, permissive XFF trust matrix) is bounded by this token bucket before reaching the IdP. Denied requests get 503 `temporarily_unavailable` + `error_code=idp_exchange_throttled` + `Retry-After` (2-4s, jittered so N replicas' rejected callers do not re-converge on one instant). Set to a positive number (e.g. `20`) to enable. **Per-replica scope:** an `N`-replica deployment admits up to `N × IDP_EXCHANGE_RATE_PER_SEC` to the IdP — divide your IdP-side ceiling by replica count. |
 | `IDP_EXCHANGE_BURST` | `50` | Burst size for the IdP-exchange limiter when `IDP_EXCHANGE_RATE_PER_SEC > 0`. Higher burst absorbs a short spike (e.g. a deploy-time reconnect storm) without 503s; lower burst keeps the ceiling tighter. Ignored when `IDP_EXCHANGE_RATE_PER_SEC` is unset/zero. |
+
+## Limits
+
+Not configurable; stated here because they are the ones an operator
+meets in an incident.
+
+| Limit | Value | On exceed |
+| --- | --- | --- |
+| Request headers (both listeners) | 16 KB total | `431 Request Header Fields Too Large`, answered by net/http **before** any middleware — so it appears in no access log and no metric |
+| Request body (POST endpoints) | 1 MB | `413` + `error_code=consent_body_too_large` on `/consent`; `invalid_request` elsewhere |
 
 ## Rate limiting and proxy headers
 
 | Variable | Default | Description |
 |---|---|---|
-| `RATE_LIMIT_ENABLED` | `true` | Per-IP rate limiting on pre-auth endpoints and on the authenticated MCP route. Disable only behind a WAF that already enforces it. |
+| `RATE_LIMIT_ENABLED` | `true` | Per-IP rate limiting on pre-auth endpoints and on the authenticated MCP route. Disable only behind a WAF that already enforces it — the per-IP buckets are the only bound on the unauthenticated pre-auth surface, where a browser-negotiated rejection is ~13x the JSON body (~16x on the throttle path). Rejected by `PROD_MODE`. |
 | `TRUSTED_PROXY_CIDRS` | (empty) | Comma-separated CIDRs of peers whose forwarding header (default `X-Forwarded-For`) is walked right-to-left for rate-limit keying. The first hop NOT in the trusted set is the bucket key; everything left of it (typically appended by the client) is ignored. Other peers fall back to RemoteAddr. **Preferred over the legacy `TRUST_PROXY_HEADERS` bool.** |
 | `TRUSTED_PROXY_HEADER` | `X-Forwarded-For` | Pin which forwarding header carries the hop list. Allowlist: `X-Forwarded-For`, `X-Real-IP`, `True-Client-IP`. Pin `X-Real-IP` / `True-Client-IP` only when the trusted ingress is known to OVERWRITE (not append) that header — otherwise a client behind a passthrough ingress can spoof an unbounded rate-limit bucket per request. |
 | `TRUST_PROXY_HEADERS` | `false` | **Legacy.** Blanket trust of every peer's forwarded headers. Superseded by `TRUSTED_PROXY_CIDRS` when both are set; rejected entirely under `PROD_MODE=true` without `TRUSTED_PROXY_CIDRS` because the bucket key becomes attacker-spoofable. |
@@ -88,7 +98,7 @@ control.
 
 | Variable | Default | Description |
 |---|---|---|
-| `PROD_MODE` | `true` | Fails startup if any compatibility flag that weakens a security control is set (`PKCE_REQUIRED=false`, `COMPAT_ALLOW_STATELESS=true`, `REDIS_REQUIRED=false`, `REDIS_URL` empty, `OIDC_ALLOW_INSECURE_HTTP=true`, or legacy `TRUST_PROXY_HEADERS=true` without `TRUSTED_PROXY_CIDRS`). Set `false` explicitly only for dev / single-replica work that needs one of the relaxation toggles. |
+| `PROD_MODE` | `true` | Fails startup if any compatibility flag that weakens a security control is set (`PKCE_REQUIRED=false`, `COMPAT_ALLOW_STATELESS=true`, `REDIS_REQUIRED=false`, `RATE_LIMIT_ENABLED=false`, `REDIS_URL` empty, `OIDC_ALLOW_INSECURE_HTTP=true`, a weak `TOKEN_SIGNING_SECRET`, or legacy `TRUST_PROXY_HEADERS=true` without `TRUSTED_PROXY_CIDRS`). Set `false` explicitly only for dev / single-replica work that needs one of the relaxation toggles. |
 | `PKCE_REQUIRED` | `true` | Set `false` for legacy clients that omit PKCE (Cursor, MCP Inspector, ChatGPT). Rejected by `PROD_MODE`. |
 | `COMPAT_ALLOW_STATELESS` | `false` | Synthesize a server-side `state` on `/authorize` when the client omits it. Strict mode refuses the request; counter `mcp_auth_access_denied_total{reason="state_missing"}` fires either way. Rejected by `PROD_MODE`. |
 | `RENDER_CONSENT_PAGE` | `true` | Render an explicit proxy-side consent page on `/authorize` so the user sees who's asking and where they'll be redirected before the IdP login. Closes the silent-token-issuance path where a malicious DCR client + an active IdP session = tokens issued without any user interaction. Plain HTML, no JavaScript. Set `false` to fall back to the legacy silent-redirect — only when every caller is non-interactive and known-trusted. |
@@ -141,10 +151,28 @@ sum(mcp_auth_consent_decisions_total{decision="approved"})
 
 ### Denials
 
+A denial has two vocabularies: the metric label below (operator-facing,
+stable dashboard keys) and the wire `error_code` the user sees and
+quotes — the full code → meaning table lives in
+[specs.md](../specs.md#oauth2-error-handling). They match by name except
+where a bullet says otherwise. These buckets carry no wire `error_code`
+at all — nothing on those paths renders a support code:
+`invalid_token`, `token_expired`, `audience_mismatch`,
+`resource_mismatch`, `token_revoked_iat_cutoff` (all
+`middleware/auth.go`), `subject_concurrency_exceeded`
+(`internal/subjectlimiter`), and `state_missing`
+(`handlers/authorize.go`, which delivers an RFC 6749 §4.1.2.1 redirect
+instead of a rendered error).
+
 - `mcp_auth_access_denied_total{reason}` — buckets:
   - `group` / `group_invalid` — user not in `ALLOWED_GROUPS`, or
-    group name contained header-smuggling chars.
-  - `email_unverified` — `email_verified=false` from the IdP.
+    group name contained header-smuggling chars. The user-facing
+    `error_code` for the first is `group_not_allowed` (the wire
+    vocabulary is `<subject>_<state>`); the metric label stays `group`.
+  - `email_unverified` — `email_verified=false` from the IdP. The
+    user-facing `error_code` for this one is `email_not_verified`
+    (wire contract, pinned by the e2e suite) — a user quoting that
+    string is in this bucket.
   - `subject_missing` / `subject_concurrency_exceeded`.
   - `invalid_token` — forged / malformed / signature / AAD failures
     (**attack signal**).
@@ -162,7 +190,11 @@ sum(mcp_auth_consent_decisions_total{decision="approved"})
     `client_id`. (`/token` folds a missing `client_id` into its generic
     `invalid_request` "missing required parameters", unmetered.)
   - `client_id_invalid` — `/authorize` or `/token` could not decode
-    the sealed `client_id` (tampered, truncated, or wrong key).
+    the sealed `client_id` (tampered, truncated, or wrong key). Both
+    this and `client_typ_mismatch` surface on the wire as
+    `error_code=client_id_unknown` — deliberate: distinct codes would
+    tell an unauthenticated caller which of the two happened. The
+    metric labels stay distinct for the operator.
   - `client_typ_mismatch` — the blob decoded but is not a client
     registration (sealed-type-confusion defense; should not fire
     absent tampering).
@@ -173,6 +205,15 @@ sum(mcp_auth_consent_decisions_total{decision="approved"})
     `CLIENT_REGISTRATION_TTL`. Sustained counts = a client that
     never re-runs DCR; see
     [`runbooks/client-registration-expired.md`](./runbooks/client-registration-expired.md).
+  - `redirect_uri_missing` / `redirect_uri_mismatch` — `/authorize`
+    `redirect_uri` absent or not among the registered URIs (client
+    misconfiguration, not an attack signal).
+- `mcp_auth_page_render_failed_total{page}` — proxy-rendered page
+  template execute failures, by page (`error` / `consent` /
+  `interstitial`). The error page falls back to the JSON body; the
+  consent page and the interstitial fall back to the client's
+  `redirect_uri` envelope. Zero in a healthy deploy; any increment is a
+  template regression.
 - `mcp_auth_replay_detected_total{kind}` — `code` / `refresh` /
   `consent` / `callback_state` replays caught by the Redis-backed
   store. The `consent` kind answers with a re-rendered consent page

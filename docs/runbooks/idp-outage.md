@@ -8,14 +8,33 @@ refresh happens** — but refresh does NOT call the IdP, it only
 consults the sealed refresh token and the local replay store. So a
 brief IdP outage has a smaller blast radius than you might expect.
 
+Error codes quoted below (and by users off the error page) are
+catalogued in the [specs.md error-code
+table](../../specs.md#oauth2-error-handling).
+
 ## Signals
 
 - `/authorize` redirects to the IdP, user fails to complete login,
   browser returns to `/callback` with `error=server_error` (or the
   IdP's own error code if it's up enough to emit one). We then
   propagate the error verbatim to the MCP client.
+- Browser users on the exchange failures (`idp_exchange_failed`, 502)
+  see the "Temporarily unavailable" page telling them to wait, then go
+  back to the application and try again — the callback state is
+  claimed before the exchange, so the retry restarts at `/authorize`
+  rather than reloading the burnt `/callback` URL. Expect re-auth
+  traffic rather than support tickets. This response deliberately
+  carries **no** `Retry-After`: the callback state is already claimed,
+  so the only thing a retry of that URL can produce is
+  `callback_state_replay` — and a false replay-attack signal with it.
+  The two permanent misconfigurations
+  that share that status — `id_token_missing` (the IdP returns no
+  id_token) and `id_token_verification_failed` (signing-key / issuer /
+  audience mismatch) — deliberately say "contact the administrator"
+  instead, because retrying never clears them.
 - Prom: `mcp_auth_access_denied_total{reason="..."}` climbs for the
-  usual IdP-sourced denial reasons (`email_unverified`,
+  usual IdP-sourced denial reasons (`email_unverified` — reported to
+  the user as `email_not_verified`,
   `group_invalid`, `subject_missing`, `id_token_verification_failed`)
   depending on exactly how the IdP is failing.
 - Log: `upstream_token_exchange_failed` (IdP down at the token-
@@ -85,7 +104,7 @@ inbound traffic stays steady, the optional outbound rate-bucket
 (`IDP_EXCHANGE_RATE_PER_SEC` + `IDP_EXCHANGE_BURST`) is doing its
 job — capping proxy → IdP fan-out at `/callback` so the IdP isn't
 hammered. Throttled requests return 503 `idp_exchange_throttled`
-+ `Retry-After: 1`; the user retries and gets through once the
++ `Retry-After` (2-4s, jittered); the user retries and gets through once the
 bucket refills.
 
 Tuning playbook (only if the bucket is wired):

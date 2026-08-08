@@ -124,29 +124,48 @@ func TestRegisterDiscoveryRoutes_CustomMount(t *testing.T) {
 	}
 }
 
-// TestWellKnownNotFound_JSONShape verifies the JSON-envelope 404 body
-// so clients that only parse JSON errors do not trip on a text/plain
-// "404 page not found" from net/http's default (M2).
-func TestWellKnownNotFound_JSONShape(t *testing.T) {
+// Every 404 the proxy emits carries ONE body: the RFC 6749 envelope
+// with error_code=not_found. Previously the discovery carve-outs had a
+// shape of their own (`{"error":"not_found"}`), so a client parsing
+// error_code got nothing from them, and adding a browser-facing 404
+// would have produced a third. Asserted across all three producers —
+// a discovery carve-out, a stray unrouted path, and a browser-facing
+// path answered as JSON — because the point is that they agree.
+func TestNotFound_OneBodyEverywhere(t *testing.T) {
 	r := chi.NewRouter()
 	registerDiscoveryRoutes(r, "https://proxy.example.test", "/mcp", "", nil)
+	installNotFound(r)
 
-	req := httptest.NewRequest(http.MethodGet, "/.well-known/openid-configuration", nil)
-	rr := httptest.NewRecorder()
-	r.ServeHTTP(rr, req)
+	for _, path := range []string{
+		"/.well-known/openid-configuration", // discovery carve-out
+		"/nope",                             // stray probe
+		"/authorize/",                       // browser-facing, JSON arm
+	} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			rr := httptest.NewRecorder()
+			r.ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusNotFound {
-		t.Fatalf("status: want 404, got %d", rr.Code)
-	}
-	if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
-		t.Errorf("Content-Type: want application/json, got %q", ct)
-	}
-	var body map[string]any
-	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
-		t.Fatalf("decode body: %v", err)
-	}
-	if body["error"] != "not_found" {
-		t.Errorf("error field: want \"not_found\", got %v", body["error"])
+			if rr.Code != http.StatusNotFound {
+				t.Fatalf("status: want 404, got %d", rr.Code)
+			}
+			if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
+				t.Errorf("Content-Type: want application/json, got %q", ct)
+			}
+			var body map[string]any
+			if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+				t.Fatalf("decode body: %v", err)
+			}
+			if body["error"] != "invalid_request" {
+				t.Errorf("error: want invalid_request, got %v", body["error"])
+			}
+			if body["error_code"] != "not_found" {
+				t.Errorf("error_code: want not_found, got %v", body["error_code"])
+			}
+			if body["error_description"] == nil || body["error_description"] == "" {
+				t.Error("error_description is empty — a JSON-only client gets no explanation")
+			}
+		})
 	}
 }
 

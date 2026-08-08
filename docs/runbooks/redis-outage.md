@@ -17,7 +17,10 @@ the proxy fails closed on any Redis error.
   probing the same Redis, all 3 flip at once — customer impact is an
   instant 503 on every endpoint.
 - Prom: `mcp_auth_access_denied_total{reason="replay_store_unavailable"}`
-  climbs on `/token`. Log lines `replay_store_error` at error level.
+  climbs on `/token`, `/callback` and `/consent` (every claim site fails
+  closed). Log lines `replay_store_error` at error level. All three
+  answer 503 + `Retry-After: 5`; on `/callback` and `/consent` a browser
+  additionally gets the "Temporarily unavailable" error page.
 - If Redis is _slow_ rather than _down_, you'll see `PoolTimeout`,
   `read tcp … i/o timeout`, or context-deadline-exceeded errors (500ms
   default for read/write). `/readyz` may flap.

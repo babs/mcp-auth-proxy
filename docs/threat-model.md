@@ -43,15 +43,30 @@ rather than assuming they're already covered.
   verification, `nonce` echo, and audience checks all assume the
   IdP itself is honest. Out of scope for this proxy; in scope for
   the IdP operator's own threat model.
-- **Browser-side XSS in the consent page.** The page is JS-free and
-  CSP-locked (`default-src 'none'`, `style-src 'unsafe-inline'`,
-  `script-src` defaults to none, `frame-ancestors 'none'`,
-  `base-uri 'none'`, `form-action 'self'`). The consent POST is
+- **Browser-side XSS in the proxy-rendered pages** (consent page,
+  navigation interstitial, browser-facing error page — styles, CSPs and
+  the shared render path all in `handlers/pages.go`). Every one is
+  JS-free and
+  CSP-locked (`default-src 'none'`, `script-src` defaults to none,
+  `frame-ancestors 'none'`, `base-uri 'none'`; `form-action 'self'` on
+  the consent page — `'none'` on the interstitial and the error page,
+  neither of which carries a form). `style-src` names the sha256 of each
+  page's own compile-time `<style>` content rather than
+  `'unsafe-inline'`, so injected markup cannot carry styles of its own —
+  on the consent page that also means an injected style cannot hide the
+  Deny button or overlay the client name. The consent POST is
   answered with a same-origin navigation interstitial (200 + meta
   refresh), so `form-action` never needs to name the IdP or client
   origins — an injected form cannot point anywhere but the proxy
   itself. A browser-engine bug that escapes contextual HTML
-  escaping is not separately mitigated.
+  escaping is not separately mitigated. The error page additionally
+  relies on an invariant: every `writeOAuthError` description is a
+  compile-time literal — `sanitizeErrorDescription` strips control
+  bytes but not markup, so a call site piping IdP- or config-supplied
+  text through the sink would reach the page with only html/template's
+  escaping in the way. Enforced by
+  `TestWriteOAuthError_DescriptionsAreLiterals`, which walks every sink
+  call site and rejects non-literal-built description arguments.
 - **Network-level MITM between proxy and IdP.** TLS verification is
   on by default in the `oauth2` library; an operator who disables
   it (or a CA compromise) lets a MITM observe the upstream code

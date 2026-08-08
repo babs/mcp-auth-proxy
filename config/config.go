@@ -550,6 +550,12 @@ func Load() (*Config, error) {
 		if !c.RedisRequired {
 			violations = append(violations, "REDIS_REQUIRED=false (authorization codes + refresh tokens become replayable within TTL)")
 		}
+		// The per-IP buckets are the only bound on the unauthenticated
+		// pre-auth surface, and the browser error page makes a typical
+		// rejection ~13x the JSON body it replaced.
+		if !c.RateLimitEnabled {
+			violations = append(violations, "RATE_LIMIT_ENABLED=false (pre-auth endpoints unbounded; the browser error page amplifies a typical rejection ~13x)")
+		}
 		if c.RedisURL == "" {
 			violations = append(violations, "REDIS_URL unset (no replay store → no single-use codes, no refresh-rotation reuse detection)")
 		}

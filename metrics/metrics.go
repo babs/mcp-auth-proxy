@@ -94,6 +94,17 @@ var (
 		Help: "Dynamic client registrations accepted.",
 	})
 
+	// PageRenderFailed counts proxy-rendered pages whose template failed
+	// to execute. Labelled by page, because the three fail differently:
+	// the error page falls back to the JSON body, while the consent page
+	// and the interstitial fall back to the client's redirect_uri
+	// envelope. Zero in a healthy deploy; any increment is a template
+	// regression that would otherwise be visible only as a log line.
+	PageRenderFailed = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "mcp_auth_page_render_failed_total",
+		Help: "Proxy-rendered page template execute failures, by page.",
+	}, []string{"page"})
+
 	// RateLimited counts requests that were throttled at the pre-auth
 	// httprate layer. Labelled by endpoint.
 	RateLimited = promauto.NewCounterVec(prometheus.CounterOpts{

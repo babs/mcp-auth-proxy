@@ -101,11 +101,16 @@ On Redis failure the handler fails closed (503 `server_error` / `error_code: rep
 
 ### Migration notes (breaking changes since the previous spec)
 
-Three defaults were flipped to enforce the strict OAuth 2.1 / MCP posture by default. An operator pulling a new image without re-reading the config table will hit a hard `Fatal` at startup for the first two; the third changes the shape of the `/authorize` response.
+Defaults were tightened to enforce the strict OAuth 2.1 / MCP posture. An operator pulling a new image without re-reading the config table will hit a hard `Fatal` at startup for most of these; `RENDER_CONSENT_PAGE` instead changes the shape of the `/authorize` response.
 
 - **`UPSTREAM_MCP_URL` now requires an explicit path.** Origin-only URLs (`http://backend`, `http://backend/`) used to be the only legal shape; they are now rejected. The path is the proxy's public mount AND the path forwarded upstream — pick what your upstream actually serves (FastMCP default: `/mcp`). The path is also restricted to RFC 3986 unreserved characters plus `/`, so `:`, `*`, `{`, `}`, `@`, `+` etc. are rejected — they would otherwise silently register chi router patterns instead of literal segments.
-- **`PROD_MODE` now defaults to `true`.** Was `false`. Strict mode rejects every relaxation flag (`PKCE_REQUIRED=false`, `COMPAT_ALLOW_STATELESS=true`, `REDIS_REQUIRED=false`, `REDIS_URL` empty, legacy `TRUST_PROXY_HEADERS=true` without `TRUSTED_PROXY_CIDRS`). Existing dev / single-replica deployments that depended on those flags must set `PROD_MODE=false` explicitly.
+- **`PROD_MODE` now defaults to `true`.** Was `false`. Strict mode rejects every relaxation flag (`PKCE_REQUIRED=false`, `COMPAT_ALLOW_STATELESS=true`, `REDIS_REQUIRED=false`, `REDIS_URL` empty, `OIDC_ALLOW_INSECURE_HTTP=true`, a weak `TOKEN_SIGNING_SECRET`, legacy `TRUST_PROXY_HEADERS=true` without `TRUSTED_PROXY_CIDRS`; `RATE_LIMIT_ENABLED=false` joined the list later, see below). Existing dev / single-replica deployments that depended on those flags must set `PROD_MODE=false` explicitly.
 - **`RENDER_CONSENT_PAGE` now defaults to `true`.** Was `false`. `/authorize` now returns a 200 HTML consent page instead of a 302 to the IdP; the user clicks Approve or Deny on a `<form action="/consent" method="POST">`. Closes the open-DCR-plus-active-IdP-session silent-issuance phishing class. Browser-driven MCP clients (claude.ai, Claude Code, Cursor, MCP Inspector, ChatGPT) follow the form transparently. **If you drive `/authorize` from a non-browser caller** (CI rig, scrape test, headless agent that expected a 302), you have two options: set `RENDER_CONSENT_PAGE=false` to keep the legacy silent redirect, or update the caller to handle a 200 HTML response with a `consent_token`-bearing form (see `keycloak_e2e_test.go::approveConsent` for the reference walk-through).
+- **`POST /consent` with an `Authorization` header now answers 400, not 401.** A challenge-less 401 violates RFC 7235 §3.1, and a challenge would pop a browser credential dialog on an endpoint that rejects credentials by design. Any harness asserting 401 there breaks.
+- **`/authorize`, `/consent` and `/callback` now answer `text/html` to a caller sending `Accept: text/html`.** Many HTTP clients send that by default, so a non-browser caller that previously received JSON now receives a ~1.3 kB page on the same status and with the same `error`/`error_code`. Send `Accept: application/json` (or no `Accept`) to keep the JSON body. `/token`, `/register` and discovery are unaffected whatever they ask for.
+- **Wrong-method and unrouted requests now carry a body.** chi's defaults returned an empty 405 and a `text/plain` 404; both now answer JSON, or the error page on a browser-facing path with a real navigation.
+- **Request headers are capped at 16 KB on both listeners** (`MaxHeaderBytes`), down from net/http's 1 MB default. Over that, net/http answers `431 Request Header Fields Too Large` before any middleware, so it appears in no access log and no metric.
+- **`PROD_MODE=true` now also rejects `RATE_LIMIT_ENABLED=false`.** The per-IP buckets are the only bound on the unauthenticated pre-auth surface, and the browser-facing error page makes a typical rejection ~13x the JSON body it replaced (~16x on the throttle path). A production pod running both settings now fails startup; keep the limiter on, or set `PROD_MODE=false` if a WAF genuinely enforces the bound upstream.
 
 All configuration is via environment variables.
 
@@ -134,7 +139,7 @@ All configuration is via environment variables.
 | `COMPAT_ALLOW_STATELESS` | When `true`, `/authorize` synthesizes a `state` server-side if the client omits it (legacy MCP Inspector / Cursor). Default `false` — strict mode refuses with 400 `invalid_request` because a silent server-synth hides client-side CSRF bugs. `mcp_auth_access_denied_total{reason="state_missing"}` is incremented either way so operators can see how many clients still rely on the compat path | `false` (default) |
 | `MCP_LOG_BODY_MAX` | Max bytes buffered per authenticated request for JSON-RPC method extraction into access logs (default `65536`). `0` disables buffering — no `rpc_method`/`rpc_tool`/`rpc_id` fields are emitted. Only triggered when `Content-Type: application/json` and `Content-Length` is set and within the limit; SSE / chunked uploads pass through untouched | `65536` (default) |
 | `ACCESS_LOG_SKIP_RE` | Go RE2 regexp matched against `r.URL.Path` on the public listener only. Matching paths are dropped from the access log; handler response, Prometheus counters, and panic recovery are unaffected. Compiled once at startup; invalid pattern is fatal. RE2 is linear-time — no ReDoS surface. Whitespace-only values are treated as unset. `/readyz` and `/metrics` live on `METRICS_ADDR` and never reach this middleware. Always anchor with `^…$`; unanchored substrings can match unrelated upstream paths and `.*` silences the entire access log | `^/healthz$` |
-| `PROD_MODE` | Strict-posture gate. Default `true` — fails startup if any compatibility flag that weakens a security control is set (`PKCE_REQUIRED=false`, `COMPAT_ALLOW_STATELESS=true`, `REDIS_REQUIRED=false`, `REDIS_URL` empty, or legacy `TRUST_PROXY_HEADERS=true` without `TRUSTED_PROXY_CIDRS`). Set `PROD_MODE=false` explicitly for dev / single-replica work that needs one of the relaxation toggles | `true` (default) |
+| `PROD_MODE` | Strict-posture gate. Default `true` — fails startup if any compatibility flag that weakens a security control is set (`PKCE_REQUIRED=false`, `COMPAT_ALLOW_STATELESS=true`, `REDIS_REQUIRED=false`, `RATE_LIMIT_ENABLED=false`, `REDIS_URL` empty, `OIDC_ALLOW_INSECURE_HTTP=true`, a weak `TOKEN_SIGNING_SECRET`, or legacy `TRUST_PROXY_HEADERS=true` without `TRUSTED_PROXY_CIDRS`). Set `PROD_MODE=false` explicitly for dev / single-replica work that needs one of the relaxation toggles | `true` (default) |
 | `TRUSTED_PROXY_CIDRS` | Comma-separated CIDRs of peers whose `X-Forwarded-For`/`X-Real-IP`/`True-Client-IP` headers are honored for rate-limit keying. Other peers fall back to `RemoteAddr`. Preferred over `TRUST_PROXY_HEADERS`; takes precedence when both are set | `10.0.0.0/8,172.16.0.0/12,192.168.0.0/16` |
 | `MCP_RESOURCE_NAME` | Optional human-readable display name advertised under `resource_name` in the RFC 9728 PRM. Used by MCP clients for consent / UI display. Field is omitted when unset | `ACME MCP` |
 | `UPSTREAM_AUTHORIZATION_HEADER` | When non-empty, sent verbatim as the `Authorization` header on every request to the upstream MCP backend (full value incl. scheme, e.g. `Bearer s3cr3t`). Treat as a secret — mount from a Secret, not a ConfigMap | `Bearer xyz` |
@@ -155,7 +160,10 @@ mcp-auth-proxy/
 ├── config/
 │   └── config.go              # env parsing, validation
 ├── handlers/
-│   ├── helpers.go             # OAuthError, sealed types, writeJSON, isLoopback
+│   ├── helpers.go             # OAuthError + error_code vocabulary, the error sink, sealed types, isLoopback
+│   ├── pages.go               # shared page styles, CSPs, buffered render path
+│   ├── error_page.go          # Accept negotiation, title/advice mapping, pre-rendered 429/405/404 responders
+│   ├── consent.go             # consent page + POST /consent + nav interstitial
 │   ├── resource_metadata.go   # GET /.well-known/oauth-protected-resource (RFC 9728)
 │   ├── discovery.go           # GET /.well-known/oauth-authorization-server (RFC 8414)
 │   ├── register.go            # POST /register  (RFC 7591 DCR)
@@ -172,6 +180,12 @@ mcp-auth-proxy/
 │   ├── replay.go              # Store interface + ErrAlreadyClaimed
 │   ├── redis.go               # Redis-backed Store (SET NX, SET, EXISTS with prefix)
 │   └── memory.go              # In-process Store (tests / single replica)
+├── internal/
+│   ├── health/                # readiness probe state
+│   └── subjectlimiter/        # per-subject in-flight cap on the MCP route
+├── middleware/
+│   ├── auth.go                # Bearer validation on the proxied MCP route
+│   └── rpc_peek.go            # JSON-RPC method/tool extraction for logs + metrics
 ├── metrics/
 │   └── metrics.go             # Prometheus counters for security events
 └── Dockerfile
@@ -325,9 +339,9 @@ Always registered. Driven by the consent form rendered at step 3 of `/authorize`
 
 **Form fields:** `consent_token` (sealed blob from the GET-side render), `action` (`approve` or `deny`).
 
-**Guards (mirror `/token`):**
+**Guards (same shape as `/token`, except the `Authorization` rejection):**
 - `r.URL.RawQuery != ""` → 400. The sealed token would otherwise leak into access logs / browser history / Referer.
-- `Authorization` header present → 401 `invalid_client` with a `WWW-Authenticate` challenge. The endpoint advertises no client-auth scheme.
+- `Authorization` header present → 400 `invalid_request` + `error_code=consent_auth_header_present`, no challenge. The endpoint advertises no client-auth scheme; a 401 would require a `WWW-Authenticate` challenge (RFC 7235 §3.1) that pops a browser credential dialog on an endpoint rejecting credentials by design.
 - Body capped at 1 MB; repeated `consent_token` / `action` fields rejected.
 
 **Behavior:**
@@ -336,7 +350,7 @@ Always registered. Driven by the consent form rendered at step 3 of `/authorize`
 3. **`action=approve`:** mint upstream OIDC `nonce` (random 32 hex) + upstream PKCE verifier, regenerate the H6 server-side PKCE pair if the consent blob recorded one, seal a `sealedSession` (same shape as step 4 of `/authorize`), answer with the navigation interstitial targeting the IdP authorize URL. Increment `mcp_auth_consent_decisions_total{decision="approved"}`.
 4. **Anything else:** 400 `invalid_request`.
 
-**Why an interstitial, not a 302:** Chromium enforces the consent page's CSP `form-action` directive against every hop of the redirect chain a form submit initiates — including redirects the OAuth *client* performs after receiving the code, which are unknowable in advance. Terminating the form navigation at a same-origin 200 ends that enforcement; the meta refresh starts a regular navigation that `form-action` does not govern. This keeps the consent page CSP at `form-action 'self'` with no origin enumeration. The interstitial's own CSP is fully locked (`form-action 'none'`, no scripts) and `Cache-Control: no-store`. Server-error paths (seal failure, nonce failure) deliver the RFC 6749 error envelope through the same interstitial; only the replay-store-unavailable 503 and pre-validation 4xx remain JSON (same-origin, no redirect to block).
+**Why an interstitial, not a 302:** Chromium enforces the consent page's CSP `form-action` directive against every hop of the redirect chain a form submit initiates — including redirects the OAuth *client* performs after receiving the code, which are unknowable in advance. Terminating the form navigation at a same-origin 200 ends that enforcement; the meta refresh starts a regular navigation that `form-action` does not govern. This keeps the consent page CSP at `form-action 'self'` with no origin enumeration. The interstitial's own CSP is fully locked (`form-action 'none'`, no scripts) and `Cache-Control: no-store`. Server-error paths (seal failure, nonce failure) deliver the RFC 6749 error envelope through the same interstitial; only the replay-store-unavailable 503 and pre-validation 4xx stay at the proxy (same-origin, no redirect to block) — and since `/consent` is `BrowserFacing`, those render as the negotiated error page for a browser and as JSON for everyone else.
 
 **Single-use replay defense on `consent_token`:** when a replay store is wired (`REDIS_URL`), the consent token's `jti` is claimed atomically before either branch runs — the *decision* (Approve or Deny) executes at most once per token. Each GET `/authorize` render mints a fresh `jti`, so the back-button case still works. **On replay** (double-submit, back-button re-POST, captured token): the proxy re-renders the consent page (200) with a notice, a **fresh `jti`**, and the **original `ExpiresAt`** — replay→re-render cycles cannot extend a captured blob's life past the original 5-minute window, and a new explicit click is always required, so nothing auto-approves. `mcp_auth_replay_detected_total{kind="consent"}` increments **once per replayed POST** — note this now also counts benign double-submits, not only adversarial replays; do not page on low counts of this kind (see Metrics). The re-render loop is bounded by the per-IP `/consent` rate bucket. With no replay store wired (configured opt-out) the handler falls back to the prior stateless behavior (token unique, audience-bound, TTL-bounded, but replayable within the 5-min window).
 
@@ -349,13 +363,13 @@ Always registered. Driven by the consent form rendered at step 3 of `/authorize`
 **Behavior:**
 1. If the IdP returns an `error` (RFC 6749 §4.1.2.1), propagate it to the client
 2. Decrypt the `state` → retrieve the session, verify not expired
-3. **Single-use claim** on the session's `sid` when a replay store is wired — a replayed `/callback` is rejected with 400 `invalid_request` + `error_code=callback_state_replay` BEFORE the upstream IdP exchange runs (no fan-out, no audit-log noise). `mcp_auth_replay_detected_total{kind="callback_state"}` increments. Empty `sid` (legacy session in flight during rollout) falls through to stateless behavior. Store-error path fail-closes to 503 + `replay_store_unavailable`.
+3. **Single-use claim** on the session's `sid` when a replay store is wired — a replayed `/callback` is rejected with 400 `invalid_request` + `error_code=callback_state_replay` BEFORE the upstream IdP exchange runs (no fan-out, no audit-log noise). `mcp_auth_replay_detected_total{kind="callback_state"}` increments. Empty `sid` (legacy session in flight during rollout) falls through to stateless behavior. Store-error path fail-closes to 503 + `replay_store_unavailable` + `Retry-After: 5`.
 4. Exchange the code with the IdP (POST token endpoint, 10s timeout) to obtain `id_token` + `access_token`
 5. Validate the `id_token` via go-oidc (JWKS signature auto-discovery, issuer, audience)
 6. Extract claims: `sub`, `email`, `email_verified`, `name`
 7. If `email_verified` is present and false, reject with 403 `access_denied` + `error_code: email_not_verified` (absent claim is accepted — not all IdPs emit it)
 8. Extract groups from the configured claim (`GROUPS_CLAIM`, default `groups`)
-9. If `ALLOWED_GROUPS` is configured, verify the user belongs to at least one allowed group → 403 otherwise
+9. If `ALLOWED_GROUPS` is configured, verify the user belongs to at least one allowed group → 403 `access_denied` + `error_code: group_not_allowed` otherwise (the metric label stays `group`)
 10. Encrypt an internal authorization code with AES-GCM (60s TTL):
    ```
    {
@@ -533,7 +547,8 @@ Origin-only URLs (no path / lone `/`), query, fragment, userinfo, and paths that
 The router is built in [`main.go`](./main.go) (`func main`) — see that file rather than a copy here, since this block historically rotted. High level:
 
 - Global middlewares: in-flight WaitGroup → strip inbound `X-Request-Id` → `chimw.RequestID` → `zapMiddleware` → `chimw.Recoverer` → per-IP rate limiter.
-- OAuth endpoints (`/register`, `/authorize`, `/callback`, `/token`) and the discovery surface (`/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource`, mount-suffixed variants, and the openid-configuration / under-mount 404 carve-outs) carry per-endpoint rate limiters when `RATE_LIMIT_ENABLED=true` (passthrough otherwise). Discovery is silent on rate-limit per RFC 8414 §3 / RFC 9728 §3.1; the 60/min/IP ceiling here only catches floods. The `X-RateLimit-Limit` / `-Remaining` / `-Reset` headers httprate sets internally are stripped from every response — production MCP servers (Cloudflare, GitHub Copilot, Atlassian, Notion, Sentry) all keep them silent, and the IETF rate-limit-headers draft warns that disclosing quota state on auth/error paths leaks operational capacity to attackers. `replayStore` is wired only when `REDIS_URL` is set.
+- OAuth endpoints (`/register`, `/authorize`, `/consent`, `/callback`, `/token`) and the discovery surface (`/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource`, mount-suffixed variants, and the openid-configuration / under-mount 404 carve-outs) carry per-endpoint rate limiters when `RATE_LIMIT_ENABLED=true` (passthrough otherwise). Discovery is silent on rate-limit per RFC 8414 §3 / RFC 9728 §3.1; the 60/min/IP ceiling here only catches floods. The 429 carries `Retry-After: <window seconds>`, which states when to retry without disclosing the per-window quota; the `X-RateLimit-Limit` / `-Remaining` / `-Reset` headers httprate sets internally are stripped from every response — production MCP servers (Cloudflare, GitHub Copilot, Atlassian, Notion, Sentry) all keep them silent, and the IETF rate-limit-headers draft warns that disclosing quota state on auth/error paths leaks operational capacity to attackers. `replayStore` is wired only when `REDIS_URL` is set.
+- 405 responder (`installMethodNotAllowed`, wired after every route so it can read the finished routing table): replaces chi's empty-bodied default with the shared error sink, keeps the RFC 9110 §15.5.6 `Allow` header, and applies the `BrowserFacing` marker **per path** — a wrong method on `/consent` renders the page, one on `/token` or `/register` stays `application/json` like every other error there.
 - Liveness `/healthz` (always 200) on the public listener; readiness `/readyz` lives ONLY on the metrics listener (an unauthenticated `/readyz` on the public port is a Redis-DoS amplifier — see comment at `main.go:304`).
 - MCP proxy mounts at `cfg.UpstreamMCPMountPath` (path from `UPSTREAM_MCP_URL`) under `authMW.Validate` → `RPCPeek` → per-subject concurrency limiter. Client path == upstream path, verbatim, no rewrite.
 
@@ -541,7 +556,9 @@ The router is built in [`main.go`](./main.go) (`func main`) — see that file ra
 
 ## OAuth2 error handling
 
-Always return errors conforming to RFC 6749:
+Always return errors conforming to RFC 6749. This is the wire form for every programmatic caller;
+a browser that asks for `text/html` gets the same error as a page instead (see **Browser-facing
+rendering** below):
 
 ```go
 type OAuthError struct {
@@ -560,20 +577,101 @@ type OAuthError struct {
 | `code_replay` | Authorization code reused (requires Redis) | `invalid_grant` |
 | `refresh_reuse_detected` | Refresh token replayed after rotation → family revoked (requires Redis) | `invalid_grant` |
 | `refresh_family_revoked` | Refresh token whose family was previously revoked | `invalid_grant` |
-| `email_not_verified` | id_token `email_verified` is `false` | `access_denied` |
+| `email_not_verified` | id_token `email_verified` is `false` (metric label: `email_unverified`) | `access_denied` |
 | `subject_missing` | IdP returned a verified id_token without a `sub` claim (L5) | `access_denied` |
 | `group_invalid` | IdP group name contains `,` `\r` `\n` `\x00` | `access_denied` |
+| `group_not_allowed` | User belongs to none of `ALLOWED_GROUPS` (metric label: `group`) | `access_denied` |
+| `session_expired` / `session_audience_mismatch` / `callback_params_missing` | `/callback` flow state is unusable; the page tells the user to start again | `invalid_request` |
+| `session_unknown` | `/callback` state cannot be opened. Paired `error` is `invalid_request`, **or** the allowlisted IdP `error` when the IdP itself returned one | `invalid_request` (or the IdP's) |
+| `consent_token_missing` / `consent_token_invalid` / `consent_token_expired` / `consent_token_audience_mismatch` | `/consent` flow state is unusable; same "start again" advice | `invalid_request` |
+| `idp_exchange_failed` / `id_token_missing` / `id_token_claims_unparsable` | Upstream IdP failed the exchange or returned an unusable id_token | `server_error` |
+| `callback_state_replay` | `/callback` replayed (requires Redis); metric: `mcp_auth_replay_detected_total{kind="callback_state"}` — not an `access_denied_total` reason | `invalid_request` |
+| `idp_exchange_throttled` | Outbound IdP exchange throttled (`IDP_EXCHANGE_RATE_PER_SEC`) | `temporarily_unavailable` |
+| `refresh_concurrent_submit` | Racing refresh inside `REFRESH_RACE_GRACE_SEC` | `invalid_grant` |
+| `redirect_uri_missing` / `redirect_uri_mismatch` | `redirect_uri` absent or not registered (client input, `/authorize`) | `invalid_request` |
+| `redirect_uri_malformed` | An already-validated `redirect_uri` failed to re-parse at `/authorize`, `/consent` or `/callback`, leaving nowhere to deliver the §4.1.2.1 envelope — invariant violation, see the browser-facing rendering note | the original envelope's `error` (`server_error`, `access_denied`, `unsupported_response_type`, `invalid_target`, `invalid_request`, or the allowlisted IdP one) |
+| `consent_query_params_forbidden` / `consent_auth_header_present` / `consent_body_too_large` / `consent_form_malformed` / `consent_action_invalid` | `POST /consent` request-shape rejections | `invalid_request` |
+| `parameter_repeated` | A singleton query/form parameter was sent more than once (`/authorize`, `/consent`, `/callback`, `/token`) | `invalid_request` |
+| `method_not_allowed` | Wrong HTTP method for the route (e.g. `GET /consent` from a bookmark) | `invalid_request` |
+| `not_found` | No route at that path — a mistyped or trailing-slash bookmark, a stray probe, or a discovery carve-out. One body for all of them; only the browser-facing paths additionally render it as a page | `invalid_request` |
+| `refresh_revoked_iat_cutoff` | Refresh token predates `REVOKE_BEFORE` (bulk cutoff). **Emits no metric** — `mcp_auth_access_denied_total{reason="token_revoked_iat_cutoff"}` counts the separate *access-token* rejection in `middleware/auth.go`, which carries no wire code. Distinct from `refresh_family_revoked`, which is reuse detection | `invalid_grant` |
+| `code_seal_failed` / `interstitial_render_failed` | Internal failure minting a code or rendering the interstitial | `server_error` |
+| `client_id_missing` | `client_id` absent (`/authorize` only — `/token` folds it into an unmetered generic `invalid_request`) | `invalid_request` |
+| `client_id_unknown` | `client_id` did not decrypt, **or** decrypted with the wrong purpose tag. One code for both on purpose: distinct codes would tell an unauthenticated caller which of the two happened, i.e. whether a blob they hold is a genuine token of this proxy. The metric labels stay distinct (`client_id_invalid`, `client_typ_mismatch`) | `invalid_client` / `invalid_grant` |
+| `client_audience_mismatch` / `client_registration_expired` | Client registered for another `PROXY_BASE_URL`, or past its TTL; each matches the metric label of the same name | `invalid_client` |
 | `replay_store_unavailable` | Redis unreachable; handler fails closed | `server_error` |
 | `id_token_verification_failed` | go-oidc rejected the IdP id_token | `server_error` |
 | `token_issue_failed` | AES-GCM seal error when minting an access token | `server_error` |
+
+**Browser-facing rendering.** `/authorize`, `/consent` and `/callback` terminate in the user's
+browser, not in the MCP client — a raw JSON body there is a dead end for the human reading it. Those
+three routes are wrapped in `handlers.BrowserFacing`, and the shared error sink renders an HTML page
+when **both** hold: the route carries that marker, and the request's `Accept` lists `text/html`
+explicitly. Everything else gets the RFC 6749 JSON body unchanged.
+
+Gating on the route, not on `Accept` alone, is what keeps `/token` and `/register` on
+`application/json` as RFC 6749 §5.2 and RFC 7591 §3.2.2 require, whatever a caller asks for;
+discovery is likewise machine-only. `*/*` never triggers the page, and a `text/html` sitting inside a
+quoted parameter does not either.
+
+The page carries a title derived from the status, the `error` value **and** the `error_code`: a
+transient code reads as "Temporarily unavailable" even on a 5xx, and otherwise a `server_error` never
+reads as an authorization decision whatever status it rides on. It carries the `error_description` as its reason
+sentence, one line of
+advice, and `error` + `error_code` in small print for support. The advice is chosen from the failure:
+*wait and retry* on 429/503 and on the transient `error_code`s (`idp_exchange_throttled`,
+`replay_store_unavailable` — 502 alone is not enough, since two permanent IdP misconfigurations ride
+it); *wait, then go back to the application and try again* on `idp_exchange_failed`, whose callback
+state was claimed before the exchange, so reloading the same URL can only yield
+`callback_state_replay`; *go back to the application and start again* on the `error_code`s whose flow
+state is dead (`session_*`, `consent_token_*`, `callback_*`) and on the `/consent` request-shape
+rejections a fresh flow re-forms (`consent_query_params_forbidden`, `consent_form_malformed`,
+`consent_action_invalid`, `parameter_repeated`, `consent_auth_header_present`,
+`consent_body_too_large`, `method_not_allowed`, `not_found`); *reconnect this service in your application* on the stale-registration codes
+(`client_registration_expired`, `client_id_unknown`, `client_audience_mismatch`,
+`redirect_uri_mismatch`), which a client-side re-registration clears (see the runbook);
+*verify your email address with your identity provider* on `email_not_verified`, the one denial the
+user clears without an operator; and *contact the administrator quoting the code* otherwise. The
+mapping is `codeHints` in `handlers/error_page.go`, and
+`TestBrowserReachableCodes_HaveDeliberateAdvice` fails if a browser-reachable code has neither a row
+there nor an explicit record that the fallback is intended — telling a throttled user to call an
+administrator is worse than saying nothing. The per-endpoint rate limiter serves the pre-rendered
+page only to a request that also carries `Sec-Fetch-Dest: document` (a real top-level navigation) and
+answers plain JSON otherwise — the 429 path is unbounded and its page is ~16x its own 78-byte JSON body, so a
+spoofed `Accept` alone must not buy the amplification; its responses carry
+`Vary: Accept, Sec-Fetch-Dest`.
+
+Scope is the errors the proxy renders itself. An error that §4.1.2.1 delivers to an already-validated
+`redirect_uri` — the IdP-error path on `/callback`, every `/authorize` failure past `redirect_uri`
+validation, deny and server-error on `/consent` — leaves as a redirect or through the consent
+interstitial, not as a page. The one exception is the invariant-violation fallback: if that
+already-validated `redirect_uri` fails to re-parse there is nowhere to send the envelope, so the error
+goes back through the sink and renders like any other.
+
+The page is script-free under its own locked CSP (`errorPageCSP`, `handlers/pages.go` — `default-src 'none'; style-src
+'sha256-…'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'`; the style-src names the
+sha256 of the page's compile-time `<style>` content instead of `'unsafe-inline'`, computed from the
+same constant the template embeds so the two cannot drift; all three proxy-rendered pages are built
+this way). Both representations carry `Cache-Control: no-store`, and `Vary: Accept` is set on the
+browser-facing routes only — `/token` and `/register` have a single representation by RFC mandate, so
+advertising negotiation on them would invite a cache to key on an `Accept` that changes nothing. A
+`WWW-Authenticate` challenge is dropped whenever a page ships, where it would only make the browser pop
+a credential dialog and discard the body. The body is rendered into a buffer before any header is
+committed, so a template failure falls back to the JSON body instead of shipping a blank 4xx (and
+increments `mcp_auth_page_render_failed_total{page="error"}`). The HTTP status is identical either way, so
+nothing machine-observable changes.
 
 IdP-supplied `error` values on `/callback` are allowlisted against the
 RFC 6749 §4.1.2.1 set (`invalid_request`, `invalid_client`,
 `unauthorized_client`, `access_denied`, `unsupported_response_type`,
 `invalid_scope`, `server_error`, `temporarily_unavailable`); anything
 outside that set is rewritten to `server_error` before being echoed to
-the MCP client. `error_description` is truncated at 200 bytes and
-stripped of non-ASCII-printable bytes to defeat log / header injection.
+the MCP client. The IdP-supplied `error_description` is **not** echoed
+at all: it is discarded and replaced by a fixed literal on both the
+redirect and the proxy-rendered branch, because it is attacker-supplied
+on a `/callback` hit and would otherwise be rendered under the proxy's
+own domain. The 200-byte / printable-ASCII clamp at the sink remains as
+defence in depth for any future caller.
 
 ---
 
@@ -591,15 +689,20 @@ Operator-load-bearing invariants that are not surfaced by the env table or the e
 - **Structured logs**: zap JSON, `request_id` on every line. Inbound `X-Request-Id` is stripped before chi mints one (defeats client-controlled log forgery). Authenticated requests carry `sub` and `email`; JSON-RPC requests additionally carry `rpc_method`, `rpc_tool` (capped at 128 chars), `rpc_id` (capped at 64), all passed through a narrow allowlist (ASCII alphanumerics plus `._:/-+`). `MCP_LOG_BODY_MAX=0` suppresses the `rpc_*` fields; `ACCESS_LOG_SKIP_RE` drops whole lines for matching paths.
 - **Business metrics** (under `/metrics` on `METRICS_ADDR`):
   - `mcp_auth_tokens_issued_total{grant_type}`
-  - `mcp_auth_access_denied_total{reason}` — see README for the enumerated reasons
+  - `mcp_auth_access_denied_total{reason}` — see [`docs/configuration.md`](./docs/configuration.md#observability) for the enumerated reasons
   - `mcp_auth_replay_detected_total{kind}` (`code` / `refresh` / `consent` / `callback_state`) — `code`, `refresh` and `callback_state` are rejected requests (security signal); `consent` counts replayed consent POSTs that were answered with a re-rendered consent page, which includes benign double-submits / back-button re-POSTs — alert on sustained rate, not single ticks
+  - `mcp_auth_authorize_initiated_total{flow}` — `/authorize` requests admitted past validation, by flow (`consent` / `redirect`)
+  - `mcp_auth_idp_exchange_throttled_total` — outbound proxy → IdP exchanges refused by `IDP_EXCHANGE_RATE_PER_SEC`
   - `mcp_auth_rate_limited_total{endpoint}`
   - `mcp_auth_clients_registered_total`
   - `mcp_auth_groups_claim_shape_mismatch_total` — IdP-schema-drift signal; user is admitted with empty groups, so it's NOT a denial
+  - `mcp_auth_page_render_failed_total{page}` — proxy-rendered page template execute failures, by page (`error` / `consent` / `interstitial`). The error page falls back to the JSON body; the consent page and interstitial fall back to the client's `redirect_uri` envelope. Zero in a healthy deploy; any increment is a template regression
   - `mcp_auth_token_seals_total{purpose}` — cross-replica AES-GCM seal counter; alert on `sum(increase(metric[7d])) > 2**28` to drive `TOKEN_SIGNING_SECRET` rotation
   - `mcp_auth_rpc_calls_total{tool}` / `mcp_auth_rpc_calls_failed_total{tool}` / `mcp_auth_rpc_request_bytes_total{tool}` / `mcp_auth_rpc_response_bytes_total{tool}` — per-tool RPC traffic. Fire only on JSON-RPC `tools/call` (protocol-level methods like `initialize` / `tools/list` are excluded so `_unknown` reliably flags malformed `tools/call` payloads). Batches fan out into one `rpc_calls_total` increment per `tools/call` entry; byte counters stay scoped to single-call requests because per-call Content-Length / response bytes cannot be honestly attributed inside a batch. Disabled by default (cardinality + privacy trade); opt-in via `MCP_TOOL_METRICS=true`. Distinct labels capped by `MCP_TOOL_METRICS_MAX_CARDINALITY` (default 256) — overflow folds into `_overflow`, unparseable tool names into `_unknown`
   - `mcp_auth_rpc_batches_total` / `mcp_auth_rpc_batches_failed_total` / `mcp_auth_rpc_batch_bytes_total{direction}` — batch-shape counters, disjoint from the per-tool family. One increment per HTTP request that decoded as a JSON-RPC batch with at least one `tools/call` entry; carries the request's actual Content-Length / BytesWritten. No per-tool label — batch contents do not have honest per-call attribution. Same opt-in toggle (`MCP_TOOL_METRICS=true`) as the per-tool family
-- **HTTP timeouts**: `ReadTimeout: 30s`, `WriteTimeout: 0` (SSE), `IdleTimeout: 120s`. SSE streams MUST flush; do not buffer `text/event-stream` responses.
+- **HTTP timeouts**: `ReadTimeout: 30s`, `WriteTimeout: 0` (SSE), `IdleTimeout: 120s`, `ReadHeaderTimeout: 10s`.
+- SSE streams MUST flush; do not buffer `text/event-stream` responses.
+- **Header size limit**: `MaxHeaderBytes: 16 KB` (down from net/http's 1 MB default) on both listeners, so every header-driven cost — including the pre-auth `Accept` negotiation scan, which the rate limiter by construction does not cover — is bounded.
 - **Body size limit**: POST endpoints capped at 1 MB via `MaxBytesReader`.
 - **307/308 redirect following**: proxy follows server-side for Python MCP backends that redirect `/mcp` → `/mcp/`. Same-host only, body replayed, max 10 hops, scheme downgrade rejected.
 - **PRM `resource` field**: the root `/.well-known/oauth-protected-resource` carries the trailing-slash form for Claude.ai canonicalization (intentional deviation from RFC 9728 §3 — see the Endpoints section). The per-mount variant is spec-strict.

@@ -55,7 +55,7 @@ func Token(tm *token.Manager, logger *zap.Logger, audience string, revokeBefore 
 		// silently accepting via r.ParseForm merging both sources
 		// into r.Form.
 		if r.URL.RawQuery != "" {
-			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "token endpoint parameters must be in the request body, not the URL query")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "token endpoint parameters must be in the request body, not the URL query")
 			return
 		}
 
@@ -70,7 +70,7 @@ func Token(tm *token.Manager, logger *zap.Logger, audience string, revokeBefore 
 		// non-authenticated path.
 		if r.Header.Get("Authorization") != "" {
 			w.Header().Set("WWW-Authenticate", `Basic realm="token", error="invalid_client", error_description="this token endpoint does not authenticate clients (token_endpoint_auth_method=none); remove the Authorization header"`)
-			writeOAuthError(w, http.StatusUnauthorized, "invalid_client", "this token endpoint does not authenticate clients (token_endpoint_auth_method=none); remove the Authorization header")
+			writeOAuthError(w, r, http.StatusUnauthorized, "invalid_client", "this token endpoint does not authenticate clients (token_endpoint_auth_method=none); remove the Authorization header")
 			return
 		}
 
@@ -83,13 +83,13 @@ func Token(tm *token.Manager, logger *zap.Logger, audience string, revokeBefore 
 			// cases — we just sharpen the description.
 			var maxErr *http.MaxBytesError
 			if errors.As(err, &maxErr) {
-				writeOAuthError(w, http.StatusRequestEntityTooLarge, "invalid_request", "request body exceeds the 1 MB cap")
+				writeOAuthError(w, r, http.StatusRequestEntityTooLarge, "invalid_request", "request body exceeds the 1 MB cap")
 				return
 			}
-			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "malformed form body")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "malformed form body")
 			return
 		}
-		if rejectRepeatedParams(w, r.Form,
+		if rejectRepeatedParams(w, r, r.Form,
 			"grant_type",
 			"code",
 			"redirect_uri",
@@ -108,7 +108,7 @@ func Token(tm *token.Manager, logger *zap.Logger, audience string, revokeBefore 
 		if resources, ok := r.Form["resource"]; ok {
 			for _, res := range resources {
 				if !matchAnyResource(res, append([]string{audience}, resourceURIs...)) {
-					writeOAuthError(w, http.StatusBadRequest, "invalid_target", "resource does not identify this authorization server")
+					writeOAuthError(w, r, http.StatusBadRequest, "invalid_target", "resource does not identify this authorization server")
 					return
 				}
 			}
@@ -122,7 +122,7 @@ func Token(tm *token.Manager, logger *zap.Logger, audience string, revokeBefore 
 		case "refresh_token":
 			handleRefreshToken(w, r, tm, logger, audience, revokeBefore, replayStore, cfg.RefreshRaceGrace)
 		default:
-			writeOAuthError(w, http.StatusBadRequest, "unsupported_grant_type", "grant_type must be authorization_code or refresh_token")
+			writeOAuthError(w, r, http.StatusBadRequest, "unsupported_grant_type", "grant_type must be authorization_code or refresh_token")
 		}
 	}
 }
@@ -134,49 +134,49 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 	codeVerifier := r.FormValue("code_verifier")
 
 	if codeStr == "" || redirectURI == "" || clientIDStr == "" {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "missing required parameters")
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "missing required parameters")
 		return
 	}
 
 	// RFC 7636 §4.1: code_verifier = 43*128unreserved.
 	if codeVerifier != "" && !validPKCEValue(codeVerifier) {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "code_verifier must be 43-128 unreserved characters")
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "code_verifier must be 43-128 unreserved characters")
 		return
 	}
 
 	var code sealedCode
 	if err := tm.OpenJSON(codeStr, &code, token.PurposeCode); err != nil {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "invalid or expired authorization code")
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "invalid or expired authorization code")
 		return
 	}
 
 	if code.Typ != token.PurposeCode {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "invalid or expired authorization code")
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "invalid or expired authorization code")
 		return
 	}
 
 	if code.Audience != audience {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "authorization code bound to a different audience")
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "authorization code bound to a different audience")
 		return
 	}
 
 	if time.Now().After(code.ExpiresAt) {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "authorization code expired")
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "authorization code expired")
 		return
 	}
 
-	client := openAndValidateClient(w, tm, logger, clientIDStr, audience)
+	client := openAndValidateClient(w, r, tm, logger, clientIDStr, audience)
 	if client == nil {
 		return
 	}
 
 	if client.ID != code.ClientID {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "client_id mismatch")
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "client_id mismatch")
 		return
 	}
 
 	if code.RedirectURI != redirectURI {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "redirect_uri mismatch")
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "redirect_uri mismatch")
 		return
 	}
 
@@ -187,7 +187,7 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 	// replay / revocation guards below cannot silently no-op if a future
 	// code path forgets to populate either field at seal time.
 	if code.TokenID == "" || code.FamilyID == "" {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "authorization code missing token id or family id")
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "authorization code missing token id or family id")
 		return
 	}
 
@@ -206,11 +206,11 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 			effectiveVerifier = code.SvrVerifier
 		}
 		if effectiveVerifier == "" {
-			writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "code_verifier is required")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "code_verifier is required")
 			return
 		}
 		if !VerifyPKCE(effectiveVerifier, code.CodeChallenge) {
-			writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "PKCE verification failed")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "PKCE verification failed")
 			return
 		}
 	} else if codeVerifier != "" {
@@ -218,7 +218,7 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 		// registered without a code_challenge but supplies a code_verifier
 		// at /token is either confused or attempting to paper over a
 		// downgrade. Refuse explicitly instead of silently accepting.
-		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "code_verifier supplied but code was issued without a code_challenge")
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "code_verifier supplied but code was issued without a code_challenge")
 		return
 	}
 
@@ -257,7 +257,7 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 					zap.String("subject", code.Subject),
 					zap.String("client_id", client.ID),
 				)
-				writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "authorization code already used", "code_replay")
+				writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "authorization code already used", codeCodeReplay)
 				return
 			}
 			// Fail closed on backend errors — do not issue tokens against an
@@ -267,7 +267,8 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 			// both the code and refresh paths under load).
 			logger.Error("replay_store_error", zap.String("op", "claim_authz_code"), zap.Error(err))
 			metrics.AccessDenied.WithLabelValues("replay_store_unavailable").Inc()
-			writeOAuthError(w, http.StatusServiceUnavailable, "server_error", "replay store unavailable", "replay_store_unavailable")
+			retryAfterReplayStore(w.Header())
+			writeOAuthError(w, r, http.StatusServiceUnavailable, "server_error", "replay store unavailable", codeReplayStoreUnavailable)
 			return
 		}
 	}
@@ -275,7 +276,7 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 	accessToken, _, err := tm.Issue(audience, code.Subject, code.Email, client.ID, code.Groups, accessTokenTTL, code.Resource)
 	if err != nil {
 		logger.Error("token_issue_failed", zap.Error(err))
-		writeOAuthError(w, http.StatusInternalServerError, "server_error", "failed to issue token", "token_issue_failed")
+		writeOAuthError(w, r, http.StatusInternalServerError, "server_error", "failed to issue token", codeTokenIssueFailed)
 		return
 	}
 
@@ -310,7 +311,7 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 	refreshToken, err := tm.SealJSON(refresh, token.PurposeRefresh)
 	if err != nil {
 		logger.Error("refresh_token_seal_failed", zap.Error(err))
-		writeOAuthError(w, http.StatusInternalServerError, "server_error", "internal error")
+		writeOAuthError(w, r, http.StatusInternalServerError, "server_error", "internal error")
 		return
 	}
 
@@ -319,8 +320,7 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 
 	// RFC 6749 §5.1: token responses must not be cached. Pragma is HTTP/1.0
 	// legacy but still explicitly required by the spec.
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Pragma", "no-cache")
+	noStore(w.Header())
 	writeJSON(w, http.StatusOK, map[string]any{
 		"access_token":  accessToken,
 		"token_type":    "Bearer",
@@ -334,18 +334,18 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 	clientIDStr := r.FormValue("client_id")
 
 	if refreshTokenStr == "" || clientIDStr == "" {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "missing required parameters")
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "missing required parameters")
 		return
 	}
 
 	var refresh sealedRefresh
 	if err := tm.OpenJSON(refreshTokenStr, &refresh, token.PurposeRefresh); err != nil {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "invalid or expired refresh token")
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "invalid or expired refresh token")
 		return
 	}
 
 	if refresh.Typ != token.PurposeRefresh {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "invalid or expired refresh token")
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "invalid or expired refresh token")
 		return
 	}
 
@@ -355,12 +355,12 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 	// we reject upfront — belt-and-braces against any future code path
 	// that forgets to populate both fields at seal time.
 	if refresh.FamilyID == "" || refresh.TokenID == "" {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh token missing family or id")
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "refresh token missing family or id")
 		return
 	}
 
 	if refresh.Audience != audience {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh token bound to a different audience")
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "refresh token bound to a different audience")
 		return
 	}
 
@@ -386,22 +386,25 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 			zap.Time("family_issued_at", cutoffStamp),
 			zap.Time("revoke_before", revokeBefore),
 		)
-		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh token revoked")
+		// Distinct description AND code from the family-revocation
+		// rejection below: same words for both would leave an operator
+		// unable to tell a bulk cutoff from reuse detection.
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "refresh token revoked by the configured cutoff", codeRefreshRevokedCutoff)
 		return
 	}
 
 	if time.Now().After(refresh.ExpiresAt) {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh token expired")
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "refresh token expired")
 		return
 	}
 
-	client := openAndValidateClient(w, tm, logger, clientIDStr, audience)
+	client := openAndValidateClient(w, r, tm, logger, clientIDStr, audience)
 	if client == nil {
 		return
 	}
 
 	if client.ID != refresh.ClientID {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "client_id mismatch")
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "client_id mismatch")
 		return
 	}
 
@@ -431,7 +434,8 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 		if err != nil {
 			logger.Error("replay_store_error", zap.String("op", "claim_refresh_family"), zap.Error(err))
 			metrics.AccessDenied.WithLabelValues("replay_store_unavailable").Inc()
-			writeOAuthError(w, http.StatusServiceUnavailable, "server_error", "replay store unavailable", "replay_store_unavailable")
+			retryAfterReplayStore(w.Header())
+			writeOAuthError(w, r, http.StatusServiceUnavailable, "server_error", "replay store unavailable", codeReplayStoreUnavailable)
 			return
 		}
 		if revoked {
@@ -441,7 +445,7 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 				zap.String("subject", refresh.Subject),
 				zap.String("client_id", client.ID),
 			)
-			writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh token revoked", "refresh_family_revoked")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "refresh token revoked", codeRefreshFamilyRevoked)
 			return
 		}
 		if racing {
@@ -463,8 +467,15 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 			// peer's new refresh has had time to land in shared
 			// storage. The exact value is conservative; clients
 			// MAY retry sooner if they observe the new refresh.
+			//
+			// Fixed, unlike the jittered replay-store and IdP-exchange
+			// helpers: this rejection is scoped to one token family's
+			// two racing peers, not to a population every replica is
+			// rejecting at once, so there is no herd to desynchronise —
+			// and spreading it past the grace window would only delay
+			// the retry that is meant to land just after it.
 			w.Header().Set("Retry-After", "2")
-			writeOAuthError(w, http.StatusTooManyRequests, "invalid_grant", "refresh token concurrent submit; the legitimate peer is rotating, retry after the new refresh lands", "refresh_concurrent_submit")
+			writeOAuthError(w, r, http.StatusTooManyRequests, "invalid_grant", "refresh token concurrent submit; the legitimate peer is rotating, retry after the new refresh lands", codeRefreshConcurrent)
 			return
 		}
 		if alreadyClaimed {
@@ -475,7 +486,7 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 				zap.String("subject", refresh.Subject),
 				zap.String("client_id", client.ID),
 			)
-			writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh token reuse detected — family revoked", "refresh_reuse_detected")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "refresh token reuse detected — family revoked", codeRefreshReuse)
 			return
 		}
 	}
@@ -483,7 +494,7 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 	accessToken, _, err := tm.Issue(audience, refresh.Subject, refresh.Email, client.ID, refresh.Groups, accessTokenTTL, refresh.Resource)
 	if err != nil {
 		logger.Error("token_refresh_issue_failed", zap.Error(err))
-		writeOAuthError(w, http.StatusInternalServerError, "server_error", "failed to issue token", "token_issue_failed")
+		writeOAuthError(w, r, http.StatusInternalServerError, "server_error", "failed to issue token", codeTokenIssueFailed)
 		return
 	}
 
@@ -517,7 +528,7 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 	newRefreshToken, err := tm.SealJSON(newRefresh, token.PurposeRefresh)
 	if err != nil {
 		logger.Error("refresh_token_reseal_failed", zap.Error(err))
-		writeOAuthError(w, http.StatusInternalServerError, "server_error", "internal error")
+		writeOAuthError(w, r, http.StatusInternalServerError, "server_error", "internal error")
 		return
 	}
 
@@ -526,8 +537,7 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 
 	// RFC 6749 §5.1: token responses must not be cached. Pragma is HTTP/1.0
 	// legacy but still explicitly required by the spec.
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Pragma", "no-cache")
+	noStore(w.Header())
 	writeJSON(w, http.StatusOK, map[string]any{
 		"access_token":  accessToken,
 		"token_type":    "Bearer",

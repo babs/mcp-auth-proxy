@@ -1606,21 +1606,27 @@ func TestLoad_UpstreamMCPURL_ReservedPrefix_NotShadowed(t *testing.T) {
 // error message clearly names which one tripped the gate.
 func TestLoad_ProdMode_BlocksUnsafeFlags(t *testing.T) {
 	cases := []struct {
-		name  string
-		setup func(t *testing.T)
+		name string
+		// wantSubstr names the violation expected to fire: asserting
+		// only that "PROD_MODE" appears lets any violation stand in for
+		// any other, so a message rewritten to the empty string still
+		// passed.
+		wantSubstr string
+		setup      func(t *testing.T)
 	}{
-		{"pkce_disabled", func(t *testing.T) { t.Setenv("PKCE_REQUIRED", "false") }},
-		{"compat_stateless", func(t *testing.T) { t.Setenv("COMPAT_ALLOW_STATELESS", "true") }},
-		{"redis_not_required", func(t *testing.T) { t.Setenv("REDIS_REQUIRED", "false") }},
-		{"redis_url_unset", func(t *testing.T) {
+		{"pkce_disabled", "PKCE_REQUIRED", func(t *testing.T) { t.Setenv("PKCE_REQUIRED", "false") }},
+		{"compat_stateless", "COMPAT_ALLOW_STATELESS", func(t *testing.T) { t.Setenv("COMPAT_ALLOW_STATELESS", "true") }},
+		{"redis_not_required", "REDIS_REQUIRED", func(t *testing.T) { t.Setenv("REDIS_REQUIRED", "false") }},
+		{"rate_limit_disabled", "RATE_LIMIT_ENABLED", func(t *testing.T) { t.Setenv("RATE_LIMIT_ENABLED", "false") }},
+		{"redis_url_unset", "REDIS_URL", func(t *testing.T) {
 			// setAllRequired seeds a default REDIS_URL for PROD_MODE
 			// compatibility; clear it explicitly for this case.
 			t.Setenv("REDIS_URL", "")
 		}},
-		{"legacy_trust_proxy_headers", func(t *testing.T) {
+		{"legacy_trust_proxy_headers", "TRUST_PROXY_HEADERS", func(t *testing.T) {
 			t.Setenv("TRUST_PROXY_HEADERS", "true")
 		}},
-		{"insecure_oidc_http", func(t *testing.T) {
+		{"insecure_oidc_http", "OIDC_ALLOW_INSECURE_HTTP", func(t *testing.T) {
 			t.Setenv("OIDC_ALLOW_INSECURE_HTTP", "true")
 			t.Setenv("OIDC_ISSUER_URL", "http://keycloak:8080/realms/mcp-demo")
 		}},
@@ -1636,6 +1642,9 @@ func TestLoad_ProdMode_BlocksUnsafeFlags(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), "PROD_MODE") {
 				t.Errorf("error should mention PROD_MODE, got %q", err)
+			}
+			if !strings.Contains(err.Error(), tc.wantSubstr) {
+				t.Errorf("error should name %s, got %q", tc.wantSubstr, err)
 			}
 		})
 	}
