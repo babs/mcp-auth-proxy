@@ -1978,9 +1978,9 @@ func TestLoad_GroupsClaimMaxBytes(t *testing.T) {
 		{"default when unset", "", token.DefaultGroupsMaxBytes, ""},
 		{"accepted mid-range", "6144", 6144, ""},
 		{"accepted at floor", "1024", 1024, ""},
-		{"accepted at ceiling", "10240", 10240, ""},
+		{"accepted at ceiling", "40960", 40960, ""},
 		{"below floor rejected", "512", 0, "must be >= 1024"},
-		{"above ceiling rejected", "12288", 0, "must be <= 10240"},
+		{"above ceiling rejected", "49152", 0, "must be <= 40960"},
 		{"non-integer rejected", "8k", 0, "must be an integer"},
 	}
 	for _, tc := range cases {

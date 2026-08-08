@@ -786,30 +786,52 @@ func TestWantsHTML_NoCountOrLengthCap(t *testing.T) {
 	}
 }
 
-// The real ceiling, asserted where it lives: a header at the server's
-// MaxHeaderBytes limit must stay cheap. Fails loudly if the scan ever
-// becomes super-linear — a quadratic scan on 16 KB is milliseconds, not
-// microseconds.
-func TestWantsHTML_WorstCaseAtHeaderCeiling(t *testing.T) {
-	const maxHeaderBytes = 16 << 10
-	worst := map[string]string{
-		"quoted_commas": `application/json;profile="` + strings.Repeat("a,", maxHeaderBytes/2-20) + `"`,
-		"all_semis":     "text/html;" + strings.Repeat("q=0.5;", maxHeaderBytes/6-10),
-		"all_commas":    strings.Repeat(",", maxHeaderBytes-16) + "text/html",
+// The scan must stay LINEAR in the header's length: quadratic behaviour
+// on a 64 KB header (main.go's MaxHeaderBytes) would be a pre-auth CPU
+// amplifier on a path no rate limiter covers.
+//
+// Asserted as a ratio, never as wall-clock: an absolute budget encodes
+// the machine it was written on, and this test failed in CI under -race
+// while passing locally for exactly that reason. Doubling the input on
+// the same machine cancels its speed out — linear work doubles,
+// quadratic work quadruples.
+func TestWantsHTML_ScanIsLinearInHeaderLength(t *testing.T) {
+	shapes := map[string]func(int) string{
+		"quoted_commas": func(n int) string {
+			return `application/json;profile="` + strings.Repeat("a,", n/2-20) + `"`
+		},
+		"all_semis":  func(n int) string { return "text/html;" + strings.Repeat("q=0.5;", n/6-10) },
+		"all_commas": func(n int) string { return strings.Repeat(",", n-16) + "text/html" },
 	}
-	for name, accept := range worst {
-		t.Run(name, func(t *testing.T) {
-			if len(accept) > maxHeaderBytes {
-				t.Fatalf("probe header is %d bytes, over the %d ceiling it models", len(accept), maxHeaderBytes)
-			}
-			r := browserRoute(httptest.NewRequest(http.MethodGet, "/callback", nil))
-			r.Header.Set("Accept", accept)
+	// Best-of-three at each size: scheduling noise inflates a sample,
+	// it never makes one faster, so the minimum is the stable estimate.
+	measure := func(accept string) time.Duration {
+		r := browserRoute(httptest.NewRequest(http.MethodGet, "/callback", nil))
+		r.Header.Set("Accept", accept)
+		best := time.Duration(1<<62 - 1)
+		for range 3 {
 			start := time.Now()
-			for range 100 {
+			for range 20 {
 				wantsHTML(r)
 			}
-			if el := time.Since(start); el > time.Second {
-				t.Errorf("100 scans of a %d-byte header took %v — the scan is not linear", len(accept), el)
+			if d := time.Since(start); d < best {
+				best = d
+			}
+		}
+		return best
+	}
+	for name, build := range shapes {
+		t.Run(name, func(t *testing.T) {
+			small := measure(build(16 << 10))
+			large := measure(build(32 << 10))
+			if small <= 0 {
+				t.Skip("timer resolution too coarse to compare")
+			}
+			ratio := float64(large) / float64(small)
+			// Linear doubles (~2), quadratic quadruples (~4). 3 splits
+			// them with room for measurement noise.
+			if ratio > 3 {
+				t.Errorf("doubling the header multiplied the scan by %.1fx (%v -> %v) — the scan is not linear", ratio, small, large)
 			}
 		})
 	}

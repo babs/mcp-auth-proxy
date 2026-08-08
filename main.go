@@ -413,12 +413,18 @@ func main() {
 		// otherwise exceed it, but MCP POSTs are small JSON-RPC payloads.
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		// 16 KB, down from net/http's 1 MB default: every header-driven
+		// 64 KB, down from net/http's 1 MB default: every header-driven
 		// cost on every route (including the pre-auth Accept scan, which
 		// the rate limiter by construction does not cover) is bounded by
-		// this. Real browsers and MCP clients sit well under 8 KB, the
-		// ceiling most reverse proxies already impose.
-		MaxHeaderBytes: 16 << 10,
+		// this, and so is the memory an in-flight connection can hold
+		// while its headers are still being read.
+		//
+		// Not tighter: the bearer token this proxy mints carries the
+		// user's groups, so a group-heavy directory legitimately needs
+		// tens of kilobytes. A budget that a valid token cannot fit
+		// answers 431 before any middleware runs — invisible in the
+		// access log and in every metric.
+		MaxHeaderBytes: 64 << 10,
 		// WriteTimeout left at 0 — required for SSE/streaming connections
 		IdleTimeout: 120 * time.Second,
 	}
@@ -436,7 +442,7 @@ func main() {
 		Handler:        metricsMux,
 		ReadTimeout:    5 * time.Second,
 		WriteTimeout:   30 * time.Second,
-		MaxHeaderBytes: 16 << 10,
+		MaxHeaderBytes: 64 << 10,
 		IdleTimeout:    120 * time.Second,
 	}
 
