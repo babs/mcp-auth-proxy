@@ -81,15 +81,15 @@ func Register(tm *token.Manager, logger *zap.Logger, audience string, clientTTL 
 			// handlers/token.go.
 			var maxErr *http.MaxBytesError
 			if errors.As(err, &maxErr) {
-				writeOAuthError(w, http.StatusRequestEntityTooLarge, "invalid_request", "request body exceeds the 1 MB cap")
+				writeOAuthError(w, r, http.StatusRequestEntityTooLarge, "invalid_request", "request body exceeds the 1 MB cap")
 				return
 			}
-			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "invalid JSON body")
 			return
 		}
 		var trailing any
 		if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
-			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "invalid JSON body")
 			return
 		}
 
@@ -99,7 +99,7 @@ func Register(tm *token.Manager, logger *zap.Logger, audience string, clientTTL 
 		// field). Clients switch on these codes to surface the specific
 		// defect to the operator.
 		if len(req.RedirectURIs) == 0 {
-			writeOAuthError(w, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uris is required and must not be empty")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uris is required and must not be empty")
 			return
 		}
 
@@ -107,7 +107,7 @@ func Register(tm *token.Manager, logger *zap.Logger, audience string, clientTTL 
 		// unauthenticated caller can register thousands of URIs and bloat
 		// the sealed client_id / logs / metrics indefinitely.
 		if len(req.RedirectURIs) > maxRedirectURIs {
-			writeOAuthError(w, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uris exceeds maximum count")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uris exceeds maximum count")
 			return
 		}
 
@@ -116,7 +116,7 @@ func Register(tm *token.Manager, logger *zap.Logger, audience string, clientTTL 
 		// /register cannot amplify a large request body into oversized
 		// logs and responses.
 		if len(req.ClientName) > maxClientNameLength {
-			writeOAuthError(w, http.StatusBadRequest, "invalid_client_metadata", "client_name exceeds maximum length")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_client_metadata", "client_name exceeds maximum length")
 			return
 		}
 		// Reject control bytes (NUL / CR / LF / TAB / etc.) and the
@@ -128,7 +128,7 @@ func Register(tm *token.Manager, logger *zap.Logger, audience string, clientTTL 
 		// callback.go (M12). RFC 7591 §2 permits operator-side
 		// rejection of metadata; §3.2.2 prescribes the error code.
 		if strings.ContainsAny(req.ClientName, ",\r\n\t\x00\x0b\x0c") {
-			writeOAuthError(w, http.StatusBadRequest, "invalid_client_metadata", "client_name must not contain control bytes or commas")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_client_metadata", "client_name must not contain control bytes or commas")
 			return
 		}
 
@@ -138,12 +138,12 @@ func Register(tm *token.Manager, logger *zap.Logger, audience string, clientTTL 
 		// phishing (https://attacker:pass@legit.example/cb visually legit).
 		for _, raw := range req.RedirectURIs {
 			if len(raw) > maxRedirectURILength {
-				writeOAuthError(w, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri exceeds maximum length")
+				writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri exceeds maximum length")
 				return
 			}
 			u, err := url.Parse(raw)
 			if err != nil {
-				writeOAuthError(w, http.StatusBadRequest, "invalid_redirect_uri", "malformed redirect_uri")
+				writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "malformed redirect_uri")
 				return
 			}
 			// Require an absolute URI with a real authority.
@@ -154,21 +154,21 @@ func Register(tm *token.Manager, logger *zap.Logger, audience string, clientTTL 
 			// through and the /callback redirect later emits a broken
 			// Location header to the browser.
 			if u.Opaque != "" {
-				writeOAuthError(w, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must be an absolute URI with authority, not opaque")
+				writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must be an absolute URI with authority, not opaque")
 				return
 			}
 			if u.Host == "" {
-				writeOAuthError(w, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must include a host")
+				writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must include a host")
 				return
 			}
 			// Also trip on a trailing bare "#" (url.Parse leaves Fragment
 			// empty for "https://x/cb#" even though the marker is present).
 			if u.Fragment != "" || strings.Contains(raw, "#") {
-				writeOAuthError(w, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must not contain a fragment")
+				writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must not contain a fragment")
 				return
 			}
 			if u.User != nil {
-				writeOAuthError(w, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must not contain userinfo")
+				writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must not contain userinfo")
 				return
 			}
 			// Only http(s) schemes are meaningful for a browser-driven
@@ -180,11 +180,11 @@ func Register(tm *token.Manager, logger *zap.Logger, audience string, clientTTL 
 				// always allowed
 			case "http":
 				if !isLoopback(u) {
-					writeOAuthError(w, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must use HTTPS for non-loopback addresses")
+					writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must use HTTPS for non-loopback addresses")
 					return
 				}
 			default:
-				writeOAuthError(w, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri scheme must be http (loopback only) or https")
+				writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri scheme must be http (loopback only) or https")
 				return
 			}
 		}
@@ -198,7 +198,7 @@ func Register(tm *token.Manager, logger *zap.Logger, audience string, clientTTL 
 		case "", "none":
 			authMethod = "none"
 		default:
-			writeOAuthError(w, http.StatusBadRequest, "invalid_client_metadata", "unsupported token_endpoint_auth_method; only \"none\" is supported")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_client_metadata", "unsupported token_endpoint_auth_method; only \"none\" is supported")
 			return
 		}
 
@@ -224,7 +224,7 @@ func Register(tm *token.Manager, logger *zap.Logger, audience string, clientTTL 
 		clientID, err := tm.SealJSON(sc, token.PurposeClient)
 		if err != nil {
 			logger.Error("client_seal_failed", zap.Error(err))
-			writeOAuthError(w, http.StatusInternalServerError, "server_error", "failed to register client")
+			writeOAuthError(w, r, http.StatusInternalServerError, "server_error", "failed to register client")
 			return
 		}
 
@@ -235,8 +235,7 @@ func Register(tm *token.Manager, logger *zap.Logger, audience string, clientTTL 
 		// Our client_id is a bearer-like registration handle (7d default
 		// TTL, or non-expiring when CLIENT_REGISTRATION_TTL=0), so keep it
 		// out of shared caches even though POST responses are rarely cached.
-		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Pragma", "no-cache")
+		noStore(w.Header())
 		// 0 = never expires; zero time must not be rendered via .Unix()
 		// (which yields a large negative epoch).
 		var clientIDExpiresAt int64

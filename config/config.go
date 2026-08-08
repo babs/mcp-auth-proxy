@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/babs/mcp-auth-proxy/token"
 )
 
 type Config struct {
@@ -103,6 +105,15 @@ type Config struct {
 	// extraction into access logs. 0 disables buffering entirely (no method
 	// logging). Default 65536 (64 KiB).
 	MCPLogBodyMax int64 // env: MCP_LOG_BODY_MAX
+	// GroupsClaimMaxBytes bounds the groups claim sealed into an access
+	// token. Tunable because the budget is bytes, so how many groups
+	// survive depends on the directory's naming scheme (per-shape counts
+	// in the Limits table of docs/configuration.md — not repeated here,
+	// since a measured figure copied twice drifts the moment the budget
+	// moves). Above ~10 KB the sealed token alone exceeds the 16 KB
+	// header block and every request 431s before any middleware runs.
+	// env: GROUPS_CLAIM_MAX_BYTES.
+	GroupsClaimMaxBytes int
 	// AccessLogSkipRE, when non-nil, suppresses access-log lines whose
 	// request path matches. Typical use: quiet liveness-probe noise with
 	// "^/healthz$" (probes on every replica, every periodSeconds, bury
@@ -342,6 +353,26 @@ func Load() (*Config, error) {
 		c.RefreshRaceGrace = time.Duration(n) * time.Second
 	}
 
+	// GROUPS_CLAIM_MAX_BYTES: default 8 KB, clamped to [1 KB, 10 KB].
+	// The ceiling is measured, not chosen: the seal expands the claim
+	// ~1.37x, so a 12 KB budget mints a 17 KB Authorization header that
+	// cannot fit the 16 KB block (TestGroupsCeilingFitsHeaderBudget).
+	// The floor keeps a typo from truncating every user to nothing.
+	c.GroupsClaimMaxBytes = token.DefaultGroupsMaxBytes
+	if raw := os.Getenv("GROUPS_CLAIM_MAX_BYTES"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			return nil, fmt.Errorf("GROUPS_CLAIM_MAX_BYTES must be an integer: %w", err)
+		}
+		if n < 1024 {
+			return nil, fmt.Errorf("GROUPS_CLAIM_MAX_BYTES must be >= 1024; got %d", n)
+		}
+		if n > 10240 {
+			return nil, fmt.Errorf("GROUPS_CLAIM_MAX_BYTES must be <= 10240; got %d (above that the sealed token alone exceeds the 16 KB header block and every request fails with 431 before any middleware runs)", n)
+		}
+		c.GroupsClaimMaxBytes = n
+	}
+
 	// IDP_EXCHANGE_RATE_PER_SEC + IDP_EXCHANGE_BURST tune the
 	// outbound rate-limit bucket on the proxy → IdP /token leg.
 	// 0 disables. Default off — operators behind a permissive XFF
@@ -549,6 +580,12 @@ func Load() (*Config, error) {
 		}
 		if !c.RedisRequired {
 			violations = append(violations, "REDIS_REQUIRED=false (authorization codes + refresh tokens become replayable within TTL)")
+		}
+		// The per-IP buckets are the only bound on the unauthenticated
+		// pre-auth surface, and the browser error page makes a typical
+		// rejection ~13x the JSON body it replaced.
+		if !c.RateLimitEnabled {
+			violations = append(violations, "RATE_LIMIT_ENABLED=false (pre-auth endpoints unbounded; the browser error page amplifies a typical rejection ~13x)")
 		}
 		if c.RedisURL == "" {
 			violations = append(violations, "REDIS_URL unset (no replay store → no single-use codes, no refresh-rotation reuse detection)")

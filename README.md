@@ -83,11 +83,26 @@ already wired up, see [Demo stack](#demo-stack).
 - **Redis-backed replay defense** — single-use authorization codes,
   refresh-rotation reuse detection (OAuth 2.1 §6.1), single-use
   consent and callback-state tokens.
-- **Per-IP rate limiting** on every pre-auth endpoint, **per-subject
+- **Per-IP rate limiting** (`RATE_LIMIT_ENABLED=true`; `=false` fails startup under `PROD_MODE`) on every pre-auth endpoint, **per-subject
   concurrency caps** on the authenticated route, `email_verified`
   enforcement on the IdP id_token, **Prometheus metrics** for every
   security-relevant event, and a **proxy-rendered consent page** on
   by default.
+- **Readable errors for humans**: `/authorize`, `/consent` and
+  `/callback` end up in the user's browser, so a request that asks for
+  `text/html` gets the failure (wrong group, unverified email, expired
+  session, throttled — the throttle page needs a real browser
+  navigation, `Sec-Fetch-Dest: document`) as a plain page carrying a
+  support code and advice matched to the failure, instead of a raw JSON
+  blob — the support-code vocabulary is catalogued in the
+  [error-code table](./specs.md#oauth2-error-handling). Every
+  programmatic caller keeps the RFC 6749 JSON body unchanged, and
+  `/token` / `/register` stay JSON whatever they ask for. Failures that
+  happen once a `redirect_uri` is validated still go back to the client
+  as an RFC 6749 §4.1.2.1 error envelope — a redirect from `/authorize`
+  and `/callback`, a same-origin interstitial from `/consent` — never
+  the error page, except the invariant-violation fallback when that
+  already-validated URI fails to re-parse.
 
 The MCP spec requires an OAuth 2.1 Authorization Server in front of
 protected MCP servers. You probably do not want to implement RFC 8414

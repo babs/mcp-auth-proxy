@@ -19,3 +19,4 @@ manifests/docker-compose/.env
 # Local audit artifacts (not committed)
 SECURITY_AUDIT_REDTEAM.md
 PLAN_AUDIT_LOGGING.md
+.claude/scratchpad/

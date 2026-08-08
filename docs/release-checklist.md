@@ -27,6 +27,38 @@ Check the rendered production overlay:
 - Redis egress points at the intended managed/operator Redis endpoint,
 - pod security context remains nonroot with dropped capabilities.
 
+Exercise the error page against a running instance — a page that stops
+rendering is invisible to the checks above. The status is printed too:
+without it, an ingress or WAF serving its own HTML error page is
+indistinguishable from a working proxy:
+
+```bash
+BASE=https://mcp.example.com   # the running instance under test
+
+# error page: expect "400 text/html; charset=utf-8"
+curl -sS -o /dev/null -w '%{http_code} %{content_type}\n' -H 'Accept: text/html' "$BASE/callback?state=bogus"
+# machine contract: a */* caller (curl's default) must stay JSON — expect "400 application/json"
+curl -sS -o /dev/null -w '%{http_code} %{content_type}\n' "$BASE/callback?state=bogus"
+# and so must a caller sending no Accept header at all — expect "400 application/json"
+curl -sS -o /dev/null -w '%{http_code} %{content_type}\n' -H 'Accept:' "$BASE/callback?state=bogus"
+# /token must stay JSON even when asked for HTML — expect "400 application/json"
+curl -sS -o /dev/null -w '%{http_code} %{content_type}\n' -X POST -H 'Accept: text/html' "$BASE/token"
+```
+
+`-S` so a bad `$BASE` fails loudly instead of printing an empty line. No
+`-f`: the endpoints answer 400 by design, and `-f` would turn every one
+of these into a curl exit 22.
+
+Status and `Content-Type` do not prove the page is *styled*: a wrong
+`style-src` sha256 renders a page every browser strips the CSS from,
+which on the consent page is the Approve/Deny distinction. CI pins the
+hash against the rendered bytes (`TestPageCSPHashMatchesRenderedStyle`),
+so this is a spot-check rather than the gate:
+
+```bash
+curl -sS -D- -o /dev/null -H 'Accept: text/html' "$BASE/callback?state=bogus" | grep -i content-security-policy
+```
+
 ## Tagging
 
 Use a semver tag with a leading `v`:

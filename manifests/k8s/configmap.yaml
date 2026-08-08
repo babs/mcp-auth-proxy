@@ -67,7 +67,9 @@ data:
 
   # Strict-posture gate. Default (true) fails startup if any
   # compatibility flag weakens a security control (PKCE_REQUIRED=false,
-  # COMPAT_ALLOW_STATELESS=true, REDIS_REQUIRED=false, REDIS_URL empty,
+  # COMPAT_ALLOW_STATELESS=true, REDIS_REQUIRED=false,
+  # RATE_LIMIT_ENABLED=false, REDIS_URL empty,
+  # OIDC_ALLOW_INSECURE_HTTP=true, a weak TOKEN_SIGNING_SECRET,
   # legacy TRUST_PROXY_HEADERS=true without TRUSTED_PROXY_CIDRS). Set
   # to "false" only for dev / single-replica work that needs one of
   # the relaxation toggles.

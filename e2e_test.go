@@ -5,6 +5,7 @@ import (
 	"crypto/rsa"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -20,6 +21,7 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/oauth2"
 
+	"github.com/babs/mcp-auth-proxy/config"
 	"github.com/babs/mcp-auth-proxy/handlers"
 	"github.com/babs/mcp-auth-proxy/middleware"
 	"github.com/babs/mcp-auth-proxy/proxy"
@@ -173,7 +175,7 @@ func (m *mockMCPServer) Close() {
 
 // buildTestProxy wires up the full proxy router using real components
 // but pointing at mock OIDC and mock MCP.
-func buildTestProxy(t *testing.T, oidcProvider *mockOIDCProvider, mcpServer *mockMCPServer, proxyBaseURL string) http.Handler {
+func buildTestProxy(t *testing.T, oidcProvider *mockOIDCProvider, mcpServer *mockMCPServer, proxyBaseURL string, renderConsent bool) http.Handler {
 	t.Helper()
 
 	provider, err := oidc.NewProvider(t.Context(), oidcProvider.Server.URL)
@@ -204,22 +206,40 @@ func buildTestProxy(t *testing.T, oidcProvider *mockOIDCProvider, mcpServer *moc
 	authMW := middleware.NewAuth(tm, zap.NewNop(), proxyBaseURL, "/mcp", time.Time{})
 
 	r := chi.NewRouter()
+	// The production middleware chain, not a bare router: the error
+	// page's CSP has to override the securityHeaders baseline, and only
+	// this chain puts that baseline there.
+	baseMiddleware(r, zap.NewNop(), &config.Config{})
 	registerDiscoveryRoutes(r, proxyBaseURL, "/mcp", "", nil)
-	r.Post("/register", handlers.Register(tm, zap.NewNop(), proxyBaseURL, handlers.DefaultClientTTL))
-	r.Get("/authorize", handlers.Authorize(tm, zap.NewNop(), proxyBaseURL, oauth2Cfg, handlers.AuthorizeConfig{
-		PKCERequired:      true,
-		CanonicalResource: proxyBaseURL + "/mcp",
-	}))
-	r.Get("/callback", handlers.Callback(tm, zap.NewNop(), proxyBaseURL, oauth2Cfg, verifier, handlers.CallbackConfig{
-		GroupsClaim: "groups",
-	}))
-	r.Post("/token", handlers.Token(tm, zap.NewNop(), proxyBaseURL, time.Time{}, nil, handlers.TokenConfig{}))
+	// The production wiring, not hand-mounted routes: the e2e suite must
+	// exercise the same router shape main builds (BrowserFacing markers
+	// included), or the two silently diverge.
+	registerOAuthRoutes(r, oauthRoutes{
+		Register: handlers.Register(tm, zap.NewNop(), proxyBaseURL, handlers.DefaultClientTTL),
+		Authorize: handlers.Authorize(tm, zap.NewNop(), proxyBaseURL, oauth2Cfg, handlers.AuthorizeConfig{
+			PKCERequired:      true,
+			CanonicalResource: proxyBaseURL + "/mcp",
+			// Production defaults this true. Most cases run it false to
+			// drive the direct-to-IdP path;
+			// TestE2E_ConsentFlowThroughProductionRouter runs it true.
+			RenderConsentPage: renderConsent,
+		}),
+		Consent: handlers.Consent(tm, zap.NewNop(), proxyBaseURL, oauth2Cfg, handlers.ConsentConfig{}),
+		Callback: handlers.Callback(tm, zap.NewNop(), proxyBaseURL, oauth2Cfg, verifier, handlers.CallbackConfig{
+			GroupsClaim: "groups",
+		}),
+		Token:         handlers.Token(tm, zap.NewNop(), proxyBaseURL, time.Time{}, nil, handlers.TokenConfig{}),
+		RegisterLimit: passthrough, AuthorizeLimit: passthrough, ConsentLimit: passthrough,
+		CallbackLimit: passthrough, TokenLimit: passthrough,
+	})
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
 	r.Group(func(r chi.Router) {
 		r.Use(authMW.Validate)
 		r.Handle("/mcp", proxyHandler)
 		r.Handle("/mcp/*", proxyHandler)
 	})
+	installMethodNotAllowed(r)
+	installNotFound(r)
 
 	return r
 }
@@ -233,7 +253,7 @@ func TestE2E_FullOAuthMCPFlow(t *testing.T) {
 	defer mcpMock.Close()
 
 	// 2. Start the proxy
-	proxyServer := httptest.NewServer(buildTestProxy(t, oidcMock, mcpMock, "http://proxy.test"))
+	proxyServer := httptest.NewServer(buildTestProxy(t, oidcMock, mcpMock, "http://proxy.test", false))
 	defer proxyServer.Close()
 
 	client := &http.Client{
@@ -646,7 +666,7 @@ func TestE2E_RejectsUnverifiedEmail(t *testing.T) {
 	mcpMock := newMockMCPServer(t)
 	defer mcpMock.Close()
 
-	proxyServer := httptest.NewServer(buildTestProxy(t, oidcMock, mcpMock, "http://proxy.test"))
+	proxyServer := httptest.NewServer(buildTestProxy(t, oidcMock, mcpMock, "http://proxy.test", false))
 	defer proxyServer.Close()
 
 	client := &http.Client{
@@ -691,7 +711,7 @@ func TestE2E_AcceptsVerifiedEmail(t *testing.T) {
 	mcpMock := newMockMCPServer(t)
 	defer mcpMock.Close()
 
-	proxyServer := httptest.NewServer(buildTestProxy(t, oidcMock, mcpMock, "http://proxy.test"))
+	proxyServer := httptest.NewServer(buildTestProxy(t, oidcMock, mcpMock, "http://proxy.test", false))
 	defer proxyServer.Close()
 
 	client := &http.Client{
@@ -711,4 +731,143 @@ func TestE2E_AcceptsVerifiedEmail(t *testing.T) {
 		b, _ := io.ReadAll(cbResp.Body)
 		t.Fatalf("expected 302 for verified email, got %d: %s", cbResp.StatusCode, b)
 	}
+}
+
+// TestE2E_ConsentFlowThroughProductionRouter drives the consent screen
+// the way production serves it (RenderConsentPage defaults true): GET
+// /authorize renders the page, the Approve POST comes back as a
+// same-origin interstitial, and only then does the flow reach the IdP.
+// The rest of the suite runs with consent off, so without this case no
+// e2e request ever reached POST /consent even though the router mounts
+// it.
+func TestE2E_ConsentFlowThroughProductionRouter(t *testing.T) {
+	oidcMock := newMockOIDCProvider(t)
+	defer oidcMock.Close()
+	mcpMock := newMockMCPServer(t)
+	defer mcpMock.Close()
+
+	proxyServer := httptest.NewServer(buildTestProxy(t, oidcMock, mcpMock, "http://proxy.test", true))
+	defer proxyServer.Close()
+
+	client := &http.Client{
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	const redirectURI = "https://app.example.com/callback"
+
+	regBody := strings.NewReader(`{"redirect_uris":["` + redirectURI + `"],"client_name":"e2e consent app"}`)
+	regReq, err := http.NewRequestWithContext(t.Context(), http.MethodPost, proxyServer.URL+"/register", regBody)
+	if err != nil {
+		t.Fatalf("build /register: %v", err)
+	}
+	regReq.Header.Set("Content-Type", "application/json")
+	regResp, err := client.Do(regReq)
+	if err != nil {
+		t.Fatalf("POST /register: %v", err)
+	}
+	var reg map[string]any
+	if err := json.NewDecoder(regResp.Body).Decode(&reg); err != nil {
+		t.Fatalf("decode /register: %v", err)
+	}
+	if err := regResp.Body.Close(); err != nil {
+		t.Fatalf("close /register body: %v", err)
+	}
+
+	params := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {reg["client_id"].(string)},
+		"redirect_uri":          {redirectURI},
+		"code_challenge":        {handlers.ComputePKCEChallenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk")},
+		"code_challenge_method": {"S256"},
+		"state":                 {"s"},
+	}
+	authzReq, err := http.NewRequestWithContext(t.Context(), http.MethodGet, proxyServer.URL+"/authorize?"+params.Encode(), nil)
+	if err != nil {
+		t.Fatalf("build /authorize: %v", err)
+	}
+	authzResp, err := client.Do(authzReq)
+	if err != nil {
+		t.Fatalf("GET /authorize: %v", err)
+	}
+	page, err := io.ReadAll(authzResp.Body)
+	if err != nil {
+		t.Fatalf("read consent page: %v", err)
+	}
+	if err := authzResp.Body.Close(); err != nil {
+		t.Fatalf("close /authorize body: %v", err)
+	}
+	if authzResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /authorize: want 200 consent page, got %d: %s", authzResp.StatusCode, page)
+	}
+	// The page must survive the production middleware chain: its own CSP
+	// has to replace the securityHeaders baseline, not be intersected
+	// with it.
+	if csp := authzResp.Header.Values("Content-Security-Policy"); len(csp) != 1 || !strings.Contains(csp[0], "style-src 'sha256-") {
+		t.Errorf("consent page CSP = %q, want exactly one policy naming its style hash", csp)
+	}
+
+	consentToken := extractE2EConsentToken(t, string(page))
+	form := url.Values{"consent_token": {consentToken}, "action": {"approve"}}
+	consentReq, err := http.NewRequestWithContext(t.Context(), http.MethodPost, proxyServer.URL+"/consent", strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatalf("build /consent: %v", err)
+	}
+	consentReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	consentResp, err := client.Do(consentReq)
+	if err != nil {
+		t.Fatalf("POST /consent: %v", err)
+	}
+	interstitial, err := io.ReadAll(consentResp.Body)
+	if err != nil {
+		t.Fatalf("read interstitial: %v", err)
+	}
+	if err := consentResp.Body.Close(); err != nil {
+		t.Fatalf("close /consent body: %v", err)
+	}
+	// Approve is answered by the same-origin interstitial (200 + meta
+	// refresh), never a cross-origin 302 — that is what keeps the
+	// consent page's form-action 'self' from blocking the chain.
+	if consentResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /consent: want 200 interstitial, got %d: %s", consentResp.StatusCode, interstitial)
+	}
+	target := extractE2EMetaRefresh(t, string(interstitial))
+	if !strings.HasPrefix(target, oidcMock.Server.URL) {
+		t.Errorf("interstitial target = %q, want the IdP authorize URL", target)
+	}
+	idpURL, err := url.Parse(target)
+	if err != nil {
+		t.Fatalf("parse IdP URL: %v", err)
+	}
+	if idpURL.Query().Get("state") == "" || idpURL.Query().Get("nonce") == "" {
+		t.Errorf("interstitial target missing sealed state / nonce: %q", target)
+	}
+}
+
+// extractE2EConsentToken pulls the sealed consent token out of the
+// rendered consent form.
+func extractE2EConsentToken(t *testing.T, body string) string {
+	t.Helper()
+	_, rest, found := strings.Cut(body, `name="consent_token" value="`)
+	if !found {
+		t.Fatalf("consent_token field not found in page:\n%s", body)
+	}
+	tok, _, found := strings.Cut(rest, `"`)
+	if !found {
+		t.Fatal("consent_token close-quote not found")
+	}
+	return tok
+}
+
+// extractE2EMetaRefresh pulls the navigation target out of the
+// interstitial's meta refresh, undoing the attribute escaping.
+func extractE2EMetaRefresh(t *testing.T, body string) string {
+	t.Helper()
+	_, rest, found := strings.Cut(body, `content="0;url=`)
+	if !found {
+		t.Fatalf("meta refresh not found in interstitial:\n%s", body)
+	}
+	raw, _, found := strings.Cut(rest, `"`)
+	if !found {
+		t.Fatal("meta refresh close-quote not found")
+	}
+	return html.UnescapeString(raw)
 }

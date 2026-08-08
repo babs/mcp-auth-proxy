@@ -112,7 +112,7 @@ func CallbackWithVerifyFunc(tm *token.Manager, logger *zap.Logger, audience stri
 func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oauth2Cfg *oauth2.Config, verify verifyIDTokenFunc, cbCfg CallbackConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
-		if rejectRepeatedParams(w, q,
+		if rejectRepeatedParams(w, r, q,
 			"code",
 			"state",
 			"error",
@@ -127,13 +127,14 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 		// OriginalState) so the MCP client sees a spec-compliant error
 		// response and can correlate against the state it sent. Only
 		// when the session is unreachable (tampered/expired state) do
-		// we fall through to a proxy-hosted JSON body.
+		// we fall through to a proxy-hosted error response (negotiated:
+		// JSON, or the page on this browser-facing route).
 		//
 		// The IdP-supplied `error` is allowlisted against RFC 6749
 		// §4.1.2.1 (anything else collapses to server_error) and
-		// `error_description` is truncated at 200 chars with
-		// non-printable bytes stripped, so neither can smuggle a
-		// header-breaking or log-injection payload through the redirect.
+		// `error_description` is discarded and replaced with a fixed
+		// literal, so neither can smuggle attacker-controlled text
+		// through the redirect or the proxy-hosted response.
 		idpError := q.Get("error")
 		internalState := q.Get("state")
 
@@ -174,35 +175,35 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 				redirectAuthzError(w, r, idpSession.RedirectURI, idpSession.OriginalState, safeError, fixedDesc, audience)
 				return
 			}
-			writeOAuthError(w, http.StatusBadRequest, safeError, "authorization request could not be matched to a known session")
+			writeOAuthError(w, r, http.StatusBadRequest, safeError, "authorization request could not be matched to a known session", codeSessionUnknown)
 			return
 		}
 
 		upstreamCode := q.Get("code")
 
 		if upstreamCode == "" || internalState == "" {
-			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "missing code or state")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "missing code or state", codeCallbackParamsMissing)
 			return
 		}
 
 		var session sealedSession
 		if err := tm.OpenJSON(internalState, &session, token.PurposeSession); err != nil {
-			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "unknown or expired state")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "unknown or expired state", codeSessionUnknown)
 			return
 		}
 
 		if session.Typ != token.PurposeSession {
-			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "unknown or expired state")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "unknown or expired state", codeSessionUnknown)
 			return
 		}
 
 		if session.Audience != audience {
-			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "session bound to a different audience")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "session bound to a different audience", codeSessionAudienceMismatch)
 			return
 		}
 
 		if time.Now().After(session.ExpiresAt) {
-			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "session expired")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "session expired", codeSessionExpired)
 			return
 		}
 
@@ -226,8 +227,8 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 			logger.Warn("idp_exchange_throttled",
 				zap.String("client_id", session.ClientID),
 			)
-			w.Header().Set("Retry-After", "1")
-			writeOAuthError(w, http.StatusServiceUnavailable, "temporarily_unavailable", "upstream IdP exchange throttled; retry shortly", "idp_exchange_throttled")
+			retryAfterIdPExchange(w.Header())
+			writeOAuthError(w, r, http.StatusServiceUnavailable, "temporarily_unavailable", "upstream IdP exchange throttled; retry shortly", codeIdPExchangeThrottled)
 			return
 		}
 
@@ -248,12 +249,13 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 						zap.String("session_id", session.SessionID),
 						zap.String("client_id", session.ClientID),
 					)
-					writeOAuthError(w, http.StatusBadRequest, "invalid_request", "callback state already used", "callback_state_replay")
+					writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "callback state already used", codeCallbackStateReplay)
 					return
 				}
 				logger.Error("replay_store_error", zap.String("op", "claim_callback_state"), zap.Error(err))
 				metrics.AccessDenied.WithLabelValues("replay_store_unavailable").Inc()
-				writeOAuthError(w, http.StatusServiceUnavailable, "server_error", "replay store unavailable", "replay_store_unavailable")
+				retryAfterReplayStore(w.Header())
+				writeOAuthError(w, r, http.StatusServiceUnavailable, "server_error", "replay store unavailable", codeReplayStoreUnavailable)
 				return
 			}
 		}
@@ -269,13 +271,18 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 		)
 		if err != nil {
 			logger.Error("upstream_token_exchange_failed", zap.Error(err))
-			writeOAuthError(w, http.StatusBadGateway, "server_error", "upstream authentication failed")
+			// No Retry-After: the single-use state claim above already
+			// ran, so retrying THIS URL can only yield
+			// callback_state_replay (and a false replay-attack signal).
+			// The page hint sends the user back to the application
+			// instead; a machine caller has nothing correct to retry.
+			writeOAuthError(w, r, http.StatusBadGateway, "server_error", "upstream authentication failed", codeIdPExchangeFailed)
 			return
 		}
 
 		rawIDToken, ok := oauth2Token.Extra("id_token").(string)
 		if !ok {
-			writeOAuthError(w, http.StatusBadGateway, "server_error", "no id_token in upstream response")
+			writeOAuthError(w, r, http.StatusBadGateway, "server_error", "no id_token in upstream response", codeIDTokenMissing)
 			return
 		}
 
@@ -283,7 +290,7 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 		if err != nil {
 			logger.Error("id_token_verification_failed", zap.Error(err))
 			metrics.AccessDenied.WithLabelValues("id_token_verification_failed").Inc()
-			writeOAuthError(w, http.StatusBadGateway, "server_error", "id token verification failed", "id_token_verification_failed")
+			writeOAuthError(w, r, http.StatusBadGateway, "server_error", "id_token verification failed", codeIDTokenVerificationFailed)
 			return
 		}
 
@@ -308,7 +315,7 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 			// for alerting because the operator response is the
 			// same (check the IdP signing keys, scope, audience).
 			metrics.AccessDenied.WithLabelValues("id_token_verification_failed").Inc()
-			writeOAuthError(w, http.StatusForbidden, "server_error", "id token nonce mismatch", "id_token_verification_failed")
+			writeOAuthError(w, r, http.StatusForbidden, "server_error", "id_token nonce mismatch", codeIDTokenVerificationFailed)
 			return
 		}
 
@@ -320,7 +327,7 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 		}
 		if err := idToken.Claims(&claims); err != nil {
 			logger.Error("id_token_claims_parse_failed", zap.Error(err))
-			writeOAuthError(w, http.StatusInternalServerError, "server_error", "failed to parse claims")
+			writeOAuthError(w, r, http.StatusInternalServerError, "server_error", "failed to parse claims", codeIDTokenClaimsUnparsable)
 			return
 		}
 
@@ -332,7 +339,7 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 		if claims.Sub == "" {
 			metrics.AccessDenied.WithLabelValues("subject_missing").Inc()
 			logger.Warn("access_denied_subject_missing", zap.String("email", claims.Email))
-			writeOAuthError(w, http.StatusForbidden, "access_denied", "id token missing subject claim", "subject_missing")
+			writeOAuthError(w, r, http.StatusForbidden, "access_denied", "id_token is missing the subject claim", codeSubjectMissing)
 			return
 		}
 
@@ -346,7 +353,7 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 				zap.String("subject", claims.Sub),
 				zap.String("email", claims.Email),
 			)
-			writeOAuthError(w, http.StatusForbidden, "access_denied", "email address is not verified", "email_not_verified")
+			writeOAuthError(w, r, http.StatusForbidden, "access_denied", "email address is not verified", codeEmailNotVerified)
 			return
 		}
 
@@ -398,7 +405,7 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 				logger.Warn("access_denied_group_invalid",
 					zap.String("subject", claims.Sub),
 				)
-				writeOAuthError(w, http.StatusForbidden, "access_denied", "group name contains invalid characters", "group_invalid")
+				writeOAuthError(w, r, http.StatusForbidden, "access_denied", "group name contains invalid characters", codeGroupInvalid)
 				return
 			}
 		}
@@ -411,7 +418,11 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 				zap.Strings("user_groups", groups),
 				zap.Strings("allowed_groups", cbCfg.AllowedGroups),
 			)
-			writeOAuthError(w, http.StatusForbidden, "access_denied", "user not in any allowed group")
+			// Wire code and metric label differ here, like the email
+			// pair: the vocabulary is <subject>_<state> and a bare
+			// "group" is the odd one out on a page a user reads. Both
+			// pairs are documented in the specs.md error-code table.
+			writeOAuthError(w, r, http.StatusForbidden, "access_denied", "user not in any allowed group", codeGroupNotAllowed)
 			return
 		}
 
@@ -445,14 +456,14 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 		code, err := tm.SealJSON(sc, token.PurposeCode)
 		if err != nil {
 			logger.Error("authorization_code_seal_failed", zap.Error(err))
-			writeOAuthError(w, http.StatusInternalServerError, "server_error", "internal error")
+			writeOAuthError(w, r, http.StatusInternalServerError, "server_error", "internal error", codeCodeSealFailed)
 			return
 		}
 
 		// Safely merge params even if redirect_uri already contains a query string
 		redirectParsed, err := url.Parse(session.RedirectURI)
 		if err != nil {
-			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "malformed redirect_uri")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "malformed redirect_uri", codeRedirectURIMalformed)
 			return
 		}
 		q2 := redirectParsed.Query()
@@ -494,14 +505,14 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 // `iss` being present on EVERY authorization response, not just
 // success — omitting it on the error path defeats the defense exactly
 // when an attacker would want to inject a forged error from a
-// different AS. On a parse failure we fall back to a proxy-hosted
-// JSON body — the registered URI went through exact-match validation
-// upstream, so a parse error here is an invariant violation rather
-// than attacker-controlled input.
+// different AS. On a parse failure we fall back to a proxy-hosted error
+// response, negotiated like any other — the registered URI went through
+// exact-match validation upstream, so a parse error here is an invariant
+// violation rather than attacker-controlled input.
 func redirectAuthzError(w http.ResponseWriter, r *http.Request, redirectURI, state, errCode, errDesc, audience string) {
 	target, err := authzErrorURL(redirectURI, state, errCode, errDesc, audience)
 	if err != nil {
-		writeOAuthError(w, http.StatusBadRequest, errCode, errDesc)
+		writeOAuthError(w, r, http.StatusBadRequest, errCode, errDesc, codeRedirectURIMalformed)
 		return
 	}
 	http.Redirect(w, r, target, http.StatusFound)

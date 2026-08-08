@@ -88,8 +88,11 @@ func TestAuthorize_RenderConsentPage_HTMLOnApproval(t *testing.T) {
 	if ct := rr.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
 		t.Errorf("Content-Type = %q, want text/html...", ct)
 	}
-	if cc := rr.Header().Get("Cache-Control"); cc != "no-store" {
+	if cc := rr.Result().Header.Get("Cache-Control"); cc != "no-store" {
 		t.Errorf("Cache-Control = %q, want no-store", cc)
+	}
+	if pragma := rr.Result().Header.Get("Pragma"); pragma != "no-cache" {
+		t.Errorf("Pragma = %q, want no-cache", pragma)
 	}
 	body := rr.Body.String()
 	if !strings.Contains(body, "Friendly App") {
@@ -317,11 +320,11 @@ func TestConsent_ApproveSvrPKCE_H6(t *testing.T) {
 // TestConsent_RelaxedCSP pins the consent-page CSP override: the
 // shared securityHeaders middleware emits `default-src 'none'`
 // which blocks the inline <style> block on the consent page; the
-// handler overrides CSP for this response only to add
-// `style-src 'unsafe-inline'`. Pin both arms — relaxed on consent,
-// strict everywhere else — so a future renderConsent change that
-// drops the override (page renders unstyled) or loosens it further
-// (script-src 'unsafe-inline'?) is caught.
+// handler overrides CSP for this response only, naming the sha256 of
+// that block's own content. Pin both arms — widened on consent, strict
+// everywhere else — so a future renderConsent change that drops the
+// override (page renders unstyled) or loosens it to a blanket
+// inline-styles allowance is caught.
 func TestConsent_RelaxedCSP(t *testing.T) {
 	tm := newTestTokenManager(t)
 	encClientID, _ := registerClientNamed(t, tm, []string{"https://app.example.com/callback"}, "App")
@@ -340,8 +343,16 @@ func TestConsent_RelaxedCSP(t *testing.T) {
 	authorizeConsentEnabled(tm)(rr, req)
 
 	csp := rr.Header().Get("Content-Security-Policy")
-	if !strings.Contains(csp, "style-src 'unsafe-inline'") {
-		t.Errorf("consent CSP missing style-src 'unsafe-inline' (inline <style> would be blocked): got %q", csp)
+	// The inline <style> is allowed by its own sha256, not by
+	// 'unsafe-inline': injected markup must not be able to carry styles
+	// that hide the Deny button or overlay the client name. The hash
+	// matching the rendered bytes is pinned by
+	// TestPageCSPHashMatchesRenderedStyle.
+	if !strings.Contains(csp, "style-src 'sha256-") {
+		t.Errorf("consent CSP does not allow its own inline <style> by hash: got %q", csp)
+	}
+	if strings.Contains(csp, "unsafe-inline") {
+		t.Errorf("consent CSP still allows unsafe-inline: got %q", csp)
 	}
 	if strings.Contains(csp, "script-src 'unsafe-inline'") {
 		t.Errorf("consent CSP must NOT relax script-src; the page is JS-free: got %q", csp)
@@ -452,7 +463,9 @@ func TestConsent_RejectsBadInputs(t *testing.T) {
 		{name: "authorization_header_present",
 			consent: mintConsentToken(t, tm, "https://app.example.com/cb", "s"), action: "approve",
 			extraHeader: [2]string{"Authorization", "Basic dXNlcjpwYXNz"},
-			wantStatus:  http.StatusUnauthorized, wantError: "invalid_client"},
+			// 400, not 401: a challenge-less 401 would violate RFC 7235
+			// §3.1, and this endpoint rejects credentials by design.
+			wantStatus: http.StatusBadRequest, wantError: "invalid_request"},
 		{name: "foreign_purpose_token",
 			consent: foreignPurposeToken(t, tm), action: "approve",
 			wantStatus: http.StatusBadRequest, wantError: "invalid_request"},

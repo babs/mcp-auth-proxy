@@ -3,12 +3,12 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -87,6 +87,7 @@ func main() {
 		zap.Bool("render_consent_page", cfg.RenderConsentPage),
 		zap.Int64("per_subject_concurrency", cfg.PerSubjectConcurrency),
 		zap.String("groups_claim", cfg.GroupsClaim),
+		zap.Int("groups_claim_max_bytes", cfg.GroupsClaimMaxBytes),
 		zap.Bool("allowed_groups_set", len(cfg.AllowedGroups) > 0),
 		zap.Bool("revoke_before_set", !cfg.RevokeBefore.IsZero()),
 		zap.Bool("upstream_authorization_set", cfg.UpstreamAuthorization != ""),
@@ -146,6 +147,7 @@ func main() {
 	// the warning even when fleet-wide cumulative seals do; the metric
 	// closes that gap via increase(metric[window]).
 	tm.SetLogger(logger)
+	tm.SetGroupsMaxBytes(cfg.GroupsClaimMaxBytes)
 	tm.SetSealMetric(func(purpose string) {
 		metrics.TokenSeals.WithLabelValues(purpose).Inc()
 	})
@@ -240,26 +242,7 @@ func main() {
 	// Strip any inbound X-Request-Id before chi mints one. Without this,
 	// clients can inject arbitrary request IDs that propagate into every
 	// log line for the request — a trivial log-forgery vector.
-	r.Use(func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			r.Header.Del("X-Request-Id")
-			next.ServeHTTP(w, r)
-		})
-	})
-	r.Use(chimw.RequestID)
-	r.Use(zapMiddleware(logger, cfg.AccessLogSkipRE, buildRPCMetrics(cfg, logger)))
-	r.Use(chimw.Recoverer)
-	// Security-headers baseline applied to every response on the
-	// public listener. Set BEFORE the handler runs so the headers
-	// land on every status code (including upstream 5xx pass-through
-	// from the MCP proxy and the rate-limiter's 429s). Headers chosen
-	// per RFC 9700 §4.2.4 (Referrer-Policy: no-referrer is RECOMMENDED
-	// for OAuth ASes), RFC 6797 (HSTS), and production-MCP parity
-	// (GitHub Copilot / Atlassian / Notion / Sentry all carry HSTS;
-	// surveyed in the red-team plan). Not applied to the metrics
-	// listener — Prometheus scrape is in-cluster only and HSTS over
-	// loopback is meaningless.
-	r.Use(securityHeaders)
+	baseMiddleware(r, logger, cfg)
 
 	// Per-IP rate limits. By default the limiter keys on the stripped
 	// r.RemoteAddr (httprate.KeyByIP) so a client behind an untrusted
@@ -347,24 +330,7 @@ func main() {
 	}
 
 	registerDiscoveryRoutes(r, cfg.ProxyBaseURL, cfg.UpstreamMCPMountPath, cfg.ResourceName, discoveryLimit)
-	r.With(registerLimit).Post("/register", handlers.Register(tm, logger, cfg.ProxyBaseURL, cfg.ClientRegistrationTTL))
-	r.With(authorizeLimit).Get("/authorize", handlers.Authorize(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, handlers.AuthorizeConfig{
-		PKCERequired:         cfg.PKCERequired,
-		ResourceURIs:         []string{cfg.ProxyBaseURL + cfg.UpstreamMCPMountPath},
-		CanonicalResource:    cfg.ProxyBaseURL + cfg.UpstreamMCPMountPath,
-		CompatAllowStateless: cfg.CompatAllowStateless,
-		RenderConsentPage:    cfg.RenderConsentPage,
-		ResourceName:         cfg.ResourceName,
-	}))
-	// /consent has its own bucket (see consentLimit construction
-	// above): a single user-driven flow is /authorize GET +
-	// /consent POST, and the two consume from independent buckets
-	// so a human who clicks Approve quickly after Authorize doesn't
-	// halve the per-IP budget for either path.
-	r.With(consentLimit).Post("/consent", handlers.Consent(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, handlers.ConsentConfig{
-		ReplayStore:  replayStore,
-		ResourceName: cfg.ResourceName,
-	}))
+
 	var idpExchangeLimiter *rate.Limiter
 	if cfg.IdPExchangeRatePerSec > 0 {
 		idpExchangeLimiter = rate.NewLimiter(rate.Limit(cfg.IdPExchangeRatePerSec), cfg.IdPExchangeBurst)
@@ -373,15 +339,36 @@ func main() {
 			zap.Int("burst", cfg.IdPExchangeBurst),
 		)
 	}
-	r.With(callbackLimit).Get("/callback", handlers.Callback(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, idTokenVerifier, handlers.CallbackConfig{
-		AllowedGroups:      cfg.AllowedGroups,
-		GroupsClaim:        cfg.GroupsClaim,
-		ReplayStore:        replayStore,
-		IdPExchangeLimiter: idpExchangeLimiter,
-	}))
-	r.With(tokenLimit).Post("/token", handlers.Token(tm, logger, cfg.ProxyBaseURL, cfg.RevokeBefore, replayStore, handlers.TokenConfig{
-		RefreshRaceGrace: cfg.RefreshRaceGrace,
-	}, cfg.ProxyBaseURL+cfg.UpstreamMCPMountPath))
+
+	registerOAuthRoutes(r, oauthRoutes{
+		Register: handlers.Register(tm, logger, cfg.ProxyBaseURL, cfg.ClientRegistrationTTL),
+		Authorize: handlers.Authorize(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, handlers.AuthorizeConfig{
+			PKCERequired:         cfg.PKCERequired,
+			ResourceURIs:         []string{cfg.ProxyBaseURL + cfg.UpstreamMCPMountPath},
+			CanonicalResource:    cfg.ProxyBaseURL + cfg.UpstreamMCPMountPath,
+			CompatAllowStateless: cfg.CompatAllowStateless,
+			RenderConsentPage:    cfg.RenderConsentPage,
+			ResourceName:         cfg.ResourceName,
+		}),
+		Consent: handlers.Consent(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, handlers.ConsentConfig{
+			ReplayStore:  replayStore,
+			ResourceName: cfg.ResourceName,
+		}),
+		Callback: handlers.Callback(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, idTokenVerifier, handlers.CallbackConfig{
+			AllowedGroups:      cfg.AllowedGroups,
+			GroupsClaim:        cfg.GroupsClaim,
+			ReplayStore:        replayStore,
+			IdPExchangeLimiter: idpExchangeLimiter,
+		}),
+		Token: handlers.Token(tm, logger, cfg.ProxyBaseURL, cfg.RevokeBefore, replayStore, handlers.TokenConfig{
+			RefreshRaceGrace: cfg.RefreshRaceGrace,
+		}, cfg.ProxyBaseURL+cfg.UpstreamMCPMountPath),
+		RegisterLimit:  registerLimit,
+		AuthorizeLimit: authorizeLimit,
+		ConsentLimit:   consentLimit,
+		CallbackLimit:  callbackLimit,
+		TokenLimit:     tokenLimit,
+	})
 
 	// Liveness probe: always 200 as long as the process is up.
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -413,6 +400,9 @@ func main() {
 		r.Handle(cfg.UpstreamMCPMountPath+"/*", proxyHandler)
 	})
 
+	installMethodNotAllowed(r)
+	installNotFound(r)
+
 	srv := &http.Server{
 		Addr:    cfg.ListenAddr,
 		Handler: r,
@@ -423,6 +413,12 @@ func main() {
 		// otherwise exceed it, but MCP POSTs are small JSON-RPC payloads.
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
+		// 16 KB, down from net/http's 1 MB default: every header-driven
+		// cost on every route (including the pre-auth Accept scan, which
+		// the rate limiter by construction does not cover) is bounded by
+		// this. Real browsers and MCP clients sit well under 8 KB, the
+		// ceiling most reverse proxies already impose.
+		MaxHeaderBytes: 16 << 10,
 		// WriteTimeout left at 0 — required for SSE/streaming connections
 		IdleTimeout: 120 * time.Second,
 	}
@@ -436,11 +432,12 @@ func main() {
 	var shuttingDown atomic.Bool
 	metricsMux.Handle("/readyz", health.Readyz(replayStore, logger, &shuttingDown))
 	metricsSrv := &http.Server{
-		Addr:         cfg.MetricsAddr,
-		Handler:      metricsMux,
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		Addr:           cfg.MetricsAddr,
+		Handler:        metricsMux,
+		ReadTimeout:    5 * time.Second,
+		WriteTimeout:   30 * time.Second,
+		MaxHeaderBytes: 16 << 10,
+		IdleTimeout:    120 * time.Second,
 	}
 
 	go func() {
@@ -667,19 +664,19 @@ func canonicalIPKey(ip net.IP) string {
 	return ip.String()
 }
 
-// rateLimiter builds an httprate middleware that emits a JSON OAuth error on
+// rateLimiter builds an httprate middleware that emits an OAuth error on
 // throttle and increments mcp_auth_rate_limited_total so operators can alert
 // on abuse patterns per-endpoint. Callers pass the key-func composition
 // (IP-only, IP+path, ...) that matches the bucket semantics they want.
+// The response goes through the shared sink, so on a browser-facing route
+// a throttled human gets the error page rather than a JSON body.
 func rateLimiter(limit int, window time.Duration, endpoint string, keyFuncs ...httprate.KeyFunc) func(http.Handler) http.Handler {
 	httprateMW := httprate.Limit(
 		limit, window,
 		httprate.WithKeyFuncs(keyFuncs...),
-		httprate.WithLimitHandler(func(w http.ResponseWriter, _ *http.Request) {
+		httprate.WithLimitHandler(func(w http.ResponseWriter, r *http.Request) {
 			metrics.RateLimited.WithLabelValues(endpoint).Inc()
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusTooManyRequests)
-			_, _ = io.WriteString(w, `{"error":"temporarily_unavailable","error_description":"rate limit exceeded"}`)
+			handlers.RateLimitExceeded(w, r)
 		}),
 	)
 	// Wrap with suppression so httprate's X-RateLimit-* headers never
@@ -688,9 +685,10 @@ func rateLimiter(limit int, window time.Duration, endpoint string, keyFuncs ...h
 	// plan) all keep these silent. The IETF rate-limit-headers draft
 	// (security considerations) explicitly notes that disclosing
 	// quota state on auth/error paths leaks operational capacity to
-	// attackers; suppression is the safer default. Retry-After (when
-	// httprate sets it on 429) is preserved — that one is genuine
-	// client-UX and does not advertise the bucket geometry.
+	// attackers; suppression is the safer default. Retry-After, which
+	// httprate sets on the 429, is preserved: it states when to retry,
+	// which the error page also promises, and the window alone does not
+	// disclose the per-window quota that X-RateLimit-* would.
 	return func(next http.Handler) http.Handler {
 		return suppressRateLimitHeaders(httprateMW(next))
 	}
@@ -874,7 +872,8 @@ func buildRPCMetrics(cfg *config.Config, logger *zap.Logger) *rpcMetrics {
 //     it. 2-year max-age + includeSubDomains assumes the operator's
 //     parent zone is all-HTTPS — flag in deployment docs.
 //   - X-Content-Type-Options: nosniff — defense-in-depth against
-//     MIME-sniffing of JSON error bodies.
+//     MIME-sniffing of error bodies (JSON, or HTML on the
+//     browser-negotiated error page).
 //   - X-Frame-Options: DENY — supplements CSP frame-ancestors for
 //     pre-CSP-2 browsers.
 //   - Referrer-Policy: no-referrer — RFC 9700 §4.2.4 RECOMMENDED for
@@ -882,13 +881,12 @@ func buildRPCMetrics(cfg *config.Config, logger *zap.Logger) *rpcMetrics {
 //     Referer header to a downstream resource).
 //   - Content-Security-Policy: default-src 'none'; frame-ancestors 'none'
 //     — JSON / redirect responses do not need any subresource; the
-//     stricter CSP is honest about that. The consent page and the
-//     navigation interstitial override this baseline with their own
-//     self-contained headers in handlers/consent.go (style-src
-//     'unsafe-inline' for the inline <style>, form-action 'self' /
-//     'none' respectively — no origin enumeration since the
-//     interstitial terminates Chromium's form-action chain
-//     enforcement at the proxy).
+//     stricter CSP is honest about that. The three proxy-rendered pages
+//     (handlers/pages.go) override this baseline with their own
+//     self-contained headers: style-src names each page's own style
+//     hash, and form-action is 'self' on the consent page and 'none' on
+//     the other two — no origin enumeration, because the interstitial
+//     terminates Chromium's form-action chain enforcement at the proxy.
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
@@ -937,6 +935,11 @@ func zapMiddleware(logger *zap.Logger, skipRE *regexp.Regexp, rpcObs *rpcMetrics
 				zap.Duration("duration", time.Since(start)),
 				zap.Int64("req_bytes", r.ContentLength),
 				zap.Int("resp_bytes", ww.BytesWritten()),
+				// Distinguishes the negotiated HTML error page from the
+				// JSON body on the same status and path — resp_bytes
+				// stopped being that fingerprint when the page landed
+				// (see the client-registration-expired runbook).
+				zap.String("resp_content_type", ww.Header().Get("Content-Type")),
 				zap.String("request_id", chimw.GetReqID(ctx)),
 			}
 			if rec.Sub != "" {
@@ -995,15 +998,189 @@ func zapMiddleware(logger *zap.Logger, skipRE *regexp.Regexp, rpcObs *rpcMetrics
 	}
 }
 
-// wellKnownNotFound writes a JSON 404 body. The auth middleware and the
-// OAuth error surface both emit JSON, so probes that fall under the
-// discovery carve-outs stay consistent with the rest of the error shape
-// rather than leaking chi/net-http's default "404 page not found\n"
-// text/plain body to clients that only parse JSON errors.
-func wellKnownNotFound(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusNotFound)
-	_, _ = w.Write([]byte(`{"error":"not_found"}`))
+// baseMiddleware installs the middleware every public response passes
+// through, in order. Extracted so the e2e harness runs the same chain
+// as production: the error page's own CSP has to override the
+// securityHeaders baseline, which a router without it cannot exercise.
+func baseMiddleware(r chi.Router, logger *zap.Logger, cfg *config.Config) {
+	r.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r.Header.Del("X-Request-Id")
+			next.ServeHTTP(w, r)
+		})
+	})
+	r.Use(chimw.RequestID)
+	r.Use(zapMiddleware(logger, cfg.AccessLogSkipRE, buildRPCMetrics(cfg, logger)))
+	r.Use(chimw.Recoverer)
+	// Security-headers baseline applied to every response on the
+	// public listener. Set BEFORE the handler runs so the headers
+	// land on every status code (including upstream 5xx pass-through
+	// from the MCP proxy and the rate-limiter's 429s). Headers chosen
+	// per RFC 9700 §4.2.4 (Referrer-Policy: no-referrer is RECOMMENDED
+	// for OAuth ASes), RFC 6797 (HSTS), and production-MCP parity
+	// (GitHub Copilot / Atlassian / Notion / Sentry all carry HSTS;
+	// surveyed in the red-team plan). Not applied to the metrics
+	// listener — Prometheus scrape is in-cluster only and HSTS over
+	// loopback is meaningless.
+	r.Use(securityHeaders)
+}
+
+// oauthRoutes carries the OAuth control-plane handlers and their
+// per-endpoint limiters. Grouping them lets registerOAuthRoutes own the
+// middleware wiring — the part a test can pin.
+type oauthRoutes struct {
+	Register  http.HandlerFunc
+	Authorize http.HandlerFunc
+	Consent   http.HandlerFunc
+	Callback  http.HandlerFunc
+	Token     http.HandlerFunc
+
+	RegisterLimit  func(http.Handler) http.Handler
+	AuthorizeLimit func(http.Handler) http.Handler
+	ConsentLimit   func(http.Handler) http.Handler
+	CallbackLimit  func(http.Handler) http.Handler
+	TokenLimit     func(http.Handler) http.Handler
+}
+
+// registerOAuthRoutes wires the OAuth control plane onto r.
+//
+// BrowserFacing marks the three routes that terminate in a user's
+// browser, and sits OUTSIDE their limiter so a throttled human still
+// gets the error page instead of a JSON body. /register and /token
+// deliberately carry no marker: that is what keeps them on
+// application/json as RFC 6749 §5.2 and RFC 7591 §3.2.2 require, no
+// matter what a caller puts in Accept.
+//
+// /consent gets its own bucket: a single user-driven flow is
+// /authorize GET + /consent POST, and independent buckets stop a human
+// who clicks Approve quickly from halving the per-IP budget for either.
+func registerOAuthRoutes(r chi.Router, rt oauthRoutes) {
+	// Fail at wiring time, not at the first request and not silently: a
+	// missing limiter leaves the route unthrottled, which is the one
+	// failure mode worth crashing a deploy over. Callers pass
+	// passthrough explicitly when they mean "no limit".
+	// Slice, not map: with several nil limiters the panic must name the
+	// first one in route order, not a randomized pick.
+	for _, l := range []struct {
+		name string
+		mw   func(http.Handler) http.Handler
+	}{
+		{"register", rt.RegisterLimit}, {"authorize", rt.AuthorizeLimit},
+		{"consent", rt.ConsentLimit}, {"callback", rt.CallbackLimit}, {"token", rt.TokenLimit},
+	} {
+		if l.mw == nil {
+			panic("registerOAuthRoutes: nil limiter for /" + l.name)
+		}
+	}
+	r.With(rt.RegisterLimit).Post("/register", rt.Register)
+	r.With(handlers.BrowserFacing, rt.AuthorizeLimit).Get("/authorize", rt.Authorize)
+	r.With(handlers.BrowserFacing, rt.ConsentLimit).Post("/consent", rt.Consent)
+	r.With(handlers.BrowserFacing, rt.CallbackLimit).Get("/callback", rt.Callback)
+	r.With(rt.TokenLimit).Post("/token", rt.Token)
+}
+
+// browserFacingPaths lists the routes that terminate in a user's
+// browser. registerOAuthRoutes wires the marker onto them directly;
+// this list is what installMethodNotAllowed reads, so the two are
+// separate statements of the same fact and would drift silently.
+// TestBrowserFacingPaths_MatchesTheWiring derives the marked set from
+// the live router and fails on any difference.
+var browserFacingPaths = []string{"/authorize", "/consent", "/callback"}
+
+// installMethodNotAllowed replaces chi's 405 responder.
+//
+// Two things the default handler gets wrong for this proxy, and one it
+// gets right:
+//   - it writes an empty body, which on /consent or /authorize is a
+//     blank page for a user arriving from a bookmark or a stale form —
+//     so the response goes through the shared error sink instead;
+//   - negotiation is per path, NOT router-wide: a wrong method on
+//     /token or /register must stay application/json like every other
+//     error on those routes (RFC 6749 §5.2, RFC 7591 §3.2.2);
+//   - it sets Allow, which RFC 9110 §15.5.6 makes a MUST on 405, so a
+//     replacement has to keep setting it.
+func installMethodNotAllowed(r chi.Router) {
+	// Built on the first 405, not at wiring time: the routing table is
+	// complete by then whatever order the caller registered things in,
+	// so no route can be added "after" this and silently lose its Allow.
+	// Cached rather than per-request — a 405 flood on an unlimited route
+	// (/healthz) must not buy a tree walk each time.
+	//
+	// atomic.Pointer, not sync.Once: Once latches done even when its
+	// function panics, which would strip the RFC 9110 §15.5.6 Allow
+	// header from every later 405 with Recoverer swallowing the cause.
+	// A racing double-build is cheap and idempotent.
+	var allowCache atomic.Pointer[map[string]string]
+	plain := http.HandlerFunc(handlers.MethodNotAllowed)
+	browser := handlers.BrowserFacing(plain)
+	r.MethodNotAllowed(func(w http.ResponseWriter, req *http.Request) {
+		allow := allowCache.Load()
+		if allow == nil {
+			built := allowedMethods(r)
+			allowCache.Store(&built)
+			allow = &built
+		}
+		if a := (*allow)[req.URL.Path]; a != "" {
+			w.Header().Set("Allow", a)
+		}
+		if slices.Contains(browserFacingPaths, req.URL.Path) {
+			browser.ServeHTTP(w, req)
+			return
+		}
+		plain.ServeHTTP(w, req)
+	})
+}
+
+// installNotFound routes a 404 through the same responder as the 405,
+// for the same reason: /authorize/ and a mistyped bookmark land here
+// rather than on MethodNotAllowed, and chi's default answers a bare
+// text/plain body.
+//
+// One body for every 404 in the proxy — handlers.NotFound emits the
+// RFC 6749 envelope on an unmarked route and negotiates only on a
+// marked one, so the discovery carve-outs, stray probes and browser
+// bookmarks all carry the same JSON. The marker is applied per path
+// exactly as the 405's is: it decides representation, never content.
+func installNotFound(r chi.Router) {
+	notFound := http.HandlerFunc(handlers.NotFound)
+	browser := handlers.BrowserFacing(notFound)
+	r.NotFound(func(w http.ResponseWriter, req *http.Request) {
+		if slices.Contains(browserFacingPaths, strings.TrimSuffix(req.URL.Path, "/")) {
+			browser.ServeHTTP(w, req)
+			return
+		}
+		notFound.ServeHTTP(w, req)
+	})
+}
+
+// allowedMethods maps each literal route pattern to its Allow header
+// value. Wildcard patterns are skipped: they are registered with
+// Handle (every method), so they never reach a 405, and their pattern
+// would not equal a request path anyway — chi leaves RoutePattern empty
+// on the method-not-allowed branch, so the lookup has to key on the
+// path itself.
+func allowedMethods(r chi.Router) map[string]string {
+	allow := map[string]string{}
+	for _, route := range r.Routes() {
+		if strings.ContainsAny(route.Pattern, "*{") {
+			continue
+		}
+		methods := make([]string, 0, len(route.Handlers))
+		for m := range route.Handlers {
+			// chi keys an all-methods route under "*", which is not a
+			// method token (RFC 9110 §10.2.1) and must not reach Allow.
+			if m == "*" {
+				continue
+			}
+			methods = append(methods, m)
+		}
+		if len(methods) == 0 {
+			continue
+		}
+		slices.Sort(methods)
+		allow[route.Pattern] = strings.Join(methods, ", ")
+	}
+	return allow
 }
 
 // registerDiscoveryRoutes wires all /.well-known/* and related
@@ -1054,7 +1231,7 @@ func registerDiscoveryRoutes(r chi.Router, baseURL, mountPath, resourceName stri
 	// they fall back to the OAuth metadata above. The 404 path is
 	// also rate-limited — otherwise it becomes the cheapest flood
 	// surface (smallest body, no JSON build).
-	nf := http.HandlerFunc(wellKnownNotFound)
+	nf := http.HandlerFunc(handlers.NotFound)
 	r.With(limiter).Handle("/.well-known/openid-configuration", nf)
 	r.With(limiter).Handle("/.well-known/openid-configuration"+mountPath, nf)
 	// Non-spec probes: some clients look for well-known paths under

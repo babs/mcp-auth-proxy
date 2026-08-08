@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -394,6 +395,8 @@ func TestConsent_SingleUse_StoreErrorFailClosed(t *testing.T) {
 	if oauthErr.ErrorCode != "replay_store_unavailable" {
 		t.Errorf("error_code = %q, want replay_store_unavailable", oauthErr.ErrorCode)
 	}
+	// The page invites a retry; the response must pace it.
+	assertRetryAfterInRange(t, rr.Header(), 5, 10)
 	if got := testutil.ToFloat64(metrics.AccessDenied.WithLabelValues("replay_store_unavailable")); got-before != 1 {
 		t.Errorf("AccessDenied{reason=replay_store_unavailable} delta = %v, want 1", got-before)
 	}
@@ -463,7 +466,16 @@ func TestCallback_SingleUse_ReplayDetected(t *testing.T) {
 	// claim must be recorded even when the downstream exchange
 	// fails, otherwise a flaky upstream lets a stolen state be
 	// retried.
-	_ = first
+	if first.Code != http.StatusBadGateway {
+		t.Fatalf("first hit: want 502 (exchange failed), got %d: %s", first.Code, first.Body.String())
+	}
+	// No Retry-After on this 502: the claim above already burnt the
+	// state, so retrying this URL can only produce the replay rejection
+	// asserted below — advertising a retry would manufacture a false
+	// replay-attack signal on every IdP outage.
+	if got := first.Header().Get("Retry-After"); got != "" {
+		t.Errorf("exchange failure: Retry-After = %q, want absent — the retry it invites is guaranteed to fail", got)
+	}
 
 	second := hit()
 	if second.Code != http.StatusBadRequest {
@@ -545,6 +557,8 @@ func TestCallback_SingleUse_StoreErrorFailClosed(t *testing.T) {
 	if oauthErr.ErrorCode != "replay_store_unavailable" {
 		t.Errorf("error_code = %q, want replay_store_unavailable", oauthErr.ErrorCode)
 	}
+	// The page invites a retry; the response must pace it.
+	assertRetryAfterInRange(t, rr.Header(), 5, 10)
 	if got := testutil.ToFloat64(metrics.AccessDenied.WithLabelValues("replay_store_unavailable")); got-before != 1 {
 		t.Errorf("AccessDenied{reason=replay_store_unavailable} delta = %v, want 1", got-before)
 	}
@@ -1034,5 +1048,81 @@ func TestAuthorize_SilentRedirect_PopulatesSessionID(t *testing.T) {
 	}
 	if sess.SessionID == "" {
 		t.Errorf("sealedSession.SessionID is empty — per-session claim slot not populated")
+	}
+}
+
+// TestToken_StoreErrorFailClosed pins the fail-closed policy on BOTH
+// /token claim sites (code redemption and refresh rotation), including
+// the Retry-After that paces the retry: MCP clients retry /token on
+// their own, so a Redis outage without pacing becomes an uncoordinated
+// flood against a proxy already failing closed. The browser-facing
+// sites are covered separately — this is the caller that actually loops.
+func TestToken_StoreErrorFailClosed(t *testing.T) {
+	tm := newTestTokenManager(t)
+	store := &erroringStore{err: errors.New("redis blew up")}
+	encClientID, internalID := registerClient(t, tm, []string{"https://app.example.com/callback"})
+	verifier := "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+
+	cases := []struct {
+		name string
+		form url.Values
+	}{
+		{"authorization_code", url.Values{
+			"grant_type":    {"authorization_code"},
+			"code":          {sealCode(t, tm, internalID, "https://app.example.com/callback", pkceChallenge(verifier), "user-sub", "user@example.com")},
+			"redirect_uri":  {"https://app.example.com/callback"},
+			"code_verifier": {verifier},
+			"client_id":     {encClientID},
+		}},
+		{"refresh_token", url.Values{
+			"grant_type":    {"refresh_token"},
+			"refresh_token": {sealRefresh(t, tm, "user-sub", "user@example.com", internalID)},
+			"client_id":     {encClientID},
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/token", strings.NewReader(tc.form.Encode()))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			rr := httptest.NewRecorder()
+			Token(tm, zap.NewNop(), testBaseURL, time.Time{}, store, TokenConfig{})(rr, req)
+
+			if rr.Code != http.StatusServiceUnavailable {
+				t.Fatalf("want 503, got %d: %s", rr.Code, rr.Body.String())
+			}
+			var oauthErr OAuthError
+			if err := json.NewDecoder(rr.Body).Decode(&oauthErr); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if oauthErr.ErrorCode != "replay_store_unavailable" {
+				t.Errorf("error_code = %q, want replay_store_unavailable", oauthErr.ErrorCode)
+			}
+			assertRetryAfterInRange(t, rr.Header(), 5, 10)
+			// Machine endpoint: never negotiates, whatever Accept says.
+			if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
+				t.Errorf("Content-Type = %q, want application/json", ct)
+			}
+		})
+	}
+}
+
+// assertRetryAfterInRange pins the jittered pacing header: the floor is
+// the wait the caller actually needs, and the spread is what stops N
+// replicas' rejected populations re-converging on one instant. An exact
+// value would forbid the jitter; no assertion at all would let the
+// header vanish.
+func assertRetryAfterInRange(t *testing.T, h http.Header, lo, hi int) {
+	t.Helper()
+	raw := h.Get("Retry-After")
+	if raw == "" {
+		t.Fatal("Retry-After is absent — a client retry loop is unpaced without it")
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		t.Fatalf("Retry-After = %q, want an integer number of seconds", raw)
+	}
+	if n < lo || n > hi {
+		t.Errorf("Retry-After = %d, want within [%d,%d]", n, lo, hi)
 	}
 }

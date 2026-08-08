@@ -8,6 +8,7 @@ linters:
     - gosec
     - misspell
     - noctx
+    - nolintlint
     - revive
     - unconvert
   settings:
@@ -18,6 +19,16 @@ linters:
         # where Fd() returns uintptr. The int() cast is unavoidable per the
         # golang.org/x/term API. Scoped below to that single call site.
         - G115
+    # A //nolint that no longer suppresses anything is worse than none:
+    # it is linter-scoped, so it silently swallows the next genuine
+    # finding on that line. allow-unused makes the dead one fail the
+    # build instead (an inert G705 directive sat on writeHTMLPage for a
+    # whole review round). require-explanation/require-specific keep the
+    # remaining ones auditable.
+    nolintlint:
+      allow-unused: false
+      require-explanation: true
+      require-specific: true
     revive:
       rules:
         - name: exported

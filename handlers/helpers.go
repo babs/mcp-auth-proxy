@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"net"
 	"net/http"
@@ -19,6 +20,106 @@ type OAuthError struct {
 	ErrorDescription string `json:"error_description,omitempty"`
 	ErrorCode        string `json:"error_code,omitempty"`
 }
+
+type contextKey string
+
+// ctxBrowserFacing marks a route whose errors terminate in the user's
+// browser. Negotiation is gated on it, not on Accept alone: RFC 6749
+// §5.2 and RFC 7591 §3.2.2 require /token and /register to answer
+// application/json, and discovery is machine-only too — a stray
+// `Accept: text/html` must not turn any of them into a web page.
+const ctxBrowserFacing contextKey = "browser_facing"
+
+// BrowserFacing marks every request routed through it as
+// browser-terminated. Wire it OUTSIDE the rate limiter so a throttled
+// user gets the page too.
+func BrowserFacing(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxBrowserFacing, true)))
+	})
+}
+
+// browserFacing reports whether this request came through BrowserFacing,
+// i.e. whether its error response has two representations at all.
+// nil-safe because writeOAuthError is the error path: a panic here would
+// mask the failure the caller was trying to report, and one test calls
+// the sink with a nil request for exactly that reason.
+func browserFacing(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	marked, _ := r.Context().Value(ctxBrowserFacing).(bool)
+	return marked
+}
+
+// error_code values — the wire vocabulary, documented in specs.md.
+// Every call site that passes an error_code passes one of these, no
+// bare literals: the classification maps in error_page.go are keyed on
+// them, so a rename cannot leave a map keyed on a string nothing emits
+// any more — the compiler catches it instead of a user silently
+// getting the wrong advice.
+const (
+	// /authorize client validation.
+	codeClientIDMissing           = "client_id_missing"
+	codeClientIDUnknown           = "client_id_unknown"
+	codeClientAudienceMismatch    = "client_audience_mismatch"
+	codeClientRegistrationExpired = "client_registration_expired"
+	codeRedirectURIMissing        = "redirect_uri_missing"
+	codeRedirectURIMismatch       = "redirect_uri_mismatch"
+	codeRedirectURIMalformed      = "redirect_uri_malformed"
+
+	// /callback session and IdP leg.
+	codeSessionUnknown          = "session_unknown"
+	codeSessionExpired          = "session_expired"
+	codeSessionAudienceMismatch = "session_audience_mismatch"
+	codeCallbackParamsMissing   = "callback_params_missing"
+	codeCallbackStateReplay     = "callback_state_replay"
+	codeIdPExchangeFailed       = "idp_exchange_failed"
+	codeIdPExchangeThrottled    = "idp_exchange_throttled"
+	codeReplayStoreUnavailable  = "replay_store_unavailable"
+
+	// id_token verification and claims policy.
+	codeIDTokenMissing = "id_token_missing"
+	// gosec G101 sees "token" beside a string literal and calls it a
+	// hardcoded credential. It is a wire-visible error code, printed to
+	// end users on the error page. Annotated here rather than excluding
+	// the whole file, which holds every sealed-token struct.
+	codeIDTokenVerificationFailed = "id_token_verification_failed" //nolint:gosec // G101 false positive: an error code, not a credential
+	codeIDTokenClaimsUnparsable   = "id_token_claims_unparsable"
+	codeSubjectMissing            = "subject_missing"
+	codeEmailNotVerified          = "email_not_verified"
+	codeGroupNotAllowed           = "group_not_allowed"
+	codeGroupInvalid              = "group_invalid"
+
+	// /consent request shape and token.
+	codeConsentTokenMissing          = "consent_token_missing"
+	codeConsentTokenInvalid          = "consent_token_invalid"
+	codeConsentTokenExpired          = "consent_token_expired"
+	codeConsentTokenAudienceMismatch = "consent_token_audience_mismatch"
+	codeConsentQueryParamsForbidden  = "consent_query_params_forbidden"
+	codeConsentAuthHeaderPresent     = "consent_auth_header_present"
+	codeConsentBodyTooLarge          = "consent_body_too_large"
+	codeConsentFormMalformed         = "consent_form_malformed"
+	codeConsentActionInvalid         = "consent_action_invalid"
+
+	// Cross-route.
+	codeMethodNotAllowed   = "method_not_allowed"
+	codeNotFound           = "not_found"
+	codeParameterRepeated  = "parameter_repeated"
+	codeCodeSealFailed     = "code_seal_failed"
+	codeInterstitialFailed = "interstitial_render_failed"
+
+	// /token grant failures. Not browser-reachable, but declared here
+	// so every error_code has one home and a rename stays compiler-
+	// checked — codeReplayStoreUnavailable in particular is a
+	// transientCodes key emitted from both /callback and /token.
+	codeCodeReplay           = "code_replay"
+	codeRefreshConcurrent    = "refresh_concurrent_submit"
+	codeRefreshFamilyRevoked = "refresh_family_revoked"
+	codeRefreshRevokedCutoff = "refresh_revoked_iat_cutoff"
+	codeRefreshReuse         = "refresh_reuse_detected"
+	codeTokenIssueFailed     = "token_issue_failed"
+)
 
 // Sealed types: all OAuth flow state is encrypted into tokens/parameters,
 // enabling stateless multi-instance deployment without shared storage.
@@ -206,24 +307,56 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func writeOAuthError(w http.ResponseWriter, status int, code, desc string, errorCode ...string) {
+// writeOAuthError writes an RFC 6749 error, negotiated on the
+// BrowserFacing route marker AND Accept.
+//
+// /authorize, /consent and /callback terminate in the user's BROWSER,
+// not in the MCP client, and are marked as such by the router. A raw
+// JSON body is a dead end for whoever is reading it, so on those routes
+// a caller asking for text/html gets the same error rendered as a page
+// (see error_page.go). Every other caller — and every caller of an
+// unmarked route, /token and /register included — keeps the JSON body
+// byte-for-byte.
+//
+// desc MUST be a compile-time literal (threat-model invariant, enforced
+// by TestWriteOAuthError_DescriptionsAreLiterals): sanitizeErrorDescription
+// strips control bytes, not markup. Write it lowercase and unterminated;
+// sentence() re-cases it for the page unless the first word contains an
+// underscore — so spell protocol artifacts as identifiers (id_token),
+// prose otherwise, and keep one spelling per subject across sites.
+func writeOAuthError(w http.ResponseWriter, r *http.Request, status int, oauthError, desc string, errorCode ...string) {
 	// Defense in depth: clamp + strip control bytes at the sink so a
 	// future caller piping caller-controlled data through (e.g. an
 	// upstream IdP message, a config-supplied prefix) cannot inject
-	// CR/LF into the JSON body — and, via writeAuthError, into the
-	// WWW-Authenticate header. Every current caller passes a static
-	// literal that's a no-op under this filter.
-	oauthErr := OAuthError{Error: code, ErrorDescription: sanitizeErrorDescription(desc)}
+	// CR/LF or unprintable bytes into either representation.
+	desc = sanitizeErrorDescription(desc)
+	var errCode string
 	if len(errorCode) > 0 {
-		oauthErr.ErrorCode = errorCode[0]
+		errCode = errorCode[0]
 	}
-	writeJSON(w, status, oauthErr)
+	// Vary only where the response genuinely has two representations:
+	// /token and /register answer application/json by RFC mandate, and
+	// advertising negotiation on them would invite a cache to key on an
+	// Accept that changes nothing. Set, not Add — the value is constant,
+	// and Add would duplicate it if a caller ever routed two errors
+	// through one ResponseWriter.
+	if browserFacing(r) {
+		w.Header().Set("Vary", "Accept")
+	}
+	noStore(w.Header())
+	// A page that fails to render writes nothing, so the JSON body below
+	// still answers the request — the caller never gets a blank 4xx.
+	body := OAuthError{Error: oauthError, ErrorDescription: desc, ErrorCode: errCode}
+	if wantsHTML(r) && renderErrorPage(w, status, newErrorPageData(status, body)) {
+		return
+	}
+	writeJSON(w, status, body)
 }
 
-func rejectRepeatedParams(w http.ResponseWriter, values url.Values, names ...string) bool {
+func rejectRepeatedParams(w http.ResponseWriter, r *http.Request, values url.Values, names ...string) bool {
 	for _, name := range names {
 		if len(values[name]) > 1 {
-			writeOAuthError(w, http.StatusBadRequest, "invalid_request", name+" must not be repeated")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", name+" must not be repeated", codeParameterRepeated)
 			return true
 		}
 	}
@@ -254,10 +387,12 @@ func hasOverlap(userGroups, allowed []string) bool {
 // recordClientDenial records a client_id-validation rejection: it
 // increments AccessDenied{reason} and emits a matching
 // access_denied_<reason> WARN log — the repo's denial-logging
-// convention (see callback.go / authorize.go state path). Pairing them
-// in one call keeps the metric series and the log in lockstep; the
-// caller still writes the (path-specific) RFC 6749 OAuth error and
-// returns. writeOAuthError is otherwise silent, so without this a stuck
+// convention (see callback.go / authorize.go state path). reason is a
+// METRIC label, always a bare literal — never a code* constant, whose
+// wire vocabulary deliberately diverges from the metric one (specs.md
+// documents the pairs). Pairing metric+log in one call keeps the series
+// and the log in lockstep; the caller still writes the (path-specific)
+// RFC 6749 OAuth error and returns. writeOAuthError is otherwise silent, so without this a stuck
 // client looping on e.g. expired registration shows up only as raw 4xx
 // access logs. Under a retry storm the log volume is bounded by the
 // per-IP rate limiter (main.go) plus zap's production sampling — keep
@@ -285,26 +420,26 @@ func clientExpired(c *sealedClient) bool {
 // Factoring this out removes the near-identical 20-line block from
 // each grant handler; error shapes are preserved verbatim so the
 // existing test matrix against both paths keeps exercising them.
-func openAndValidateClient(w http.ResponseWriter, tm *token.Manager, logger *zap.Logger, clientIDStr, audience string) *sealedClient {
+func openAndValidateClient(w http.ResponseWriter, r *http.Request, tm *token.Manager, logger *zap.Logger, clientIDStr, audience string) *sealedClient {
 	var client sealedClient
 	if err := tm.OpenJSON(clientIDStr, &client, token.PurposeClient); err != nil {
 		recordClientDenial(logger, "client_id_invalid", zap.Error(err))
-		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "invalid client_id")
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "invalid client_id", codeClientIDUnknown)
 		return nil
 	}
 	if client.Typ != token.PurposeClient {
 		recordClientDenial(logger, "client_typ_mismatch")
-		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "invalid client_id")
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "invalid client_id", codeClientIDUnknown)
 		return nil
 	}
 	if client.Audience != audience {
 		recordClientDenial(logger, "client_audience_mismatch", zap.String("internal_id", client.ID))
-		writeOAuthError(w, http.StatusBadRequest, "invalid_client", "client registered for a different audience")
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_client", "client registered for a different audience", codeClientAudienceMismatch)
 		return nil
 	}
 	if clientExpired(&client) {
 		recordClientDenial(logger, "client_registration_expired", zap.String("internal_id", client.ID), zap.Time("expired_at", client.ExpiresAt))
-		writeOAuthError(w, http.StatusBadRequest, "invalid_client", "client registration expired")
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_client", "client registration expired", codeClientRegistrationExpired)
 		return nil
 	}
 	return &client

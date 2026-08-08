@@ -61,18 +61,19 @@ type AuthorizeConfig struct {
 // Session state is encrypted into the IdP state parameter for stateless operation.
 //
 // Error-delivery follows RFC 6749 §4.1.2.1: errors that occur BEFORE
-// client_id + redirect_uri are validated render on the AS as JSON
-// (the redirect target is not yet trusted, so we cannot bounce to it).
+// client_id + redirect_uri are validated render on the AS itself
+// (the redirect target is not yet trusted, so we cannot bounce to it) —
+// JSON, or the negotiated HTML page for a browser, see error_page.go.
 // Once both are validated, every subsequent failure redirects 302 to
 // the registered redirect_uri with `error=…&state=…&iss=…` so the
-// client never sees a JSON body it can't correlate. The function flow
+// client never sees a body it can't correlate. The function flow
 // reflects this split: client/redirect validation is deliberately
 // front-loaded above the response_type / resource / PKCE / state
 // checks.
 func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg *oauth2.Config, authzCfg AuthorizeConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
-		if rejectRepeatedParams(w, q,
+		if rejectRepeatedParams(w, r, q,
 			"response_type",
 			"client_id",
 			"redirect_uri",
@@ -98,37 +99,38 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 		// no behaviour change.
 		logUnknownOIDCParams(logger, q)
 
-		// === Phase 1: validate client_id + redirect_uri (JSON on failure). ===
+		// === Phase 1: validate client_id + redirect_uri (rendered on
+		// the AS on failure, not redirected). ===
 		// Per RFC 6749 §4.1.2.1, an unauthenticated redirect target must
 		// not receive an `error=` redirect — we'd be forwarding to whatever
-		// host an attacker chose. JSON 400 keeps these errors visible to
-		// the resource owner instead.
+		// host an attacker chose. A 400 rendered here keeps these errors
+		// visible to the resource owner instead.
 		// Error shapes here differ from the /token path (invalid_client /
 		// invalid_request, not invalid_grant) per RFC 6749 §4.1.2.1, so
 		// the block stays inline rather than sharing openAndValidateClient;
 		// recordClientDenial keeps the metric+log observable (see its doc).
 		if clientIDStr == "" {
 			recordClientDenial(logger, "client_id_missing")
-			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "client_id is required")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "client_id is required", codeClientIDMissing)
 			return
 		}
 
 		var client sealedClient
 		if err := tm.OpenJSON(clientIDStr, &client, token.PurposeClient); err != nil {
 			recordClientDenial(logger, "client_id_invalid", zap.Error(err))
-			writeOAuthError(w, http.StatusBadRequest, "invalid_client", "unknown client_id")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_client", "unknown client_id", codeClientIDUnknown)
 			return
 		}
 
 		if client.Typ != token.PurposeClient {
 			recordClientDenial(logger, "client_typ_mismatch")
-			writeOAuthError(w, http.StatusBadRequest, "invalid_client", "unknown client_id")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_client", "unknown client_id", codeClientIDUnknown)
 			return
 		}
 
 		if client.Audience != baseURL {
 			recordClientDenial(logger, "client_audience_mismatch", zap.String("internal_id", client.ID))
-			writeOAuthError(w, http.StatusBadRequest, "invalid_client", "client registered for a different audience")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_client", "client registered for a different audience", codeClientAudienceMismatch)
 			return
 		}
 
@@ -136,12 +138,13 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 		// (CLIENT_REGISTRATION_TTL=0); shared with the /token path.
 		if clientExpired(&client) {
 			recordClientDenial(logger, "client_registration_expired", zap.String("internal_id", client.ID), zap.Time("expired_at", client.ExpiresAt))
-			writeOAuthError(w, http.StatusBadRequest, "invalid_client", "client registration expired")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_client", "client registration expired", codeClientRegistrationExpired)
 			return
 		}
 
 		if redirectURI == "" {
-			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "redirect_uri is required")
+			recordClientDenial(logger, "redirect_uri_missing")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "redirect_uri is required", codeRedirectURIMissing)
 			return
 		}
 
@@ -158,7 +161,8 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 			}
 		}
 		if !validRedirect {
-			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "redirect_uri does not match registered URIs")
+			recordClientDenial(logger, "redirect_uri_mismatch")
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "redirect_uri does not match registered URIs", codeRedirectURIMismatch)
 			return
 		}
 
@@ -244,7 +248,7 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 		// redirect) replays from POST /consent on approval.
 		if authzCfg.RenderConsentPage {
 			metrics.AuthorizeInitiated.WithLabelValues("consent").Inc()
-			renderConsent(w, tm, logger, baseURL, authzCfg.ResourceName, sealedConsent{
+			renderConsent(w, r, tm, logger, baseURL, authzCfg.ResourceName, sealedConsent{
 				// Per-render JTI: a fresh id every GET /authorize so
 				// back-button = re-consent (each render gets its own
 				// single-use claim slot) rather than dead-state errors.

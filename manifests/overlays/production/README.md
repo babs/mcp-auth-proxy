@@ -46,13 +46,16 @@ What to validate before rollout:
   rig you maintain — they will hit a 200 HTML body where they used
   to see a 302 and need to drive the form, the same way
   `keycloak_e2e_test.go::approveConsent` does.
-- **CSP is relaxed for the consent response only.** The shared
-  security-headers middleware emits `default-src 'none'`; the
-  consent handler overrides it to add `style-src 'unsafe-inline'`
-  for the page's inline `<style>` block. `script-src` stays
-  unset (none), `frame-ancestors 'none'`, `form-action 'self'`,
-  `base-uri 'none'`. Every other endpoint keeps the strict
-  baseline unchanged.
+- **CSP is widened for the proxy-rendered pages only.** The shared
+  security-headers middleware emits `default-src 'none'`; each
+  proxy-rendered page (consent, navigation interstitial, error
+  page) overrides it with a `style-src` naming the sha256 of its
+  own inline `<style>` block — not `'unsafe-inline'`, so injected
+  markup cannot carry styles that hide the Deny button. `script-src`
+  stays unset (none), `frame-ancestors 'none'`, `base-uri 'none'`;
+  `form-action` is `'self'` on the consent page and `'none'` on the
+  other two. Every other endpoint keeps the strict baseline
+  unchanged.
 
 Operational signals to watch:
 
