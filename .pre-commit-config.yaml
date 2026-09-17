@@ -19,7 +19,10 @@ repos:
   - repo: https://github.com/golangci/golangci-lint
     rev: v2.13.2
     hooks:
-      - id: golangci-lint
+      # -full: the plain hook lints only lines changed since HEAD, so a
+      # dependency bump that deprecates an API we call passes locally
+      # and fails in CI.
+      - id: golangci-lint-full
 
   - repo: local
     hooks:

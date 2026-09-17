@@ -245,7 +245,7 @@ func main() {
 	baseMiddleware(r, logger, cfg)
 
 	// Per-IP rate limits. By default the limiter keys on the stripped
-	// r.RemoteAddr (httprate.KeyByIP) so a client behind an untrusted
+	// r.RemoteAddr (keyByRemoteAddr) so a client behind an untrusted
 	// frontend cannot spoof XFF/X-Real-IP/True-Client-IP to mint its
 	// own bucket.
 	//
@@ -257,7 +257,7 @@ func main() {
 	// TRUST_PROXY_HEADERS (legacy, insecure): blanket trust of every
 	// peer's forwarded headers. Kept for backward compatibility but
 	// CIDR-scoped trust supersedes it whenever both are set.
-	ipKeyFunc := httprate.KeyByIP
+	ipKeyFunc := keyByRemoteAddr
 	switch {
 	case len(cfg.TrustedProxyCIDRs) > 0:
 		ipKeyFunc = cidrAwareKey(cfg.TrustedProxyCIDRs, cfg.TrustedProxyHeader)
@@ -275,7 +275,7 @@ func main() {
 		// it would silently regress existing deployments — config
 		// rejects this combo under PROD_MODE=true so production
 		// pods cannot land here.
-		ipKeyFunc = httprate.KeyByRealIP
+		ipKeyFunc = httprate.KeyByRealIP //nolint:staticcheck // SA1019: the deprecation notice is the documented risk of this legacy path; PROD_MODE rejects it
 		logger.Warn("trust_proxy_headers_deprecated",
 			zap.String("hint", "migrate to TRUSTED_PROXY_CIDRS; TRUST_PROXY_HEADERS trusts every peer"),
 		)
@@ -556,6 +556,17 @@ func mustLogger(level string) *zap.Logger {
 // so the router composition is identical in both modes.
 func passthrough(next http.Handler) http.Handler { return next }
 
+// keyByRemoteAddr keys on the TCP peer, never on a header, so the key
+// cannot be spoofed by a client reaching the pod directly. IPv6 is
+// reduced to its /64 so a client cannot rotate within its own prefix.
+func keyByRemoteAddr(r *http.Request) (string, error) {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	return httprate.CanonicalizeIP(host), nil
+}
+
 // cidrAwareKey returns an httprate.KeyFunc that resolves the rate-limit
 // bucket key from forwarded headers ONLY when the immediate peer is
 // inside one of the configured trusted-proxy networks, and ONLY by
@@ -581,7 +592,7 @@ func passthrough(next http.Handler) http.Handler { return next }
 // header carries exactly one trusted hop and the rightmost-walk
 // degenerates to "use the value verbatim".
 //
-// Falls back to the raw RemoteAddr (httprate.KeyByIP) when the peer
+// Falls back to the raw RemoteAddr (keyByRemoteAddr) when the peer
 // is not trusted, the header is absent, or every hop in the list is
 // itself trusted (legitimate but useless — can't bucket per-client
 // without an external client identity).
@@ -599,11 +610,11 @@ func cidrAwareKey(cidrs []*net.IPNet, header string) httprate.KeyFunc {
 		}
 		ip := net.ParseIP(host)
 		if ip == nil || !cidrContainsAny(cidrs, ip) {
-			return httprate.KeyByIP(r)
+			return keyByRemoteAddr(r)
 		}
 		raw := r.Header.Get(header)
 		if raw == "" {
-			return httprate.KeyByIP(r)
+			return keyByRemoteAddr(r)
 		}
 		// Walk right-to-left: the rightmost entry was added by the
 		// trusted ingress (its view of the immediate peer); each
@@ -624,13 +635,13 @@ func cidrAwareKey(cidrs []*net.IPNet, header string) httprate.KeyFunc {
 			candidate = stripPortAndBrackets(candidate)
 			hopIP := net.ParseIP(candidate)
 			if hopIP == nil {
-				return httprate.KeyByIP(r)
+				return keyByRemoteAddr(r)
 			}
 			if !cidrContainsAny(cidrs, hopIP) {
 				return canonicalIPKey(hopIP), nil
 			}
 		}
-		return httprate.KeyByIP(r)
+		return keyByRemoteAddr(r)
 	}
 }
 
@@ -677,9 +688,12 @@ func canonicalIPKey(ip net.IP) string {
 // The response goes through the shared sink, so on a browser-facing route
 // a throttled human gets the error page rather than a JSON body.
 func rateLimiter(limit int, window time.Duration, endpoint string, keyFuncs ...httprate.KeyFunc) func(http.Handler) http.Handler {
-	httprateMW := httprate.Limit(
-		limit, window,
-		httprate.WithKeyFuncs(keyFuncs...),
+	keyFn := httprate.Key("*")
+	if len(keyFuncs) > 0 {
+		keyFn = httprate.JoinKeys(keyFuncs...)
+	}
+	httprateMW := httprate.LimitBy(
+		limit, window, keyFn,
 		httprate.WithLimitHandler(func(w http.ResponseWriter, r *http.Request) {
 			metrics.RateLimited.WithLabelValues(endpoint).Inc()
 			handlers.RateLimitExceeded(w, r)

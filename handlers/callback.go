@@ -515,7 +515,7 @@ func redirectAuthzError(w http.ResponseWriter, r *http.Request, redirectURI, sta
 		writeOAuthError(w, r, http.StatusBadRequest, errCode, errDesc, codeRedirectURIMalformed)
 		return
 	}
-	http.Redirect(w, r, target, http.StatusFound)
+	http.Redirect(w, r, target, http.StatusFound) //nolint:gosec // G710: redirectURI passed exact-match validation against the registered URI upstream
 }
 
 // authzErrorURL builds the RFC 6749 §4.1.2.1 error envelope on the
