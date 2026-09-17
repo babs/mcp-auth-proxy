@@ -5,7 +5,7 @@
 > of auth code.
 
 [![Build](https://github.com/babs/mcp-auth-proxy/actions/workflows/release.yml/badge.svg)](https://github.com/babs/mcp-auth-proxy/actions/workflows/release.yml)
-[![Go](https://img.shields.io/badge/go-1.26-00ADD8?logo=go)](https://go.dev)
+[![Go](https://img.shields.io/badge/go-1.27-00ADD8?logo=go)](https://go.dev)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![Container](https://img.shields.io/badge/ghcr.io-babs%2Fmcp--auth--proxy-181717?logo=github)](https://github.com/babs/mcp-auth-proxy/pkgs/container/mcp-auth-proxy)
 
@@ -62,7 +62,7 @@ already wired up, see [Demo stack](#demo-stack).
 - **Public HTTPS** terminating at an ingress that reaches the proxy's
   `LISTEN_ADDR` (`:8080` by default). The IdP and the MCP clients both
   see `PROXY_BASE_URL` over the public network.
-- **Go 1.26.5+** (matches `go.mod`) if building from source. Container images are static
+- **Go 1.27.1+** (matches `go.mod`) if building from source. Container images are static
   (`CGO_ENABLED=0`).
 - **Kubernetes**: any conformant cluster. Sample manifests under
   [`manifests/`](./manifests). Production overlay enforces the safe
