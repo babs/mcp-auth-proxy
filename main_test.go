@@ -862,6 +862,11 @@ func TestDocs_DoNotClaimUnsafeInlineStyles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getwd: %v", err)
 	}
+	// Getwd echoes $PWD, which may be a symlink to the checkout; WalkDir
+	// does not follow a symlinked root and would visit one entry.
+	if root, err = filepath.EvalSymlinks(root); err != nil {
+		t.Fatalf("evalsymlinks: %v", err)
+	}
 	scanned := 0
 	seen := map[string]bool{}
 	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
