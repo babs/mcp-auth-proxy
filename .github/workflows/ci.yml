@@ -136,6 +136,9 @@ jobs:
         # refresh family revoke, resource mismatch). Adding new
         # negative-path tests does not require a CI workflow change
         # as long as they keep the TestKeycloakE2E_ prefix.
+        env:
+          # Set, so a missing forwarding proxy fails here instead of skipping.
+          KEYCLOAK_E2E_FORWARDING_PROXY_BASE_URL: http://localhost:8081
         run: go test -tags=keycloak_e2e -run "^TestKeycloakE2E" -count=1 -v .
 
       - name: dump compose logs on failure

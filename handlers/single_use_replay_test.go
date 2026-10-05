@@ -62,7 +62,8 @@ func (e *erroringStore) ClaimOrCheckFamily(_ context.Context, _, _ string, _, _,
 	}
 	return false, false, false, nil
 }
-func (e *erroringStore) Close() error { return nil }
+func (e *erroringStore) Release(context.Context, string) error { return nil }
+func (e *erroringStore) Close() error                          { return nil }
 
 // mintConsentTokenWithJTI seals a consent blob carrying the given
 // JTI. Mirrors mintConsentToken from consent_test.go but exposes the

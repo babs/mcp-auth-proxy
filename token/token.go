@@ -68,11 +68,11 @@ const idpTokenExpirySkew = 60 * time.Second
 // refreshing in a tight loop (expires_in rounds down to 0).
 const minForwardingLifetime = 60 * time.Second
 
-// ErrIdPTokenLifetime is returned by IssueWithIdPToken when the IdP
+// errIdPTokenLifetime is returned by IssueWithIdPToken when the IdP
 // access token would leave the proxy token less than
 // minForwardingLifetime once idpTokenExpirySkew is taken off — i.e.
 // when the IdP issues access tokens that live under two minutes.
-var ErrIdPTokenLifetime = errors.New("idp access token expires too soon")
+var errIdPTokenLifetime = errors.New("idp access token expires too soon")
 
 // ErrSealedTooLarge is returned by IssueWithIdPToken when the sealed
 // access token would exceed the access open() cap — the token would be
@@ -486,17 +486,12 @@ func (m *Manager) Issue(audience, subject, email, clientID string, groups []stri
 	})
 }
 
-// IssueWithIdPToken is Issue for upstream IdP token forwarding mode: it
-// seals idp.AccessToken into the claims so the auth middleware can hand
-// it to the reverse proxy.
-//
-// The token expires at min(now+ttl, idp.ExpiresAt-60s), so it never
-// outlives the IdP token it carries; the client's refresh then renews
-// both. The IdP token's length is taken off the groups budget, keeping
-// the sealed token inside the same header envelope that
-// GROUPS_CLAIM_MAX_BYTES was sized for. Returns ErrIdPTokenLifetime
-// when the IdP token is about to expire and ErrSealedTooLarge when the
-// result would not pass the access open() cap.
+// IssueWithIdPToken is Issue for forwarding mode: it also seals
+// idp.AccessToken into the claims. The token expires at
+// min(now+ttl, idp.ExpiresAt-60s), so it never outlives the IdP token,
+// and the IdP token's length comes off the groups budget. Returns
+// errIdPTokenLifetime when the IdP token is about to expire and
+// ErrSealedTooLarge when the result would not pass the open() cap.
 func (m *Manager) IssueWithIdPToken(audience, subject, email, clientID string, groups []string, ttl time.Duration, resource string, idp IdPToken) (string, *Claims, error) {
 	if idp.AccessToken == "" {
 		return "", nil, errors.New("idp access token empty")
@@ -508,7 +503,7 @@ func (m *Manager) IssueWithIdPToken(audience, subject, email, clientID string, g
 			exp = limit
 		}
 		if exp.Sub(now) < minForwardingLifetime {
-			return "", nil, ErrIdPTokenLifetime
+			return "", nil, errIdPTokenLifetime
 		}
 	}
 	budget := m.groupsMaxBytes

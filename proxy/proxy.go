@@ -235,12 +235,7 @@ func (t *redirectFollowingTransport) RoundTrip(req *http.Request) (*http.Respons
 		// transitions via redirect chains (H9).
 		sanitizeRequestHeaders(req)
 		injectIdentityHeaders(req)
-		// Re-apply the operator-configured upstream Authorization on
-		// every hop. The Director's Del("Authorization") + Set pair
-		// runs only on the first hop; without this, a future change
-		// to sanitizeRequestHeaders that starts stripping
-		// Authorization would silently drop the upstream credential
-		// on redirect.
+		// sanitizeRequestHeaders just stripped Authorization: re-apply.
 		applyUpstreamAuthorization(req, t.forwardIdPToken, t.upstreamAuthorization)
 		if bodyBytes != nil {
 			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))

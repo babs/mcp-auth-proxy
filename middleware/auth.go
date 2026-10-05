@@ -90,14 +90,9 @@ func NewAuth(tm *token.Manager, logger *zap.Logger, baseURL, protectedResourcePa
 }
 
 // SetForwardIdPToken switches on upstream IdP token forwarding. Call
-// during startup, before the middleware serves requests.
-//
-// In that mode an access token without an IdP token — minted before the
-// mode was switched on — is refused with the usual invalid_token
-// challenge, so the client refreshes or signs in again instead of
-// reaching the upstream without a credential. With the mode off, an
-// IdP token found in a claim (minted while it was on) is never passed
-// on.
+// during startup only. When on, an access token without an IdP token is
+// refused (invalid_token) rather than reaching the upstream without a
+// credential; when off, an IdP token in a claim is never passed on.
 func (a *Auth) SetForwardIdPToken(on bool) {
 	a.forwardIdPToken = on
 }

@@ -52,7 +52,8 @@ The compose profile `forwarding` (`docker compose -f manifests/docker-compose/co
 adds a second proxy on http://localhost:8081 with `UPSTREAM_FORWARD_IDP_TOKEN=true` in front of a
 test-only `header-echo` upstream that echoes the forwarded bearer token back. It exists for the
 Keycloak e2e suite (`TestKeycloakE2E_ForwardsIdPAccessToken`) — never put `header-echo` in front of
-anything real.
+anything real. Without this profile the test is skipped, unless `KEYCLOAK_E2E_FORWARDING_PROXY_BASE_URL`
+is set (CI sets it), in which case it fails.
 
 ---
 

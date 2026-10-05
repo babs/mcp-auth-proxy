@@ -38,7 +38,7 @@ secure production posture (`PROD_MODE=true`); flags listed here as
 | `ALLOWED_GROUPS` | (empty) | Comma-separated allowlist; empty = allow all authenticated users. |
 | `MCP_RESOURCE_NAME` | (empty) | Human-readable name advertised under `resource_name` in the RFC 9728 PRM (e.g. `"ACME MCP"`). Used by MCP clients for display / consent UI. Optional; field is omitted when unset. |
 | `UPSTREAM_AUTHORIZATION_HEADER` | (empty) | When set, sent verbatim as the `Authorization` header on every request to the upstream MCP backend. Full header value incl. scheme, e.g. `Bearer xyz`. Treat as a secret. Mutually exclusive with `UPSTREAM_FORWARD_IDP_TOKEN`. |
-| `UPSTREAM_FORWARD_IDP_TOKEN` | `false` | `true` forwards the signed-in user's IdP access token to the upstream as `Authorization: Bearer`, for upstreams that call other APIs as the user (e.g. on-behalf-of). The proxy keeps the IdP refresh token sealed inside its own tokens (still stateless) and renews the IdP access token on every refresh grant, so refresh then needs the IdP to be reachable. Startup fails when set together with `UPSTREAM_AUTHORIZATION_HEADER`. The upstream must validate the forwarded token itself (issuer, audience, signature, expiry). See specs.md "Upstream IdP token forwarding". |
+| `UPSTREAM_FORWARD_IDP_TOKEN` | `false` | `true` forwards the signed-in user's IdP access token to the upstream as `Authorization: Bearer`, for upstreams that call other APIs as the user (e.g. on-behalf-of). The proxy keeps the IdP refresh token sealed inside its own tokens (still stateless) and renews the IdP access token on every refresh grant, so refresh then needs the IdP to be reachable. Startup fails when set together with `UPSTREAM_AUTHORIZATION_HEADER`. Always runs with a replay store: `REDIS_URL`, required under `PROD_MODE` (startup fails without it). Outside `PROD_MODE`, with `REDIS_REQUIRED=false` and no `REDIS_URL`, the proxy uses an in-memory store and logs `replay_store_in_memory`: single instance only, state lost on restart. Enabling the mode refuses every pre-existing access token and refresh token, so every user signs in once. The upstream must validate the forwarded token itself (issuer, audience, signature, expiry). See specs.md "Upstream IdP token forwarding". |
 | `OIDC_EXTRA_SCOPES` | (empty) | Space-separated scopes appended to `openid email profile` on the IdP authorize request and, in forwarding mode, on every IdP refresh request — e.g. `api://<upstream-app>/access_as_user offline_access` on Entra ID. Operator-only: MCP clients still cannot request scopes and `scopes_supported` stays `[]`. Duplicates of the base scopes are ignored; a value that is not an RFC 6749 scope-token fails startup. With forwarding on and this empty, startup logs `upstream_forward_idp_token_scopes_missing`. |
 
 ## Token signing and rotation
@@ -57,7 +57,7 @@ secure production posture (`PROD_MODE=true`); flags listed here as
 | `REDIS_REQUIRED` | `true` | Fail startup when `REDIS_URL` is unset. Set `false` only for dev / single-replica; stateless mode leaves codes / refresh tokens replayable within their TTL. Rejected by `PROD_MODE`. |
 | `REDIS_KEY_PREFIX` | `mcp-auth-proxy:` | Key prefix for shared Redis. Set to empty to opt out of namespacing. |
 | `REFRESH_RACE_GRACE_SEC` | `2` | Grace window in seconds during which a refresh-rotation collision is treated as a benign concurrent submit (parallel-tab refresh, slow-network double-submit) and returns 429 `refresh_concurrent_submit` without revoking the family. Outside the window every collision still revokes. Range `[0, 10]`; `0` disables. The 10s ceiling is a security cap — wider windows are statistically attacker-shaped. |
-| `IDP_EXCHANGE_RATE_PER_SEC` | (disabled) | Cap on outbound proxy → IdP token-endpoint requests at `/callback` — and, with `UPSTREAM_FORWARD_IDP_TOKEN=true`, at every `/token` call too (one IdP refresh per code redemption and per refresh), through the same bucket. In forwarding mode, enabling it is recommended: size it for the expected refresh rate (roughly active sessions ÷ 3600 per second, since access tokens last at most an hour) plus sign-ins, and give `IDP_EXCHANGE_BURST` room for the herd of clients refreshing after a deploy or an IdP blip; a throttled `/token` call leaves the client's code or refresh token usable for its retry. Defense in depth: a flood of `/callback` hits that slips past the per-IP limiter (distributed sources, permissive XFF trust matrix) is bounded by this token bucket before reaching the IdP. Denied requests get 503 `temporarily_unavailable` + `error_code=idp_exchange_throttled` + `Retry-After` (2-4s, jittered so N replicas' rejected callers do not re-converge on one instant). Set to a positive number (e.g. `20`) to enable. **Per-replica scope:** an `N`-replica deployment admits up to `N × IDP_EXCHANGE_RATE_PER_SEC` to the IdP — divide your IdP-side ceiling by replica count. |
+| `IDP_EXCHANGE_RATE_PER_SEC` | (disabled) | Cap on outbound proxy → IdP token-endpoint requests at `/callback` — and, with `UPSTREAM_FORWARD_IDP_TOKEN=true`, at every `/token` call too (one IdP refresh per code redemption and per refresh), through the same bucket. In forwarding mode, enabling it is recommended: size it for the expected refresh rate, which is active sessions divided by the access-token lifetime in seconds (`min(3600, IdP access-token lifetime − 60)`; 240 with Keycloak's default 5-minute tokens), plus two bucket tokens per sign-in (`/callback` and the code redemption at `/token`), all divided by the replica count. Give `IDP_EXCHANGE_BURST` room for the herd of clients refreshing after a deploy or an IdP blip; a throttled `/token` call leaves the client's code or refresh token usable for its retry. Defense in depth: a flood of `/callback` hits that slips past the per-IP limiter (distributed sources, permissive XFF trust matrix) is bounded by this token bucket before reaching the IdP. Denied requests get 503 `temporarily_unavailable` + `error_code=idp_exchange_throttled` + `Retry-After` (2-4s, jittered so N replicas' rejected callers do not re-converge on one instant). Set to a positive number (e.g. `20`) to enable. **Per-replica scope:** an `N`-replica deployment admits up to `N × IDP_EXCHANGE_RATE_PER_SEC` to the IdP — divide your IdP-side ceiling by replica count. |
 | `GROUPS_CLAIM_MAX_BYTES` | `32768` | Byte budget for the `groups` claim sealed into an access token; the excess is dropped at mint time. Range `[1024, 40960]`. The ceiling is measured, not chosen: the seal expands the claim ~1.39x, so a 40 KB budget already mints a 56 KB `Authorization` header against the 64 KB block. Raise it only if your directory uses long DNs **and** your MCP clients send few other headers; watch `mcp_auth_groups_claim_truncated_total`. With `UPSTREAM_FORWARD_IDP_TOKEN=true` the IdP access token's length comes off this budget first, so the sealed token stays inside the same header envelope (see Limits). |
 | `IDP_EXCHANGE_BURST` | `50` | Burst size for the IdP-exchange limiter when `IDP_EXCHANGE_RATE_PER_SEC > 0`. Higher burst absorbs a short spike (e.g. a deploy-time reconnect storm) without 503s; lower burst keeps the ceiling tighter. Ignored when `IDP_EXCHANGE_RATE_PER_SEC` is unset/zero. |
 
@@ -162,11 +162,14 @@ quotes — the full code → meaning table lives in
 where a bullet says otherwise. These buckets carry no wire `error_code`
 at all — nothing on those paths renders a support code:
 `invalid_token`, `token_expired`, `audience_mismatch`,
-`resource_mismatch`, `token_revoked_iat_cutoff`, `idp_token_missing` (all
+`resource_mismatch`, `token_revoked_iat_cutoff` (all
 `middleware/auth.go`), `subject_concurrency_exceeded`
 (`internal/subjectlimiter`), and `state_missing`
 (`handlers/authorize.go`, which delivers an RFC 6749 §4.1.2.1 redirect
-instead of a rendered error).
+instead of a rendered error). `idp_token_missing` is counted on two
+paths: `/token` answers it as a wire `error_code`, and the MCP route
+(`middleware/auth.go`) answers the plain 401 `invalid_token` challenge
+with no `error_code`.
 
 - `mcp_auth_access_denied_total{reason}` — buckets:
   - `group` / `group_invalid` — user not in `ALLOWED_GROUPS`, or
@@ -186,12 +189,16 @@ instead of a rendered error).
   - `token_revoked_iat_cutoff` — `REVOKE_BEFORE` rejection.
   - `idp_token_missing` — forwarding mode only: an access token
     without an IdP token (minted before `UPSTREAM_FORWARD_IDP_TOKEN`
-    was switched on) reached the MCP route and got the 401 challenge.
-    Expected right after enabling the mode, while clients refresh or
-    sign in again; it should decay to zero within one access-token
-    lifetime.
-  - `id_token_verification_failed` — IdP signature / nonce / claim
-    parse.
+    was switched on) reached the MCP route and got the 401 challenge,
+    or a code or refresh token minted before the switch reached
+    `/token` and got `invalid_grant` + `error_code=idp_token_missing`.
+    Expected right after enabling the mode. A refresh cannot fix it:
+    enabling the mode refuses every pre-existing access token and
+    refresh token, so every user signs in once.
+  - `id_token_verification_failed` — IdP signature or nonce failures at
+    `/callback` (a claim-parse failure there is not counted) and, in
+    forwarding mode, a refresh id_token at `/token` that fails
+    verification, has unparsable claims, or names a different `sub`.
   - `replay_store_unavailable` — Redis down (fail-closed).
   - `state_missing` — `/authorize` without state in strict mode.
   - `refresh_family_revoked` / `refresh_concurrent_submit` —
@@ -249,24 +256,37 @@ instead of a rendered error).
   (`IDP_EXCHANGE_RATE_PER_SEC`). A spike under steady inbound
   traffic usually means a distributed flood is slipping past the
   per-IP limiter, or the IdP is slow enough that the bucket fills
-  faster than it drains. Counts `/callback` only; forwarding-mode
-  refreshes throttled by the same bucket land in
+  faster than it drains. Counts `/callback` and, in forwarding mode,
+  `/token`. A throttled `/token` call also increments
   `mcp_auth_idp_refresh_total{result="throttled"}`.
 
 ### Upstream IdP token forwarding
 
-Only populated with `UPSTREAM_FORWARD_IDP_TOKEN=true`.
+Only incremented with `UPSTREAM_FORWARD_IDP_TOKEN=true`. Without it
+`mcp_auth_upstream_idp_token_forwarded_total` is still exported, at 0.
 
 - `mcp_auth_idp_refresh_total{result}` — IdP `refresh_token` grants
   made at `/token` (once per code redemption, once per refresh):
   `ok`; `rejected` (the IdP refused the grant, the client signs in
   again — a burst after a password-reset wave or a Conditional Access
-  change is expected); `unavailable` (IdP transport error, timeout,
-  5xx/429, or the proxy's own client credentials refused — the client
-  keeps its token and retries); `failed` (a permanent IdP 4xx or a 2xx
-  without a usable token — the client signs in again; any count here
-  is worth a look); `throttled` (the `IDP_EXCHANGE_*` bucket was
-  empty, no IdP call made). Sustained
+  change is expected); `unavailable` (a transport error, a timeout, any 5xx or 429, the IdP
+  error codes `temporarily_unavailable` or `server_error` on a 4xx, the
+  proxy's own client credentials refused, a 4xx without an `error`
+  member, any 3xx, or a 2xx that is not a JSON object, such as a
+  maintenance page or a WAF block, or more than 64 refresh calls in
+  flight. The client
+  keeps its token and retries after `Retry-After`: jittered 2-4 s; an
+  IdP `Retry-After` in seconds above 4 on a 5xx, a 429 or a transient
+  code replaces it, capped at 120 s; otherwise 60 s on a 3xx, and when a
+  4xx other than 429 refused the proxy's client credentials or carried
+  no `error` member. Also counts
+  a client that hangs up during the IdP call); `failed` (a
+  JSON error with an unknown code, a
+  JSON 2xx without a usable Bearer token, a 2xx body that broke off, or
+  an `expires_in` of zero or less. The client signs in again; any count
+  here is worth a look); `throttled` (the `IDP_EXCHANGE_*` bucket was
+  empty, no IdP call made; `mcp_auth_idp_exchange_throttled_total`
+  increments too). Sustained
   `unavailable` means clients cannot renew once their access token
   expires: see `docs/runbooks/idp-outage.md`.
 - `mcp_auth_upstream_idp_token_forwarded_total` — MCP requests proxied

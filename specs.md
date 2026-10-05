@@ -63,7 +63,7 @@ All transient OAuth state (client registrations, authorize sessions, authorizati
 | Client registration | `client_id` (encrypted blob, 7d default TTL — configurable via `CLIENT_REGISTRATION_TTL`) | yes |
 | Authorize session | IdP `state` parameter (encrypted blob, 10min TTL) | yes |
 | Authorization code | `code` parameter (encrypted blob, 60s TTL) | yes |
-| Access token | Opaque token (encrypted claims, 1h TTL) | yes |
+| Access token | Opaque token (encrypted claims, 1h TTL; at most 1h in forwarding mode, `min(1h, IdP expiry − 60 s)`) | yes |
 | Refresh token | Opaque token (encrypted claims + `iat`, 7d TTL) | yes |
 | IdP refresh / access token (forwarding mode only) | the authorization `code` (refresh token only), the refresh token (refresh token) and the access token (access token) — see [Upstream IdP token forwarding](#upstream-idp-token-forwarding-opt-in) | inherited from the carrier |
 
@@ -94,7 +94,7 @@ Set `REDIS_URL` (e.g. `redis://redis:6379/0`, or `rediss://` for TLS) to enable 
 - **Single-use authorization codes.** Each code carries a unique `tid` (UUID); `/token` claims the key atomically, so a second exchange attempt is rejected with `invalid_grant` + `error_code: code_replay`. Claim TTL matches the remaining code lifetime.
 - **Refresh rotation with reuse detection** (RFC 6749 §10.4 / OAuth 2.1 §6.1). Each refresh carries a unique `tid` and a `fam` (family ID). The `fam` is seeded at `/callback` (on the sealed code) and inherited by every refresh that descends from it, so a replayed authorization code (per RFC 6749 §4.1.2) and a replayed refresh both target the same family marker — the legitimate holder and the attacker are revoked together. On rotation the old `tid` is claimed; replaying an already-rotated token past the `REFRESH_RACE_GRACE_SEC` window is detected as reuse, revokes the whole family (`refresh_family_revoked:<fam>` marker, 7-day TTL), and any subsequent use of any sibling refresh is rejected with `error_code: refresh_family_revoked`. The compromised lineage stops minting tokens; both parties are forced back through `/authorize`. A *racing* second submit inside the grace window (parallel-tab refresh, slow-network double-submit) returns 429 `refresh_concurrent_submit` instead — the legitimate peer's rotation already succeeded, no family is killed, the racing client retries with the new refresh once it lands.
 
-On Redis failure the handler fails closed (503 `server_error` / `error_code: replay_store_unavailable`) rather than issuing tokens against an unknown replay state. When `REDIS_URL` is unset the proxy stays fully stateless: codes remain replayable within the 60s TTL (mitigated by PKCE), and refresh tokens rotate without reuse detection.
+On Redis failure the handler fails closed (503 `server_error` / `error_code: replay_store_unavailable`) rather than issuing tokens against an unknown replay state. When `REDIS_URL` is unset the proxy stays fully stateless: codes remain replayable within the 60s TTL (mitigated by PKCE), and refresh tokens rotate without reuse detection. The exception is `UPSTREAM_FORWARD_IDP_TOKEN=true`, which then uses an in-memory replay store (single instance only).
 
 ---
 
@@ -144,7 +144,9 @@ All configuration is via environment variables.
 | `PROD_MODE` | Strict-posture gate. Default `true` — fails startup if any compatibility flag that weakens a security control is set (`PKCE_REQUIRED=false`, `COMPAT_ALLOW_STATELESS=true`, `REDIS_REQUIRED=false`, `RATE_LIMIT_ENABLED=false`, `REDIS_URL` empty, `OIDC_ALLOW_INSECURE_HTTP=true`, a weak `TOKEN_SIGNING_SECRET`, or legacy `TRUST_PROXY_HEADERS=true` without `TRUSTED_PROXY_CIDRS`). Set `PROD_MODE=false` explicitly for dev / single-replica work that needs one of the relaxation toggles | `true` (default) |
 | `TRUSTED_PROXY_CIDRS` | Comma-separated CIDRs of peers whose `X-Forwarded-For`/`X-Real-IP`/`True-Client-IP` headers are honored for rate-limit keying. Other peers fall back to `RemoteAddr`. Preferred over `TRUST_PROXY_HEADERS`; takes precedence when both are set | `10.0.0.0/8,172.16.0.0/12,192.168.0.0/16` |
 | `MCP_RESOURCE_NAME` | Optional human-readable display name advertised under `resource_name` in the RFC 9728 PRM. Used by MCP clients for consent / UI display. Field is omitted when unset | `ACME MCP` |
-| `UPSTREAM_AUTHORIZATION_HEADER` | When non-empty, sent verbatim as the `Authorization` header on every request to the upstream MCP backend (full value incl. scheme, e.g. `Bearer s3cr3t`). Treat as a secret — mount from a Secret, not a ConfigMap | `Bearer xyz` |
+| `UPSTREAM_AUTHORIZATION_HEADER` | When non-empty, sent verbatim as the `Authorization` header on every request to the upstream MCP backend (full value incl. scheme, e.g. `Bearer s3cr3t`). Treat as a secret — mount from a Secret, not a ConfigMap. Mutually exclusive with `UPSTREAM_FORWARD_IDP_TOKEN` | `Bearer xyz` |
+| `UPSTREAM_FORWARD_IDP_TOKEN` | `true` forwards the signed-in user's IdP access token to the upstream as `Authorization: Bearer`. Always runs with a replay store: `REDIS_URL`, required under `PROD_MODE` (startup fails without it). Outside `PROD_MODE`, with `REDIS_REQUIRED=false` and no `REDIS_URL`, the proxy uses an in-memory store and logs `replay_store_in_memory`: single instance only, state lost on restart. Mutually exclusive with `UPSTREAM_AUTHORIZATION_HEADER`. See [Upstream IdP token forwarding](#upstream-idp-token-forwarding-opt-in) | `false` (default) |
+| `OIDC_EXTRA_SCOPES` | Space-separated scopes appended to `openid email profile` on the IdP authorize request and, in forwarding mode, on every IdP refresh request. Operator-only: clients still cannot request scopes | empty (default) |
 | `TOKEN_SIGNING_SECRETS_PREVIOUS` | Whitespace-separated retired signing secrets accepted on Open during a rolling rotation. New seals always use `TOKEN_SIGNING_SECRET` (primary); Open tries primary first, then each previous entry. Each entry must be ≥32 bytes | `<old1> <old2>` |
 | `LOG_LEVEL` | Zap log level (`debug` / `info` / `warn` / `error`) | `info` (default) |
 | `GROUPS_CLAIM` | Flat claim name in id_token that carries user group memberships | `groups` (default) |
@@ -327,7 +329,7 @@ Error responses use RFC 7591 §3.2.2 codes: `invalid_redirect_uri` for any redir
      ?client_id={OIDC_CLIENT_ID}
      &response_type=code
      &redirect_uri={PROXY_BASE_URL}/callback
-     &scope=openid email profile
+     &scope=openid email profile {OIDC_EXTRA_SCOPES when set}
      &state={encrypted_session}
      &response_mode=query
    ```
@@ -415,7 +417,8 @@ grant_type=refresh_token
 4. Verify `client_id` (internal UUID) and `redirect_uri` match the code
 5. Validate PKCE: base64url-encoded `SHA256(code_verifier)` == stored `code_challenge` (constant-time comparison)
 6. If `REDIS_URL` is configured, atomically claim the code's `token_id` via `SET NX`. A second attempt is rejected with `invalid_grant` + `error_code: code_replay`; Redis failures fail closed with 503
-7. Issue an opaque access token (AES-GCM, 1h TTL) and a refresh token (AES-GCM, 7d TTL)
+7. Forwarding mode only: redeem the IdP refresh token at the IdP (see [Upstream IdP token forwarding](#upstream-idp-token-forwarding-opt-in))
+8. Issue an opaque access token (AES-GCM, 1h TTL, at most 1h in forwarding mode) and a refresh token (AES-GCM, 7d TTL)
 
 **Behavior — refresh_token:**
 1. Decrypt the refresh token, verify its `audience` matches `PROXY_BASE_URL`
@@ -427,7 +430,8 @@ grant_type=refresh_token
    b. Atomically claim `refresh:<tid>` via `SET NX`, recording the claim's set time. If the key is already claimed AND the prior claim landed within `REFRESH_RACE_GRACE_SEC` (default 2s, max 10s, set 0 to disable): treat as a benign concurrent submit — return 429 `invalid_grant` with `error_code: refresh_concurrent_submit` + `Retry-After: 2`. The family is NOT revoked; the legitimate peer's rotation already succeeded, the racing client retries with the new refresh once it lands. If the prior claim is past the grace window: reuse detected — mark the family revoked for 7 days, reject with `error_code: refresh_reuse_detected`. Any subsequent sibling refresh also gets rejected in step 5a
 
    **Note on the 429 status:** RFC 6749 §5.2 defines `/token` errors as 400 / 401. Returning 429 here is a deliberate deviation — most OAuth client libraries treat 429 + `Retry-After` as "back off and retry", which is exactly the desired behavior for a racing peer (the legit rotation already succeeded; the racing client should retry with the new refresh from shared storage). The `error_code=refresh_concurrent_submit` field disambiguates from generic rate limiting for clients that look at the body. A 400 `invalid_grant` was considered but rejected: it would force every client library to add a custom retry path keyed off `error_code` instead of using its existing 429 handling.
-6. Issue new access + refresh tokens. The new refresh inherits the original `fam` (so reuse detection spans the lineage) and gets a fresh `tid`. `iat` is set to `now` so it survives the next `REVOKE_BEFORE` application
+6. Forwarding mode only: redeem the IdP refresh token at the IdP (see [Upstream IdP token forwarding](#upstream-idp-token-forwarding-opt-in))
+7. Issue new access + refresh tokens. The new refresh inherits the original `fam` (so reuse detection spans the lineage) and gets a fresh `tid`. `iat` is set to `now` so it survives the next `REVOKE_BEFORE` application
 
 **Response 200 JSON:**
 ```json
@@ -438,6 +442,8 @@ grant_type=refresh_token
   "refresh_token": "<opaque refresh token>"
 }
 ```
+
+`expires_in` is 3600. In forwarding mode it is at most 3600: the access token expires at `min(1h, IdP expiry − 60 s)`.
 
 Headers `Cache-Control: no-store` and `Pragma: no-cache` required (RFC 6749 §5.1).
 
@@ -560,32 +566,45 @@ through an on-behalf-of exchange at the IdP — knowing who the user is from
    or replayed refresh token never reaches the IdP), refreshes at the IdP and seals the new IdP
    tokens into the new proxy tokens. A verified id_token returned on refresh re-applies the sign-in
    policy: same `sub` (else `id_token_verification_failed`), `email_verified`, group-name
-   validation and `ALLOWED_GROUPS`, and updates email and groups. Without a verified id_token the
-   previous email and groups are kept, never widened, and a warning is logged.
+   validation and `ALLOWED_GROUPS`, and updates email and groups. When the IdP returns no id_token,
+   the previous email and groups are kept, never widened, and `idp_refresh_id_token_missing` is
+   logged. An id_token that is present but fails verification, or whose claims cannot be parsed,
+   is refused: 400 `invalid_grant` / `id_token_verification_failed`, log
+   `idp_refresh_id_token_unverified`. The refresh token stays spent and the user signs in again.
+   Verification runs under its own 10 s timeout.
 
-IdP failures at `/token` map to three outcomes. **Rejected** (`invalid_grant`,
-`interaction_required`, `login_required`, `consent_required`, `invalid_scope`): 400 `invalid_grant`
-/ `idp_refresh_rejected`, the client signs in again. **Unavailable** (transport error, timeout,
-5xx, 429, or the proxy's own client credentials refused) and **throttled** (`IDP_EXCHANGE_*`):
-503 `temporarily_unavailable` + `Retry-After`, and the single-use claim is released so the client
-retries with the **same** code or refresh token (a custom replay store without `Release`, or a
-failed release, answers `invalid_grant` instead, since the retry would read as a replay).
-**Failed** (a permanent 4xx, or a 2xx without a usable Bearer token, after which the IdP has
-probably rotated its refresh token): 400 `invalid_grant` / `idp_refresh_failed`, the token stays
-spent. Any failure to mint tokens after the IdP call also answers `invalid_grant`, never a 5xx: the
+IdP answers at `/token` that are not a success map to three outcomes. **Rejected** (IdP error
+codes `invalid_grant`, `interaction_required`, `login_required`, `consent_required`,
+`invalid_scope`, on a 4xx other than 429): 400 `invalid_grant` / `idp_refresh_rejected`, the claim
+stays spent and the client signs in again. **Unavailable**: 503 `temporarily_unavailable` /
+`idp_refresh_unavailable` + `Retry-After`. This covers a transport error, a timeout, any 5xx or 429 whatever its body, the IdP error codes `temporarily_unavailable` or `server_error` on a 4xx, the proxy's own client credentials refused (`invalid_client`, `unauthorized_client`, 401), a 4xx without an `error` member, any 3xx (redirects are never followed), or a 2xx whose body is not a JSON object (a maintenance page, a WAF block). A local **throttle**
+(`IDP_EXCHANGE_*`) answers 503 `idp_exchange_throttled` the same way. In both cases the proxy
+releases the single-use claim, so the client retries with the **same** code or refresh token. A
+failed release answers `invalid_grant` instead, since the retry would read as a replay.
+**Failed**: 400 `invalid_grant` / `idp_refresh_failed`, the claim stays spent. This covers
+a JSON error with an unknown code, a 2xx JSON object that is malformed or has no usable Bearer access token, a 2xx whose body broke off mid-read, and an `expires_in` that is stated and zero or negative. `Retry-After` is the proxy's jittered 2-4 s. On a 5xx, a 429 or a `temporarily_unavailable` / `server_error` answer, an IdP `Retry-After` in seconds above 4 replaces it, capped at 120 s (the HTTP-date form is ignored). Otherwise it is 60 s on a 3xx, and when a 4xx other than 429 refused the proxy's client credentials or carried no `error` member. Logs for these failures carry the IdP's error code, the HTTP status and the
+proxy's own reason (transport error, unsupported `token_type`). They never carry a token or the
+IdP's `error_description`. Any failure to mint tokens after the IdP call also answers `invalid_grant`, never a 5xx: the
 client's token is spent, and a retry would only trip reuse detection. The IdP refresh is a hand-written
 RFC 6749 §6 call — x/oauth2 cannot add a `scope` to a refresh, and without one some IdPs (Entra ID)
 choose the new token's audience themselves. Client authentication follows the endpoint's
-`AuthStyle`; auto-detection tries Basic, falls back to form parameters on a non-grant 4xx, and
-remembers the style once the IdP accepts the credentials. Redirects are never followed.
+`AuthStyle`; auto-detection tries Basic, falls back to form parameters on a non-grant 4xx other than 429, and
+remembers the style once the IdP accepts the credentials. Redirects are never followed. At most
+64 refresh calls run at once. A call over that bound is answered `idp_refresh_unavailable` without
+reaching the IdP.
 
 What does not change: the stateless design (the IdP tokens are optional fields inside the existing
 sealed payloads; Redis still holds replay markers only), AEAD purpose and audience binding, RFC
 8707 resource binding, PKCE, DCR, the consent page, refresh rotation with reuse detection and
-`REVOKE_BEFORE`. This is not the "token passthrough" anti-pattern of the MCP security best
-practices: the token the client presents is never forwarded; the upstream receives a different
-token, minted by the IdP for the upstream's own audience. The upstream must validate it itself
-(issuer, audience, signature, expiry).
+`REVOKE_BEFORE`. The proxy always strips the token the client presents and never forwards it.
+The upstream receives a different token, one the IdP issued to the proxy's own client for the
+scopes in `OIDC_EXTRA_SCOPES`. Whether that avoids the "token passthrough" anti-pattern of the MCP
+security best practices depends on the operator. The token carries the upstream's audience only
+when `OIDC_EXTRA_SCOPES` names the upstream's scope, or an audience mapper at the IdP adds it. The
+proxy does not check `aud`. With forwarding on and `OIDC_EXTRA_SCOPES` empty, the token has the
+IdP's default audience (a Microsoft Graph token on Entra ID), and the upstream could replay it
+there. Set the upstream scope. The upstream must validate the token itself (issuer, audience,
+signature, expiry).
 
 Trade-offs, also in [`docs/threat-model.md`](docs/threat-model.md) row 17: whoever holds
 `TOKEN_SIGNING_SECRET` can now open the IdP refresh tokens inside client-held tokens; refresh
@@ -594,14 +613,29 @@ codes, access and refresh tokens grow by the IdP token sizes, so their `open()` 
 the 64 KB header block in this mode (only for those three purposes), the IdP access token's length
 comes off the groups budget, and a code, access or refresh token that would not pass its own cap is
 never minted. In
-return, revocation gets stronger: every refresh asks the IdP, so a password reset, a disabled
-account or a group removal bites within one access-token lifetime. A verified refresh id_token
+return, revocation gets stronger: every refresh asks the IdP, so a password reset or a disabled
+account bites within one access-token lifetime. A group removal does too when the IdP returns an
+id_token on refresh. When it returns none, email and groups stay as last verified (log
+`idp_refresh_id_token_missing`). A verified refresh id_token
 without the groups claim reads as "no groups", exactly as at sign-in (fail closed), and is logged
 as `idp_refresh_groups_claim_missing`.
 
-**Known limitation.** The IdP call (up to 10 s) runs while the client's single-use claim is held.
-A client that resends the same code or refresh token more than `REFRESH_RACE_GRACE_SEC` after the
-first request, while that request is still waiting on the IdP, is read as a replay: the family is
+IdP prerequisites. Entra ID: expose a scope on the upstream's app registration, grant it to the
+proxy's app registration, and set `OIDC_EXTRA_SCOPES="api://<upstream-app>/<scope> offline_access"`.
+Keycloak: add an audience mapper for the upstream on the proxy's client. The user needs the
+`offline_access` realm role when that scope is requested. The default 5-minute access tokens give
+4-minute proxy tokens, so clients refresh every 4 minutes.
+
+**Known limitation.** After an ambiguous IdP outcome (the 10 s timeout, or the client hanging up
+once the request left) the proxy releases the single-use claim and the client retries with the same
+token. An IdP that rotates refresh tokens and revokes on reuse (Keycloak with "Revoke Refresh
+Token", Okta, Auth0) then rejects the retry, and the user signs in again. Entra ID does not revoke
+on reuse and is not affected.
+
+The IdP call (up to 10 s) also runs while the client's single-use claim is held.
+A client that resends the same authorization code while the first request is still waiting on the
+IdP, or the same refresh token more than `REFRESH_RACE_GRACE_SEC` after the first request, is read
+as a replay: the family is
 revoked and `authorization_code_replay` / `refresh_token_reuse_detected` fires. It fails closed (no
 extra tokens; the user signs in once more) but raises a false alert. Marking claims "in flight" in
 the replay store would remove it; left out of this change to keep the replay semantics untouched.
@@ -629,7 +663,7 @@ Origin-only URLs (no path / lone `/`), query, fragment, userinfo, and paths that
 The router is built in [`main.go`](./main.go) (`func main`) — see that file rather than a copy here, since this block historically rotted. High level:
 
 - Global middlewares: in-flight WaitGroup → strip inbound `X-Request-Id` → `chimw.RequestID` → `zapMiddleware` → `chimw.Recoverer` → per-IP rate limiter.
-- OAuth endpoints (`/register`, `/authorize`, `/consent`, `/callback`, `/token`) and the discovery surface (`/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource`, mount-suffixed variants, and the openid-configuration / under-mount 404 carve-outs) carry per-endpoint rate limiters when `RATE_LIMIT_ENABLED=true` (passthrough otherwise). Discovery is silent on rate-limit per RFC 8414 §3 / RFC 9728 §3.1; the 60/min/IP ceiling here only catches floods. The 429 carries `Retry-After: <window seconds>`, which states when to retry without disclosing the per-window quota; the `X-RateLimit-Limit` / `-Remaining` / `-Reset` headers httprate sets internally are stripped from every response — production MCP servers (Cloudflare, GitHub Copilot, Atlassian, Notion, Sentry) all keep them silent, and the IETF rate-limit-headers draft warns that disclosing quota state on auth/error paths leaks operational capacity to attackers. `replayStore` is wired only when `REDIS_URL` is set.
+- OAuth endpoints (`/register`, `/authorize`, `/consent`, `/callback`, `/token`) and the discovery surface (`/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource`, mount-suffixed variants, and the openid-configuration / under-mount 404 carve-outs) carry per-endpoint rate limiters when `RATE_LIMIT_ENABLED=true` (passthrough otherwise). Discovery is silent on rate-limit per RFC 8414 §3 / RFC 9728 §3.1; the 60/min/IP ceiling here only catches floods. The 429 carries `Retry-After: <window seconds>`, which states when to retry without disclosing the per-window quota; the `X-RateLimit-Limit` / `-Remaining` / `-Reset` headers httprate sets internally are stripped from every response — production MCP servers (Cloudflare, GitHub Copilot, Atlassian, Notion, Sentry) all keep them silent, and the IETF rate-limit-headers draft warns that disclosing quota state on auth/error paths leaks operational capacity to attackers. `replayStore` is wired when `REDIS_URL` is set, and as an in-memory store for `UPSTREAM_FORWARD_IDP_TOKEN=true` without it.
 - 405 responder (`installMethodNotAllowed`, wired after every route so it can read the finished routing table): replaces chi's empty-bodied default with the shared error sink, keeps the RFC 9110 §15.5.6 `Allow` header, and applies the `BrowserFacing` marker **per path** — a wrong method on `/consent` renders the page, one on `/token` or `/register` stays `application/json` like every other error there.
 - Liveness `/healthz` (always 200) on the public listener; readiness `/readyz` lives ONLY on the metrics listener (an unauthenticated `/readyz` on the public port is a Redis-DoS amplifier — see comment at `main.go:304`).
 - MCP proxy mounts at `cfg.UpstreamMCPMountPath` (path from `UPSTREAM_MCP_URL`) under `authMW.Validate` → `RPCPeek` → per-subject concurrency limiter. Client path == upstream path, verbatim, no rewrite.
@@ -662,7 +696,7 @@ type OAuthError struct {
 | `email_not_verified` | id_token `email_verified` is `false` (metric label: `email_unverified`); also re-checked on a forwarding-mode refresh | `access_denied` (`invalid_grant` at `/token`) |
 | `subject_missing` | IdP returned a verified id_token without a `sub` claim (L5) | `access_denied` |
 | `group_invalid` | IdP group name contains `,` `\r` `\n` `\x00`; also re-checked on a forwarding-mode refresh | `access_denied` (`invalid_grant` at `/token`) |
-| `group_not_allowed` | User belongs to none of `ALLOWED_GROUPS` (metric label: `group`); also re-checked on a forwarding-mode refresh, so a removal bites within one access-token lifetime | `access_denied` (`invalid_grant` at `/token`) |
+| `group_not_allowed` | User belongs to none of `ALLOWED_GROUPS` (metric label: `group`); also re-checked on a forwarding-mode refresh when the IdP returns an id_token, so a removal then bites within one access-token lifetime | `access_denied` (`invalid_grant` at `/token`) |
 | `session_expired` / `session_audience_mismatch` / `callback_params_missing` | `/callback` flow state is unusable; the page tells the user to start again | `invalid_request` |
 | `session_unknown` | `/callback` state cannot be opened. Paired `error` is `invalid_request`, **or** the allowlisted IdP `error` when the IdP itself returned one | `invalid_request` (or the IdP's) |
 | `consent_token_missing` / `consent_token_invalid` / `consent_token_expired` / `consent_token_audience_mismatch` | `/consent` flow state is unusable; same "start again" advice | `invalid_request` |
@@ -682,13 +716,13 @@ type OAuthError struct {
 | `client_id_unknown` | `client_id` did not decrypt, **or** decrypted with the wrong purpose tag. One code for both on purpose: distinct codes would tell an unauthenticated caller which of the two happened, i.e. whether a blob they hold is a genuine token of this proxy. The metric labels stay distinct (`client_id_invalid`, `client_typ_mismatch`) | `invalid_client` / `invalid_grant` |
 | `client_audience_mismatch` / `client_registration_expired` | Client registered for another `PROXY_BASE_URL`, or past its TTL; each matches the metric label of the same name | `invalid_client` |
 | `replay_store_unavailable` | Redis unreachable; handler fails closed | `server_error` |
-| `id_token_verification_failed` | go-oidc rejected the IdP id_token; at `/token` in forwarding mode, the id_token returned on refresh names a different `sub` (`invalid_grant`) | `server_error` (or `invalid_grant`) |
+| `id_token_verification_failed` | go-oidc rejected the IdP id_token; at `/token` in forwarding mode, the id_token returned on refresh fails verification, has unparsable claims, or names a different `sub` (`invalid_grant`) | `server_error` (or `invalid_grant`) |
 | `token_issue_failed` | AES-GCM seal error when minting an access token. In forwarding mode also an IdP access token that would leave the proxy token under a minute (i.e. lives under about two minutes), or IdP tokens that would push an access or refresh token over its `open()` cap; there the code or refresh token is already spent, so the answer is `invalid_grant` — a 5xx would invite a retry that reads as a replay | `server_error` (`invalid_grant` in forwarding mode) |
 | `idp_refresh_token_missing` | `/callback` in forwarding mode (`UPSTREAM_FORWARD_IDP_TOKEN`): the IdP code exchange returned no refresh token — offline access not granted to the proxy's client | `server_error` |
-| `idp_token_missing` | `/token` in forwarding mode: the code or refresh token was minted before the mode was switched on and carries no IdP token; the client signs in again | `invalid_grant` |
+| `idp_token_missing` | `/token` in forwarding mode: the code or refresh token was minted before the mode was switched on and carries no IdP token; the client signs in again. Metric: `mcp_auth_access_denied_total{reason="idp_token_missing"}` | `invalid_grant` |
 | `idp_refresh_rejected` | `/token` in forwarding mode: the IdP refused the refresh (`invalid_grant`, `interaction_required`, `login_required`, `consent_required`, `invalid_scope`); the client signs in again. Metric: `mcp_auth_idp_refresh_total{result="rejected"}` | `invalid_grant` |
-| `idp_refresh_unavailable` | `/token` in forwarding mode: IdP transport error, timeout, 5xx or 429, or the proxy's own client credentials refused (`invalid_client`, `unauthorized_client`). The code or refresh token is NOT consumed — retry after `Retry-After`. If giving it back fails (replay store down at the same time), the answer is `invalid_grant` without `Retry-After`: a retry would read as a replay. Metric: `mcp_auth_idp_refresh_total{result="unavailable"}` | `temporarily_unavailable` (or `invalid_grant`) |
-| `idp_refresh_failed` | `/token` in forwarding mode: a failure waiting will not clear — a permanent IdP 4xx (`invalid_request`, `unsupported_grant_type`, …) or a 2xx without a usable Bearer access token (or one whose body broke off), after which the IdP has probably rotated its refresh token already. The code or refresh token stays spent; the client signs in again. Metric: `mcp_auth_idp_refresh_total{result="failed"}` | `invalid_grant` |
+| `idp_refresh_unavailable` | `/token` in forwarding mode: A transport error, a timeout, any 5xx or 429 whatever its body, the IdP error codes `temporarily_unavailable` or `server_error` on a 4xx, the proxy's own client credentials refused (`invalid_client`, `unauthorized_client`, 401), a 4xx without an `error` member, any 3xx (redirects are never followed), or a 2xx whose body is not a JSON object (a maintenance page, a WAF block), or more than 64 refresh calls in flight. The code or refresh token is NOT consumed — retry after `Retry-After`. `Retry-After` is the proxy's jittered 2-4 s. On a 5xx, a 429 or a `temporarily_unavailable` / `server_error` answer, an IdP `Retry-After` in seconds above 4 replaces it, capped at 120 s (the HTTP-date form is ignored). Otherwise it is 60 s on a 3xx, and when a 4xx other than 429 refused the proxy's client credentials or carried no `error` member. If giving it back fails (replay store down at the same time), the answer is `invalid_grant` without `Retry-After`: a retry would read as a replay. Metric: `mcp_auth_idp_refresh_total{result="unavailable"}` | `temporarily_unavailable` (or `invalid_grant`) |
+| `idp_refresh_failed` | `/token` in forwarding mode: a failure waiting will not clear — a JSON error with an unknown code (`invalid_request`, `unsupported_grant_type`, …), a JSON 2xx without a usable Bearer access token, a 2xx whose body broke off mid-read, or an `expires_in` that is stated and zero or negative. The code or refresh token stays spent; the client signs in again. Metric: `mcp_auth_idp_refresh_total{result="failed"}` | `invalid_grant` |
 
 **Browser-facing rendering.** `/authorize`, `/consent` and `/callback` terminate in the user's
 browser, not in the MCP client — a raw JSON body there is a dead end for the human reading it. Those
@@ -779,7 +813,7 @@ Operator-load-bearing invariants that are not surfaced by the env table or the e
   - `mcp_auth_access_denied_total{reason}` — see [`docs/configuration.md`](./docs/configuration.md#observability) for the enumerated reasons
   - `mcp_auth_replay_detected_total{kind}` (`code` / `refresh` / `consent` / `callback_state`) — `code`, `refresh` and `callback_state` are rejected requests (security signal); `consent` counts replayed consent POSTs that were answered with a re-rendered consent page, which includes benign double-submits / back-button re-POSTs — alert on sustained rate, not single ticks
   - `mcp_auth_authorize_initiated_total{flow}` — `/authorize` requests admitted past validation, by flow (`consent` / `redirect`)
-  - `mcp_auth_idp_exchange_throttled_total` — outbound proxy → IdP exchanges refused by `IDP_EXCHANGE_RATE_PER_SEC`
+  - `mcp_auth_idp_exchange_throttled_total` — outbound proxy → IdP exchanges refused by `IDP_EXCHANGE_RATE_PER_SEC`, at `/callback` and at `/token` in forwarding mode. A throttled `/token` call also increments `mcp_auth_idp_refresh_total{result="throttled"}`
   - `mcp_auth_rate_limited_total{endpoint}`
   - `mcp_auth_clients_registered_total`
   - `mcp_auth_groups_claim_shape_mismatch_total` — IdP-schema-drift signal; user is admitted with empty groups, so it's NOT a denial
@@ -879,6 +913,7 @@ The `manifests/` folder ships a turn-key demo: a Docker Compose stack (Keycloak 
 - `MCP_LOG_BODY_MAX` / `MCP_PER_SUBJECT_CONCURRENCY` not parseable as non-negative integers.
 - `SHUTDOWN_TIMEOUT` / `REVOKE_BEFORE` unparseable as duration / RFC3339.
 - `ACCESS_LOG_SKIP_RE` not compilable as a Go RE2 regexp.
+- `UPSTREAM_FORWARD_IDP_TOKEN=true` without `REDIS_URL` under `PROD_MODE`, or together with `UPSTREAM_AUTHORIZATION_HEADER`. Without a replay store, a stolen refresh token would mint a forwardable IdP token on every replay. Outside `PROD_MODE`, with `REDIS_REQUIRED=false`, the proxy falls back to an in-memory replay store (single instance only, log `replay_store_in_memory`).
 
 Non-fatal startup warnings:
 

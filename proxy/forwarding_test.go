@@ -170,3 +170,20 @@ func TestProxy_DefaultModeIgnoresContextIdPToken(t *testing.T) {
 		t.Errorf("upstream Authorization = %q, want none in default mode", up.auth)
 	}
 }
+
+// An empty token in the context must not become "Authorization: Bearer ".
+func TestProxy_ForwardIdPToken_EmptyContextTokenSendsNoHeader(t *testing.T) {
+	up := &recordingUpstream{}
+	srv := httptest.NewServer(up)
+	defer srv.Close()
+	h, err := Handler(srv.URL, zap.NewNop(), Config{ForwardIdPToken: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := forwardingRequest("")
+	req = req.WithContext(context.WithValue(req.Context(), middleware.ContextIdPAccessToken, ""))
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	if len(up.auth) != 1 || up.auth[0] != "" {
+		t.Errorf("upstream Authorization = %q, want none", up.auth)
+	}
+}

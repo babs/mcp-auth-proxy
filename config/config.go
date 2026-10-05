@@ -201,7 +201,7 @@ type Config struct {
 	// UpstreamAuthorization — both own the upstream Authorization header.
 	// env: UPSTREAM_FORWARD_IDP_TOKEN (default false).
 	UpstreamForwardIdPToken bool
-	// OIDCExtraScopes are appended to BaseOIDCScopes on the IdP
+	// OIDCExtraScopes are appended to baseOIDCScopes on the IdP
 	// authorize request and, in forwarding mode, on every IdP refresh
 	// request. Operator-only: clients still cannot request scopes, and
 	// scopes_supported stays empty. Duplicates of the base scopes are
@@ -563,6 +563,13 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("UPSTREAM_FORWARD_IDP_TOKEN=true and UPSTREAM_AUTHORIZATION_HEADER are mutually exclusive: both set the upstream Authorization header")
 	}
 
+	// Without a replay store nothing is single-use: a stolen refresh
+	// token would mint a forwardable IdP token on every replay. Outside
+	// PROD_MODE main falls back to an in-memory store instead.
+	if c.UpstreamForwardIdPToken && c.RedisURL == "" && c.ProdMode {
+		return nil, fmt.Errorf("UPSTREAM_FORWARD_IDP_TOKEN=true requires REDIS_URL under PROD_MODE: forwarding needs a shared replay store for single-use codes and refresh-token reuse detection")
+	}
+
 	extraScopes, err := parseExtraScopes(os.Getenv("OIDC_EXTRA_SCOPES"))
 	if err != nil {
 		return nil, err
@@ -661,15 +668,15 @@ func (c *Config) SecretWeaknessWarning() string {
 	return c.secretWeakWarning
 }
 
-// BaseOIDCScopes are always requested from the IdP: the proxy needs an
+// baseOIDCScopes are always requested from the IdP: the proxy needs an
 // id_token carrying the subject, email and profile claims.
-var BaseOIDCScopes = []string{"openid", "email", "profile"}
+var baseOIDCScopes = []string{"openid", "email", "profile"}
 
-// OIDCScopes returns the scope list sent to the IdP: BaseOIDCScopes
+// OIDCScopes returns the scope list sent to the IdP: baseOIDCScopes
 // followed by OIDC_EXTRA_SCOPES. A fresh slice on every call, so a
 // caller appending to it cannot alias another caller's list.
 func (c *Config) OIDCScopes() []string {
-	return append(slices.Clone(BaseOIDCScopes), c.OIDCExtraScopes...)
+	return append(slices.Clone(baseOIDCScopes), c.OIDCExtraScopes...)
 }
 
 // ForwardingScopeWarning returns a non-empty message when forwarding is
@@ -693,7 +700,7 @@ func (c *Config) ForwardingScopeWarning() string {
 func parseExtraScopes(raw string) ([]string, error) {
 	var out []string
 	seen := map[string]bool{}
-	for _, s := range BaseOIDCScopes {
+	for _, s := range baseOIDCScopes {
 		seen[s] = true
 	}
 	for _, s := range strings.Fields(raw) {

@@ -3232,7 +3232,8 @@ func (f *failingReplayStore) Exists(_ context.Context, _ string) (bool, error) {
 func (f *failingReplayStore) ClaimOrCheckFamily(_ context.Context, _, _ string, _, _, _ time.Duration) (bool, bool, bool, error) {
 	return false, false, false, f.err
 }
-func (f *failingReplayStore) Close() error { return nil }
+func (f *failingReplayStore) Release(context.Context, string) error { return nil }
+func (f *failingReplayStore) Close() error                          { return nil }
 
 // TestToken_ReplayStoreUnavailable_IncrementsAccessDenied pins R1-M2:
 // both grant paths must increment

@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -18,7 +19,7 @@ import (
 
 const (
 	testIdPClientID     = "proxy-client"
-	testIdPClientSecret = "s3cr:et/with&chars"
+	testIdPClientSecret = "s3cr:et/with&chars%+"
 	testIdPRefresh      = "idp-refresh-token-value-do-not-log"
 )
 
@@ -73,11 +74,11 @@ func TestIdPRefresher_HeaderAuthExplicitScope(t *testing.T) {
 			t.Error("no Basic credentials with AuthStyleInHeader")
 		}
 		// RFC 6749 §2.3.1: both halves are form-encoded before Basic.
-		if u, _ := url.QueryUnescape(user); u != testIdPClientID {
+		if user != url.QueryEscape(testIdPClientID) {
 			t.Errorf("basic user = %q", user)
 		}
-		if p, _ := url.QueryUnescape(pass); p != testIdPClientSecret {
-			t.Errorf("basic password = %q", pass)
+		if pass != url.QueryEscape(testIdPClientSecret) || pass == testIdPClientSecret {
+			t.Errorf("basic password = %q, want it form-encoded", pass)
 		}
 		if form.Get("client_secret") != "" {
 			t.Error("client_secret also sent in the body")
@@ -173,9 +174,9 @@ func TestIdPRefresher_AutoDetectGrantErrorDoesNotRetry(t *testing.T) {
 	r := newTestRefresher(srv.URL, oauth2.AuthStyleAutoDetect, 5*time.Second)
 
 	_, err := r.Refresh(context.Background(), testIdPRefresh)
-	var re *IdPRefreshError
-	if !errors.As(err, &re) || re.Kind != IdPRefreshRejected {
-		t.Fatalf("err = %v, want a rejected IdPRefreshError", err)
+	var re *idpRefreshError
+	if !errors.As(err, &re) || re.Kind != idpRefreshRejected {
+		t.Fatalf("err = %v, want a rejected idpRefreshError", err)
 	}
 	if n := ep.calls.Load(); n != 1 {
 		t.Errorf("calls = %d, want 1", n)
@@ -202,37 +203,74 @@ func TestIdPRefresher_ErrorClassification(t *testing.T) {
 	cases := []struct {
 		name       string
 		handler    http.HandlerFunc
-		wantKind   IdPRefreshKind
+		wantKind   idpRefreshKind
 		wantStatus int
 		wantCode   string
 	}{
-		{name: "invalid_grant", handler: func(w http.ResponseWriter, _ *http.Request) { oauthErrorJSON(w, 400, "invalid_grant") }, wantKind: IdPRefreshRejected, wantStatus: 400, wantCode: "invalid_grant"},
-		{name: "interaction_required", handler: func(w http.ResponseWriter, _ *http.Request) { oauthErrorJSON(w, 400, "interaction_required") }, wantKind: IdPRefreshRejected, wantStatus: 400, wantCode: "interaction_required"},
-		{name: "invalid_scope", handler: func(w http.ResponseWriter, _ *http.Request) { oauthErrorJSON(w, 400, "invalid_scope") }, wantKind: IdPRefreshRejected, wantStatus: 400, wantCode: "invalid_scope"},
-		{name: "invalid_client_keeps_sessions", handler: func(w http.ResponseWriter, _ *http.Request) { oauthErrorJSON(w, 401, "invalid_client") }, wantKind: IdPRefreshUnavailable, wantStatus: 401, wantCode: "invalid_client"},
-		{name: "unauthorized_client_on_400", handler: func(w http.ResponseWriter, _ *http.Request) { oauthErrorJSON(w, 400, "unauthorized_client") }, wantKind: IdPRefreshUnavailable, wantStatus: 400, wantCode: "unauthorized_client"},
-		{name: "invalid_request_is_permanent", handler: func(w http.ResponseWriter, _ *http.Request) { oauthErrorJSON(w, 400, "invalid_request") }, wantKind: IdPRefreshFailed, wantStatus: 400, wantCode: "invalid_request"},
-		{name: "unsupported_grant_type_is_permanent", handler: func(w http.ResponseWriter, _ *http.Request) { oauthErrorJSON(w, 400, "unsupported_grant_type") }, wantKind: IdPRefreshFailed, wantStatus: 400, wantCode: "unsupported_grant_type"},
-		{name: "429_is_outage", handler: func(w http.ResponseWriter, _ *http.Request) { oauthErrorJSON(w, 429, "slow_down") }, wantKind: IdPRefreshUnavailable, wantStatus: 429, wantCode: "slow_down"},
-		{name: "5xx_with_grant_error_is_outage", handler: func(w http.ResponseWriter, _ *http.Request) { oauthErrorJSON(w, 500, "invalid_grant") }, wantKind: IdPRefreshUnavailable, wantStatus: 500, wantCode: "invalid_grant"},
+		{name: "invalid_grant", handler: func(w http.ResponseWriter, _ *http.Request) { oauthErrorJSON(w, 400, "invalid_grant") }, wantKind: idpRefreshRejected, wantStatus: 400, wantCode: "invalid_grant"},
+		{name: "interaction_required", handler: func(w http.ResponseWriter, _ *http.Request) { oauthErrorJSON(w, 400, "interaction_required") }, wantKind: idpRefreshRejected, wantStatus: 400, wantCode: "interaction_required"},
+		{name: "invalid_scope", handler: func(w http.ResponseWriter, _ *http.Request) { oauthErrorJSON(w, 400, "invalid_scope") }, wantKind: idpRefreshRejected, wantStatus: 400, wantCode: "invalid_scope"},
+		{name: "invalid_client_keeps_sessions", handler: func(w http.ResponseWriter, _ *http.Request) { oauthErrorJSON(w, 401, "invalid_client") }, wantKind: idpRefreshUnavailable, wantStatus: 401, wantCode: "invalid_client"},
+		{name: "unauthorized_client_on_400", handler: func(w http.ResponseWriter, _ *http.Request) { oauthErrorJSON(w, 400, "unauthorized_client") }, wantKind: idpRefreshUnavailable, wantStatus: 400, wantCode: "unauthorized_client"},
+		{name: "invalid_request_is_permanent", handler: func(w http.ResponseWriter, _ *http.Request) { oauthErrorJSON(w, 400, "invalid_request") }, wantKind: idpRefreshFailed, wantStatus: 400, wantCode: "invalid_request"},
+		{name: "unsupported_grant_type_is_permanent", handler: func(w http.ResponseWriter, _ *http.Request) { oauthErrorJSON(w, 400, "unsupported_grant_type") }, wantKind: idpRefreshFailed, wantStatus: 400, wantCode: "unsupported_grant_type"},
+		{name: "429_is_outage", handler: func(w http.ResponseWriter, _ *http.Request) { oauthErrorJSON(w, 429, "slow_down") }, wantKind: idpRefreshUnavailable, wantStatus: 429, wantCode: "slow_down"},
+		{name: "5xx_with_grant_error_is_outage", handler: func(w http.ResponseWriter, _ *http.Request) { oauthErrorJSON(w, 500, "invalid_grant") }, wantKind: idpRefreshUnavailable, wantStatus: 500, wantCode: "invalid_grant"},
 		{name: "503_html", handler: func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(503)
 			_, _ = w.Write([]byte("<html>maintenance</html>"))
-		}, wantKind: IdPRefreshUnavailable, wantStatus: 503},
-		{name: "200_malformed_json", handler: func(w http.ResponseWriter, _ *http.Request) { okTokenJSON(w, `{"access_token":`) }, wantKind: IdPRefreshFailed, wantStatus: 200},
-		{name: "200_no_access_token", handler: func(w http.ResponseWriter, _ *http.Request) { okTokenJSON(w, `{"token_type":"Bearer"}`) }, wantKind: IdPRefreshFailed, wantStatus: 200},
+		}, wantKind: idpRefreshUnavailable, wantStatus: 503},
+		{name: "transient_code_on_400", handler: func(w http.ResponseWriter, _ *http.Request) { oauthErrorJSON(w, 400, "temporarily_unavailable") }, wantKind: idpRefreshUnavailable, wantStatus: 400, wantCode: "temporarily_unavailable"},
+		{name: "server_error_on_400", handler: func(w http.ResponseWriter, _ *http.Request) { oauthErrorJSON(w, 400, "server_error") }, wantKind: idpRefreshUnavailable, wantStatus: 400, wantCode: "server_error"},
+		// Answers that never came from a token endpoint: the IdP did
+		// not see the grant, so the client's token must stay usable.
+		{name: "403_waf_html", handler: func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(403)
+			_, _ = w.Write([]byte("<html>blocked</html>"))
+		}, wantKind: idpRefreshUnavailable, wantStatus: 403},
+		{name: "404_plain", handler: func(w http.ResponseWriter, _ *http.Request) { http.Error(w, "not found", 404) }, wantKind: idpRefreshUnavailable, wantStatus: 404},
+		{name: "400_json_without_error_member", handler: func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(400)
+			_, _ = w.Write([]byte(`{"message":"bad"}`))
+		}, wantKind: idpRefreshUnavailable, wantStatus: 400},
+		{name: "200_html_maintenance_page", handler: func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("<html>maintenance</html>")) }, wantKind: idpRefreshUnavailable, wantStatus: 200},
+		// A malformed JSON object DID come from the token endpoint: the
+		// grant was processed, so the token stays spent.
+		{name: "200_malformed_json_object", handler: func(w http.ResponseWriter, _ *http.Request) { okTokenJSON(w, `{"access_token":`) }, wantKind: idpRefreshFailed, wantStatus: 200},
+		{name: "200_malformed_object_after_whitespace", handler: func(w http.ResponseWriter, _ *http.Request) { okTokenJSON(w, "\n {\"access_token\":") }, wantKind: idpRefreshFailed, wantStatus: 200},
+		{name: "200_json_null", handler: func(w http.ResponseWriter, _ *http.Request) { okTokenJSON(w, `null`) }, wantKind: idpRefreshUnavailable, wantStatus: 200},
+		{name: "200_json_array", handler: func(w http.ResponseWriter, _ *http.Request) { okTokenJSON(w, `[]`) }, wantKind: idpRefreshUnavailable, wantStatus: 200},
+		{name: "200_mistyped_token_type", handler: func(w http.ResponseWriter, _ *http.Request) {
+			okTokenJSON(w, `{"access_token":"x","token_type":5}`)
+		}, wantKind: idpRefreshFailed, wantStatus: 200},
+		{name: "400_rejected_with_mistyped_sibling", handler: func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(400)
+			_, _ = w.Write([]byte(`{"error":"invalid_grant","access_token":5}`))
+		}, wantKind: idpRefreshRejected, wantStatus: 400, wantCode: "invalid_grant"},
+		{name: "401_with_unlisted_code", handler: func(w http.ResponseWriter, _ *http.Request) { oauthErrorJSON(w, 401, "access_denied") }, wantKind: idpRefreshUnavailable, wantStatus: 401, wantCode: "access_denied"},
+		{name: "code_is_sanitized", handler: func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(400)
+			_, _ = w.Write([]byte(`{"error":"bad\ncode"}`))
+		}, wantKind: idpRefreshFailed, wantStatus: 400, wantCode: "badcode"},
+		{name: "200_expired_on_arrival", handler: func(w http.ResponseWriter, _ *http.Request) {
+			okTokenJSON(w, `{"access_token":"x","token_type":"Bearer","expires_in":0}`)
+		}, wantKind: idpRefreshFailed, wantStatus: 200},
+		{name: "200_negative_expires_in", handler: func(w http.ResponseWriter, _ *http.Request) {
+			okTokenJSON(w, `{"access_token":"x","token_type":"Bearer","expires_in":"-5"}`)
+		}, wantKind: idpRefreshFailed, wantStatus: 200},
+		{name: "200_no_access_token", handler: func(w http.ResponseWriter, _ *http.Request) { okTokenJSON(w, `{"token_type":"Bearer"}`) }, wantKind: idpRefreshFailed, wantStatus: 200},
 		{name: "200_dpop_token", handler: func(w http.ResponseWriter, _ *http.Request) {
 			okTokenJSON(w, `{"access_token":"x","token_type":"DPoP"}`)
-		}, wantKind: IdPRefreshFailed, wantStatus: 200},
+		}, wantKind: idpRefreshFailed, wantStatus: 200},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := httptest.NewServer(tc.handler)
 			defer srv.Close()
 			_, err := newTestRefresher(srv.URL, oauth2.AuthStyleInParams, 5*time.Second).Refresh(context.Background(), testIdPRefresh)
-			var re *IdPRefreshError
+			var re *idpRefreshError
 			if !errors.As(err, &re) {
-				t.Fatalf("err = %v (%T), want *IdPRefreshError", err, err)
+				t.Fatalf("err = %v (%T), want *idpRefreshError", err, err)
 			}
 			if re.Kind != tc.wantKind || re.Status != tc.wantStatus || re.Code != tc.wantCode {
 				t.Errorf("got kind=%v status=%d code=%q, want kind=%v status=%d code=%q",
@@ -245,27 +283,159 @@ func TestIdPRefresher_ErrorClassification(t *testing.T) {
 	}
 }
 
-// An IdP that echoes the grant back in its error description must not
-// get the refresh token or the client secret into the proxy's logs.
-func TestIdPRefresher_RedactsEchoedSecrets(t *testing.T) {
+// Every code in the sets keeps its class: a code dropped from a set
+// would silently become "failed".
+func TestIdPRefresher_CodeSetsClassify(t *testing.T) {
+	classify := func(code string) idpRefreshKind {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { oauthErrorJSON(w, 400, code) }))
+		defer srv.Close()
+		_, err := newTestRefresher(srv.URL, oauth2.AuthStyleInParams, 5*time.Second).Refresh(context.Background(), testIdPRefresh)
+		var re *idpRefreshError
+		if !errors.As(err, &re) {
+			t.Fatalf("%s: err = %v", code, err)
+		}
+		return re.Kind
+	}
+	for _, code := range []string{"invalid_grant", "interaction_required", "login_required", "consent_required", "invalid_scope"} {
+		if got := classify(code); got != idpRefreshRejected {
+			t.Errorf("%s = %v, want rejected", code, got)
+		}
+	}
+	for _, code := range []string{"invalid_client", "unauthorized_client", "temporarily_unavailable", "server_error"} {
+		if got := classify(code); got != idpRefreshUnavailable {
+			t.Errorf("%s = %v, want unavailable", code, got)
+		}
+	}
+}
+
+// The IdP's error_description is free text it may fill with the grant in
+// any encoding: it never reaches the error. The code is redacted.
+func TestIdPRefresher_NeverCarriesEchoedSecrets(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
+		rt, secret := r.PostForm.Get("refresh_token"), r.PostForm.Get("client_secret")
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write([]byte(`{"error":"invalid_grant","error_description":"token ` + r.PostForm.Get("refresh_token") + ` for secret ` + r.PostForm.Get("client_secret") + ` is expired"}`))
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error":             "bad_" + rt + "_" + secret,
+			"error_description": "token " + rt + " " + url.QueryEscape(rt) + " for secret " + secret + " marker-description",
+		})
 	}))
 	defer srv.Close()
 
 	_, err := newTestRefresher(srv.URL, oauth2.AuthStyleInParams, 5*time.Second).Refresh(context.Background(), testIdPRefresh)
-	if err == nil {
-		t.Fatal("Refresh succeeded")
+	var re *idpRefreshError
+	if !errors.As(err, &re) {
+		t.Fatalf("err = %v", err)
 	}
 	msg := err.Error()
-	if strings.Contains(msg, testIdPRefresh) || strings.Contains(msg, url.QueryEscape(testIdPClientSecret)) || strings.Contains(msg, testIdPClientSecret) {
-		t.Errorf("error text leaks a credential: %q", msg)
+	if strings.Contains(msg, testIdPRefresh) || strings.Contains(msg, testIdPClientSecret) || strings.Contains(msg, "marker-description") {
+		t.Errorf("error text carries IdP free text or a credential: %q", msg)
 	}
-	if !strings.Contains(msg, "[redacted]") {
-		t.Errorf("error text = %q, want the echoed values redacted, not dropped silently", msg)
+	if re.Code != "bad_[redacted]_[redacted]" {
+		t.Errorf("code = %q, want both echoed values redacted", re.Code)
+	}
+}
+
+// The IdP's own Retry-After is carried, and a refused client credential
+// asks for a long wait: only an operator fix clears it.
+func TestIdPRefresher_RetryAfter(t *testing.T) {
+	cases := []struct {
+		name    string
+		handler http.HandlerFunc
+		want    time.Duration
+	}{
+		{name: "429_with_retry_after", handler: func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Retry-After", "120")
+			oauthErrorJSON(w, 429, "slow_down")
+		}, want: 120 * time.Second},
+		{name: "503_http_date_ignored", handler: func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Retry-After", "Wed, 21 Oct 2026 07:28:00 GMT")
+			oauthErrorJSON(w, 503, "temporarily_unavailable")
+		}, want: 0},
+		{name: "invalid_client", handler: func(w http.ResponseWriter, _ *http.Request) { oauthErrorJSON(w, 401, "invalid_client") }, want: idpClientAuthRetryAfter},
+		// A 5xx is an outage whatever its body says: the IdP's own value.
+		{name: "503_invalid_client_keeps_idp_value", handler: func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Retry-After", "30")
+			oauthErrorJSON(w, 503, "invalid_client")
+		}, want: 30 * time.Second},
+		{name: "huge_value_clamped", handler: func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Retry-After", "99999999999")
+			oauthErrorJSON(w, 503, "temporarily_unavailable")
+		}, want: maxExpiresInSeconds * time.Second},
+		{name: "codeless_403_paced_long", handler: func(w http.ResponseWriter, _ *http.Request) { http.Error(w, "blocked", http.StatusForbidden) }, want: idpClientAuthRetryAfter},
+		{name: "rejected_carries_none", handler: func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Retry-After", "120")
+			oauthErrorJSON(w, 400, "invalid_grant")
+		}, want: 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(tc.handler)
+			defer srv.Close()
+			_, err := newTestRefresher(srv.URL, oauth2.AuthStyleInParams, 5*time.Second).Refresh(context.Background(), testIdPRefresh)
+			var re *idpRefreshError
+			if !errors.As(err, &re) {
+				t.Fatalf("err = %v, want *idpRefreshError", err)
+			}
+			if re.RetryAfter != tc.want {
+				t.Errorf("RetryAfter = %v, want %v", re.RetryAfter, tc.want)
+			}
+		})
+	}
+}
+
+// A body over the cap is cut off, not buffered whole.
+func TestIdPRefresher_ResponseBodyCapped(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"x","token_type":"Bearer","pad":"` + strings.Repeat("a", idpRefreshMaxBody) + `"}`))
+	}))
+	defer srv.Close()
+	_, err := newTestRefresher(srv.URL, oauth2.AuthStyleInParams, 5*time.Second).Refresh(context.Background(), testIdPRefresh)
+	var re *idpRefreshError
+	if !errors.As(err, &re) || re.Kind != idpRefreshFailed {
+		t.Fatalf("err = %v, want failed: the IdP processed the grant", err)
+	}
+}
+
+// A call over the in-flight bound fails at once and never reaches the
+// IdP, so releasing the client's claim for it is always correct.
+func TestIdPRefresher_InFlightBounded(t *testing.T) {
+	ep := &tokenEndpoint{t: t, handler: func(w http.ResponseWriter, _ url.Values, _, _ string, _ bool) {
+		okTokenJSON(w, `{"access_token":"new-at"}`)
+	}}
+	srv := httptest.NewServer(ep)
+	defer srv.Close()
+	r := newTestRefresher(srv.URL, oauth2.AuthStyleInParams, 5*time.Second)
+	for range idpMaxInFlight {
+		r.inFlight <- struct{}{}
+	}
+
+	// A deadline, so an implementation that queues fails here instead
+	// of hanging the suite.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err := r.Refresh(ctx, testIdPRefresh)
+	var re *idpRefreshError
+	if !errors.As(err, &re) || re.Kind != idpRefreshUnavailable {
+		t.Fatalf("over the bound: err = %v, want unavailable", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("over the bound: answered after %v, want at once (no queueing)", elapsed)
+	}
+	if n := ep.calls.Load(); n != 0 {
+		t.Fatalf("the IdP was called %d times by a call over the bound", n)
+	}
+
+	<-r.inFlight
+	// token_type is OPTIONAL to check: an IdP that omits it is accepted.
+	if _, err := r.Refresh(context.Background(), testIdPRefresh); err != nil {
+		t.Fatalf("with a free slot: %v", err)
+	}
+	if len(r.inFlight) != idpMaxInFlight-1 {
+		t.Errorf("slot not given back: %d in flight, want %d", len(r.inFlight), idpMaxInFlight-1)
 	}
 }
 
@@ -290,8 +460,8 @@ func TestIdPRefresher_AutoDetectNotPinnedByOutage(t *testing.T) {
 	r := newTestRefresher(srv.URL, oauth2.AuthStyleAutoDetect, 5*time.Second)
 
 	_, err := r.Refresh(context.Background(), testIdPRefresh)
-	var re *IdPRefreshError
-	if !errors.As(err, &re) || re.Kind != IdPRefreshUnavailable {
+	var re *idpRefreshError
+	if !errors.As(err, &re) || re.Kind != idpRefreshUnavailable {
 		t.Fatalf("outage: err = %v, want unavailable", err)
 	}
 	if n := ep.calls.Load(); n != 1 {
@@ -307,6 +477,27 @@ func TestIdPRefresher_AutoDetectNotPinnedByOutage(t *testing.T) {
 	}
 	if got := oauth2.AuthStyle(r.detected.Load()); got != oauth2.AuthStyleInParams {
 		t.Errorf("detected style = %v, want InParams", got)
+	}
+}
+
+// A 5xx on the params fallback must not pin params either.
+func TestIdPRefresher_AutoDetectNotPinnedByFallbackOutage(t *testing.T) {
+	ep := &tokenEndpoint{t: t, handler: func(w http.ResponseWriter, _ url.Values, _, _ string, basic bool) {
+		if basic {
+			oauthErrorJSON(w, http.StatusUnauthorized, "invalid_client")
+			return
+		}
+		oauthErrorJSON(w, http.StatusServiceUnavailable, "temporarily_unavailable")
+	}}
+	srv := httptest.NewServer(ep)
+	defer srv.Close()
+	r := newTestRefresher(srv.URL, oauth2.AuthStyleAutoDetect, 5*time.Second)
+
+	if _, err := r.Refresh(context.Background(), testIdPRefresh); err == nil {
+		t.Fatal("Refresh succeeded")
+	}
+	if got := r.detected.Load(); got != 0 {
+		t.Errorf("detected style = %d after a failed fallback, want undecided", got)
 	}
 }
 
@@ -384,6 +575,9 @@ func TestJWTExpiry(t *testing.T) {
 		{token: "a.!!!.c", wantOK: false},
 		{token: "a." + enc(`not json`) + ".c", wantOK: false},
 		{token: "opaque", wantOK: false},
+		// A "never expires" sentinel must not wrap into the past.
+		{token: "a." + enc(`{"exp":9223372036854775807}`) + ".c", wantOK: false},
+		{token: "a." + enc(`{"exp":1e30}`) + ".c", wantOK: false},
 	} {
 		if _, ok := jwtExpiry(tc.token); ok != tc.wantOK {
 			t.Errorf("jwtExpiry(%q) ok = %v, want %v", tc.token, ok, tc.wantOK)
@@ -403,9 +597,11 @@ func TestIdPRefresher_DoesNotFollowRedirects(t *testing.T) {
 	defer srv.Close()
 
 	_, err := newTestRefresher(srv.URL, oauth2.AuthStyleInParams, 5*time.Second).Refresh(context.Background(), testIdPRefresh)
-	var re *IdPRefreshError
-	if !errors.As(err, &re) || re.Kind != IdPRefreshUnavailable || re.Status != http.StatusTemporaryRedirect {
-		t.Fatalf("err = %v, want an unavailable error with status 307", err)
+	var re *idpRefreshError
+	// Unavailable: the redirect is not followed, so the IdP never saw
+	// the grant and the client's token must stay usable.
+	if !errors.As(err, &re) || re.Kind != idpRefreshUnavailable || re.Status != http.StatusTemporaryRedirect || re.RetryAfter != idpClientAuthRetryAfter {
+		t.Fatalf("err = %v, want unavailable with status 307 and the long Retry-After", err)
 	}
 	if hit.Load() {
 		t.Error("the redirect target received the refresh request")
@@ -414,14 +610,14 @@ func TestIdPRefresher_DoesNotFollowRedirects(t *testing.T) {
 
 func TestIdPRefresher_Timeout(t *testing.T) {
 	release := make(chan struct{})
-	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { <-release }))
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { waitOrGiveUp(release) }))
 	defer srv.Close()
 	defer close(release)
 
 	start := time.Now()
 	_, err := newTestRefresher(srv.URL, oauth2.AuthStyleInParams, 200*time.Millisecond).Refresh(context.Background(), testIdPRefresh)
-	var re *IdPRefreshError
-	if !errors.As(err, &re) || re.Kind != IdPRefreshUnavailable || re.Status != 0 {
+	var re *idpRefreshError
+	if !errors.As(err, &re) || re.Kind != idpRefreshUnavailable || re.Status != 0 {
 		t.Fatalf("err = %v, want an unavailable transport error", err)
 	}
 	if elapsed := time.Since(start); elapsed > 3*time.Second {
@@ -439,11 +635,14 @@ func TestParseExpiresIn(t *testing.T) {
 		{raw: `3600`, want: 3600, wantOK: true},
 		{raw: `"3600"`, want: 3600, wantOK: true},
 		{raw: `3599.9`, want: 3599, wantOK: true},
-		{raw: `0`, wantOK: false},
-		{raw: `-5`, wantOK: false},
+		{raw: `0`, want: 0, wantOK: true},
+		{raw: `-5`, want: -5, wantOK: true},
 		{raw: `"soon"`, wantOK: false},
 		{raw: `null`, wantOK: false},
 		{raw: `99999999999999`, want: maxExpiresInSeconds, wantOK: true},
+		{raw: `1e30`, want: maxExpiresInSeconds, wantOK: true},
+		{raw: `-1e30`, want: -1, wantOK: true},
+		{raw: `"NaN"`, wantOK: false},
 	}
 	for _, tc := range cases {
 		got, ok := parseExpiresIn([]byte(tc.raw))
@@ -454,17 +653,17 @@ func TestParseExpiresIn(t *testing.T) {
 }
 
 func TestIdPRefreshError_Message(t *testing.T) {
-	e := &IdPRefreshError{Kind: IdPRefreshRejected, Code: "invalid_grant", Status: 400, Err: errors.New("expired")}
+	e := &idpRefreshError{Kind: idpRefreshRejected, Code: "invalid_grant", Status: 400, Err: errors.New("expired")}
 	if got := e.Error(); got != "idp refresh rejected (status 400): invalid_grant: expired" {
 		t.Errorf("Error() = %q", got)
 	}
 	if !errors.Is(e, e.Err) {
 		t.Error("Unwrap does not expose the cause")
 	}
-	if got := (&IdPRefreshError{}).Error(); got != "idp refresh unavailable" {
+	if got := (&idpRefreshError{}).Error(); got != "idp refresh unavailable" {
 		t.Errorf("empty Error() = %q", got)
 	}
-	if got := (&IdPRefreshError{Kind: IdPRefreshFailed}).Error(); got != "idp refresh failed" {
+	if got := (&idpRefreshError{Kind: idpRefreshFailed}).Error(); got != "idp refresh failed" {
 		t.Errorf("failed Error() = %q", got)
 	}
 }
@@ -509,8 +708,8 @@ func TestIdPRefresher_TruncatedSuccessIsFailed(t *testing.T) {
 	defer srv.Close()
 
 	_, err := newTestRefresher(srv.URL, oauth2.AuthStyleInParams, 5*time.Second).Refresh(context.Background(), testIdPRefresh)
-	var re *IdPRefreshError
-	if !errors.As(err, &re) || re.Kind != IdPRefreshFailed || re.Status != http.StatusOK {
+	var re *idpRefreshError
+	if !errors.As(err, &re) || re.Kind != idpRefreshFailed || re.Status != http.StatusOK {
 		t.Fatalf("err = %v, want a failed error with status 200", err)
 	}
 }
@@ -532,8 +731,8 @@ func TestIdPRefresher_AutoDetectSingleDeadline(t *testing.T) {
 	start := time.Now()
 	_, err := newTestRefresher(srv.URL, oauth2.AuthStyleAutoDetect, 450*time.Millisecond).Refresh(context.Background(), testIdPRefresh)
 	elapsed := time.Since(start)
-	var re *IdPRefreshError
-	if !errors.As(err, &re) || re.Kind != IdPRefreshUnavailable {
+	var re *idpRefreshError
+	if !errors.As(err, &re) || re.Kind != idpRefreshUnavailable {
 		t.Fatalf("err = %v, want the shared deadline to cut the params attempt short", err)
 	}
 	if elapsed > 550*time.Millisecond {

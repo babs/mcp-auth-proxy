@@ -104,10 +104,12 @@ func TestIssueWithIdPToken_ExpiryRule(t *testing.T) {
 		{name: "idp_shorter_than_ttl", idpExp: 30 * time.Minute, want: 29 * time.Minute},
 		{name: "idp_exactly_ttl_plus_skew", idpExp: ttl + time.Minute, want: ttl},
 		{name: "idp_expiry_unknown", idpExp: 0, want: ttl},
-		{name: "idp_inside_skew", idpExp: 30 * time.Second, wantErr: ErrIdPTokenLifetime},
-		{name: "idp_leaves_under_a_minute", idpExp: 90 * time.Second, wantErr: ErrIdPTokenLifetime},
+		{name: "idp_inside_skew", idpExp: 30 * time.Second, wantErr: errIdPTokenLifetime},
+		{name: "idp_leaves_under_a_minute", idpExp: 90 * time.Second, wantErr: errIdPTokenLifetime},
 		{name: "idp_three_minutes", idpExp: 3 * time.Minute, want: 2 * time.Minute},
-		{name: "idp_already_expired", idpExp: -time.Minute, wantErr: ErrIdPTokenLifetime},
+		{name: "just_under_the_minimum", idpExp: 115 * time.Second, wantErr: errIdPTokenLifetime},
+		{name: "just_over_the_minimum", idpExp: 125 * time.Second, want: 65 * time.Second},
+		{name: "idp_already_expired", idpExp: -time.Minute, wantErr: errIdPTokenLifetime},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -597,7 +597,14 @@ func TestToken_Forwarding_ClientHangUpReleasesCode(t *testing.T) {
 	}()
 	<-reached
 	cancel()
-	<-done
+	// The hang-up must cancel the IdP call itself: well under the fake
+	// refresher's 5 s timeout, or the call was detached from the client.
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		close(unblock) // or the fake IdP's shutdown would hang the suite
+		t.Fatal("handler still waiting on the IdP 1 s after the client hung up")
+	}
 	close(unblock)
 
 	idp.succeed(fwdIdPAT, fwdIdPRTNext, 3600)
@@ -718,5 +725,14 @@ func TestCallback_Forwarding_OversizedCodeRefused(t *testing.T) {
 	}
 	if rr.Header().Get("Location") != "" {
 		t.Error("a code was issued anyway")
+	}
+}
+
+// waitOrGiveUp blocks a fake IdP until the test releases it. Bounded, so
+// a lost timeout fails the test instead of hanging it.
+func waitOrGiveUp(release <-chan struct{}) {
+	select {
+	case <-release:
+	case <-time.After(5 * time.Second):
 	}
 }

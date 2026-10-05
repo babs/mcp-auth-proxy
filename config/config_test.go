@@ -1967,6 +1967,26 @@ func TestLoad_UpstreamForwardIdPToken(t *testing.T) {
 			}
 		}
 	})
+	t.Run("requires_redis_under_prod_mode", func(t *testing.T) {
+		setAllRequired(t)
+		t.Setenv("REDIS_URL", "")
+		t.Setenv("UPSTREAM_FORWARD_IDP_TOKEN", "true")
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UPSTREAM_FORWARD_IDP_TOKEN=true requires REDIS_URL") {
+			t.Fatalf("Load = %v, want the forwarding error naming REDIS_URL", err)
+		}
+	})
+	t.Run("no_redis_allowed_outside_prod_mode", func(t *testing.T) {
+		// main then falls back to the in-memory replay store.
+		setAllRequired(t)
+		t.Setenv("PROD_MODE", "false")
+		t.Setenv("REDIS_REQUIRED", "false")
+		t.Setenv("REDIS_URL", "")
+		t.Setenv("UPSTREAM_FORWARD_IDP_TOKEN", "true")
+		cfg, err := Load()
+		if err != nil || !cfg.UpstreamForwardIdPToken || cfg.RedisURL != "" {
+			t.Fatalf("Load = %+v, %v; want forwarding on without REDIS_URL", cfg, err)
+		}
+	})
 	t.Run("static_header_alone_still_allowed", func(t *testing.T) {
 		setAllRequired(t)
 		t.Setenv("UPSTREAM_FORWARD_IDP_TOKEN", "false")
@@ -1992,6 +2012,7 @@ func TestLoad_OIDCExtraScopes(t *testing.T) {
 		{name: "quote_rejected", raw: `offline_access "bad"`, errSub: "OIDC_EXTRA_SCOPES"},
 		{name: "backslash_rejected", raw: `bad\scope`, errSub: "OIDC_EXTRA_SCOPES"},
 		{name: "non_ascii_rejected", raw: "scöpe", errSub: "OIDC_EXTRA_SCOPES"},
+		{name: "control_char_rejected", raw: "bad\x01scope", errSub: "OIDC_EXTRA_SCOPES"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2027,10 +2048,10 @@ func TestOIDCScopes_BasePlusExtras(t *testing.T) {
 	if again := c.OIDCScopes(); !slices.Equal(again, want) {
 		t.Errorf("OIDCScopes() after caller mutation = %q, want %q", again, want)
 	}
-	if !slices.Equal(BaseOIDCScopes, []string{"openid", "email", "profile"}) {
-		t.Errorf("BaseOIDCScopes mutated: %q", BaseOIDCScopes)
+	if !slices.Equal(baseOIDCScopes, []string{"openid", "email", "profile"}) {
+		t.Errorf("baseOIDCScopes mutated: %q", baseOIDCScopes)
 	}
-	if got := (&Config{}).OIDCScopes(); !slices.Equal(got, BaseOIDCScopes) {
+	if got := (&Config{}).OIDCScopes(); !slices.Equal(got, baseOIDCScopes) {
 		t.Errorf("OIDCScopes() without extras = %q, want the base scopes", got)
 	}
 }

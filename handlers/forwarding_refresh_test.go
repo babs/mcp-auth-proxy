@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -12,10 +11,12 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 	"golang.org/x/time/rate"
 
+	"github.com/babs/mcp-auth-proxy/metrics"
 	"github.com/babs/mcp-auth-proxy/replay"
 	"github.com/babs/mcp-auth-proxy/token"
 )
@@ -198,7 +199,7 @@ func TestTokenRefresh_Forwarding_Timeout(t *testing.T) {
 	f := newRefreshFixture(t)
 	block := make(chan struct{})
 	defer close(block)
-	f.idp.respond.Store(func(http.ResponseWriter) { <-block })
+	f.idp.respond.Store(func(http.ResponseWriter) { waitOrGiveUp(block) })
 	cfg := TokenConfig{
 		ForwardIdPToken: true,
 		IdPRefresher:    f.idp.refresher(),
@@ -285,37 +286,78 @@ func TestTokenRefresh_Forwarding_IdentityUpdatedFromVerifiedIDToken(t *testing.T
 	}
 }
 
-// Without a verified id_token the previous identity is kept — never
-// widened — and a warning is logged.
-func TestTokenRefresh_Forwarding_UnverifiedIdentityKeepsPrevious(t *testing.T) {
-	cases := []struct {
-		name    string
-		idToken string
-		event   string
-	}{
-		{name: "no_id_token", idToken: "", event: "idp_refresh_id_token_missing"},
-		{name: "forged_id_token", idToken: `{"sub":"user-sub","groups":["admins"]}`, event: "idp_refresh_id_token_unverified"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			f := newRefreshFixture(t)
-			f.idp.respond.Store(idpAnswer("at-2", "rt-3", tc.idToken, 3600))
-			rt, _ := sealForwardingRefresh(t, f.tm, f.clientUUID, "rt-2", time.Now())
-			core, logs := observer.New(zap.WarnLevel)
+// An absent id_token keeps the previous identity and logs a warning.
+func TestTokenRefresh_Forwarding_NoIDTokenKeepsPrevious(t *testing.T) {
+	f := newRefreshFixture(t)
+	f.idp.respond.Store(idpAnswer("at-2", "rt-3", "", 3600))
+	rt, _ := sealForwardingRefresh(t, f.tm, f.clientUUID, "rt-2", time.Now())
+	core, logs := observer.New(zap.WarnLevel)
 
-			rr := postRefreshGrant(t, f.handler(zap.New(core), nil, "staff"), f.encClientID, rt)
-			if rr.Code != http.StatusOK {
-				t.Fatalf("status = %d: %s", rr.Code, rr.Body.String())
-			}
-			at, _, _ := decodeTokenResponse(t, rr)
-			claims, _ := f.tm.Validate(at)
-			if claims.Email != "user@example.com" || !slices.Equal(claims.Groups, []string{"staff"}) {
-				t.Errorf("identity = %q %q, want the previous values unchanged", claims.Email, claims.Groups)
-			}
-			if logs.FilterMessage(tc.event).Len() != 1 {
-				t.Errorf("no %q warning; got %v", tc.event, logs.All())
-			}
-		})
+	rr := postRefreshGrant(t, f.handler(zap.New(core), nil, "staff"), f.encClientID, rt)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rr.Code, rr.Body.String())
+	}
+	at, _, _ := decodeTokenResponse(t, rr)
+	claims, _ := f.tm.Validate(at)
+	if claims.Email != "user@example.com" || !slices.Equal(claims.Groups, []string{"staff"}) {
+		t.Errorf("identity = %q %q, want the previous values unchanged", claims.Email, claims.Groups)
+	}
+	if logs.FilterMessage("idp_refresh_id_token_missing").Len() != 1 {
+		t.Errorf("no idp_refresh_id_token_missing warning; got %v", logs.All())
+	}
+}
+
+// A present id_token that fails verification is refused: keeping the
+// previous groups would let a removed user outlast an IdP key problem.
+func TestTokenRefresh_Forwarding_UnverifiableIDTokenRefused(t *testing.T) {
+	f := newRefreshFixture(t)
+	f.idp.respond.Store(idpAnswer("at-2", "rt-3", `{"sub":"user-sub","groups":["staff"]}`, 3600))
+	rt, _ := sealForwardingRefresh(t, f.tm, f.clientUUID, "rt-2", time.Now())
+	core, logs := observer.New(zap.WarnLevel)
+	denied := testutil.ToFloat64(metrics.AccessDenied.WithLabelValues("id_token_verification_failed"))
+
+	rr := postRefreshGrant(t, f.handler(zap.New(core), nil, "staff"), f.encClientID, rt)
+	if body := oauthErrorOf(t, rr); rr.Code != http.StatusBadRequest || body.Error != "invalid_grant" || body.ErrorCode != codeIDTokenVerificationFailed {
+		t.Fatalf("got %d %+v, want 400 invalid_grant / %s", rr.Code, body, codeIDTokenVerificationFailed)
+	}
+	if logs.FilterMessage("idp_refresh_id_token_unverified").Len() != 1 {
+		t.Errorf("no idp_refresh_id_token_unverified warning; got %v", logs.All())
+	}
+	if got := testutil.ToFloat64(metrics.AccessDenied.WithLabelValues("id_token_verification_failed")) - denied; got != 1 {
+		t.Errorf("access_denied{id_token_verification_failed} delta = %v, want 1", got)
+	}
+}
+
+// A verified id_token without an email keeps the previous one, on both
+// the access token and the rotated refresh token.
+func TestTokenRefresh_Forwarding_MissingEmailKeepsPrevious(t *testing.T) {
+	f := newRefreshFixture(t)
+	f.idp.respond.Store(idpAnswer("at-2", "rt-3", fakeIDToken(map[string]any{"sub": "user-sub", "groups": []string{"staff"}}), 3600))
+	rt, _ := sealForwardingRefresh(t, f.tm, f.clientUUID, "rt-2", time.Now())
+
+	rr := postRefreshGrant(t, f.handler(zap.NewNop(), nil, "staff"), f.encClientID, rt)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rr.Code, rr.Body.String())
+	}
+	at, newRT, _ := decodeTokenResponse(t, rr)
+	claims, _ := f.tm.Validate(at)
+	var sr sealedRefresh
+	_ = f.tm.OpenJSON(newRT, &sr, token.PurposeRefresh)
+	if claims.Email != "user@example.com" || sr.Email != "user@example.com" {
+		t.Errorf("email = %q / %q, want the previous one kept", claims.Email, sr.Email)
+	}
+}
+
+// An IdP token too short-lived to mint from: the refresh token is spent
+// (the IdP already rotated), so the answer is 400, never a 5xx.
+func TestTokenRefresh_Forwarding_IdPTokenTooShortLived(t *testing.T) {
+	f := newRefreshFixture(t)
+	f.idp.respond.Store(idpAnswer("at-2", "rt-3", "", 90))
+	rt, _ := sealForwardingRefresh(t, f.tm, f.clientUUID, "rt-2", time.Now())
+
+	rr := postRefreshGrant(t, f.handler(zap.NewNop(), nil), f.encClientID, rt)
+	if body := oauthErrorOf(t, rr); rr.Code != http.StatusBadRequest || body.Error != "invalid_grant" || body.ErrorCode != codeTokenIssueFailed {
+		t.Fatalf("got %d %+v, want 400 invalid_grant / %s", rr.Code, body, codeTokenIssueFailed)
 	}
 }
 
@@ -485,7 +527,7 @@ func TestTokenRefresh_Forwarding_OversizedRefreshTokenRefused(t *testing.T) {
 func TestTokenRefresh_Forwarding_TimeoutThenRetry(t *testing.T) {
 	f := newRefreshFixture(t)
 	block := make(chan struct{})
-	f.idp.respond.Store(func(http.ResponseWriter) { <-block })
+	f.idp.respond.Store(func(http.ResponseWriter) { waitOrGiveUp(block) })
 	refresher := f.idp.refresher()
 	refresher.timeout = 200 * time.Millisecond
 	h := Token(f.tm, zap.NewNop(), testBaseURL, time.Time{}, f.store, TokenConfig{
@@ -500,39 +542,6 @@ func TestTokenRefresh_Forwarding_TimeoutThenRetry(t *testing.T) {
 	f.idp.respond.Store(idpAnswer("at-2", "rt-3", "", 3600))
 	if rr := postRefreshGrant(t, h, f.encClientID, rt); rr.Code != http.StatusOK {
 		t.Fatalf("retry after timeout: %d %s, want 200", rr.Code, rr.Body.String())
-	}
-}
-
-// noReleaseStore is a custom replay.Store without Release: the claim
-// cannot be given back, so no retry may be invited.
-type noReleaseStore struct{ s *replay.MemoryStore }
-
-func (n noReleaseStore) ClaimOnce(ctx context.Context, key string, ttl time.Duration) error {
-	return n.s.ClaimOnce(ctx, key, ttl)
-}
-func (n noReleaseStore) Mark(ctx context.Context, key string, ttl time.Duration) error {
-	return n.s.Mark(ctx, key, ttl)
-}
-func (n noReleaseStore) Exists(ctx context.Context, key string) (bool, error) {
-	return n.s.Exists(ctx, key)
-}
-func (n noReleaseStore) ClaimOrCheckFamily(ctx context.Context, familyKey, claimKey string, claimTTL, familyTTL, grace time.Duration) (bool, bool, bool, error) {
-	return n.s.ClaimOrCheckFamily(ctx, familyKey, claimKey, claimTTL, familyTTL, grace)
-}
-func (n noReleaseStore) Close() error { return nil }
-
-func TestTokenRefresh_Forwarding_StoreWithoutReleaseNotRetryable(t *testing.T) {
-	f := newRefreshFixture(t)
-	f.idp.fail(http.StatusServiceUnavailable, "temporarily_unavailable")
-	rt, _ := sealForwardingRefresh(t, f.tm, f.clientUUID, "rt-2", time.Now())
-	h := forwardingTokenHandler(f.tm, zap.NewNop(), noReleaseStore{f.store}, f.idp, nil)
-
-	rr := postRefreshGrant(t, h, f.encClientID, rt)
-	if body := oauthErrorOf(t, rr); rr.Code != http.StatusBadRequest || body.Error != "invalid_grant" || body.ErrorCode != codeIdPRefreshUnavailable {
-		t.Errorf("got %d %+v, want 400 invalid_grant / %s", rr.Code, body, codeIdPRefreshUnavailable)
-	}
-	if rr.Header().Get("Retry-After") != "" {
-		t.Error("Retry-After although the claim could not be given back")
 	}
 }
 

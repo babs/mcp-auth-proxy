@@ -740,6 +740,15 @@ func TestKeycloakE2E_ForwardsIdPAccessToken(t *testing.T) {
 	redirectURI := envOrDefaultForTest("KEYCLOAK_E2E_REDIRECT_URI", "http://127.0.0.1:8765/callback")
 
 	client := newE2EClient(t)
+	// The forwarding proxy only runs under the compose "forwarding"
+	// profile. CI sets the variable, so its absence fails there.
+	if os.Getenv("KEYCLOAK_E2E_FORWARDING_PROXY_BASE_URL") == "" {
+		resp, err := client.Get(proxyBaseURL + "/healthz")
+		if err != nil {
+			t.Skipf("forwarding proxy not reachable at %s (start the stack with --profile forwarding): %v", proxyBaseURL, err)
+		}
+		_ = resp.Body.Close()
+	}
 	requireHealthy(t, client, proxyBaseURL)
 	registeredClientID := registerE2EClient(t, client, proxyBaseURL, redirectURI)
 	codeVerifier := "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"

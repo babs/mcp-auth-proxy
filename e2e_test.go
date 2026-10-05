@@ -19,11 +19,9 @@ import (
 	"github.com/go-jose/go-jose/v4"
 	josejwt "github.com/go-jose/go-jose/v4/jwt"
 	"go.uber.org/zap"
-	"golang.org/x/oauth2"
 
 	"github.com/babs/mcp-auth-proxy/config"
 	"github.com/babs/mcp-auth-proxy/handlers"
-	"github.com/babs/mcp-auth-proxy/middleware"
 	"github.com/babs/mcp-auth-proxy/proxy"
 	"github.com/babs/mcp-auth-proxy/replay"
 	"github.com/babs/mcp-auth-proxy/token"
@@ -204,13 +202,18 @@ func buildTestProxy(t *testing.T, oidcProvider *mockOIDCProvider, mcpServer *moc
 		t.Fatalf("oidc.NewProvider: %v", err)
 	}
 
-	oauth2Cfg := &oauth2.Config{
-		ClientID:     oidcProvider.ClientID,
-		ClientSecret: "test-oidc-secret",
-		Endpoint:     provider.Endpoint(),
-		RedirectURL:  proxyBaseURL + "/callback",
-		Scopes:       append([]string{"openid", "email", "profile"}, opt.extraScopes...),
+	// Built through main's own constructors, so the harness cannot
+	// drift from the production wiring.
+	cfg := &config.Config{
+		OIDCClientID:            oidcProvider.ClientID,
+		OIDCClientSecret:        "test-oidc-secret",
+		ProxyBaseURL:            proxyBaseURL,
+		UpstreamMCPMountPath:    "/mcp",
+		GroupsClaim:             "groups",
+		OIDCExtraScopes:         opt.extraScopes,
+		UpstreamForwardIdPToken: opt.forwardIdPToken,
 	}
+	oauth2Cfg := newOAuth2Config(cfg, provider.Endpoint())
 
 	verifier := provider.Verifier(&oidc.Config{ClientID: oidcProvider.ClientID})
 
@@ -220,24 +223,19 @@ func buildTestProxy(t *testing.T, oidcProvider *mockOIDCProvider, mcpServer *moc
 	}
 
 	var replayStore replay.Store
-	var idpRefresher *handlers.IdPRefresher
+	idpRefresher := enableForwarding(cfg, tm, oauth2Cfg)
 	if opt.forwardIdPToken {
-		for _, purpose := range []string{token.PurposeCode, token.PurposeAccess, token.PurposeRefresh} {
-			tm.SetMaxSealedLen(purpose, token.ForwardingMaxSealedLen)
-		}
-		idpRefresher = handlers.NewIdPRefresher(oauth2Cfg, 5*time.Second)
 		mem := replay.NewMemoryStore()
 		t.Cleanup(func() { _ = mem.Close() })
 		replayStore = mem
 	}
 
-	proxyHandler, err := proxy.Handler(mcpServer.Server.URL, zap.NewNop(), proxy.Config{ForwardIdPToken: opt.forwardIdPToken})
+	proxyHandler, err := proxy.Handler(mcpServer.Server.URL, zap.NewNop(), newProxyConfig(cfg))
 	if err != nil {
 		t.Fatalf("proxy.Handler: %v", err)
 	}
 
-	authMW := middleware.NewAuth(tm, zap.NewNop(), proxyBaseURL, "/mcp", time.Time{})
-	authMW.SetForwardIdPToken(opt.forwardIdPToken)
+	authMW := newAuthMiddleware(cfg, tm, zap.NewNop())
 
 	r := chi.NewRouter()
 	// The production middleware chain, not a bare router: the error
@@ -258,17 +256,9 @@ func buildTestProxy(t *testing.T, oidcProvider *mockOIDCProvider, mcpServer *moc
 			// TestE2E_ConsentFlowThroughProductionRouter runs it true.
 			RenderConsentPage: renderConsent,
 		}),
-		Consent: handlers.Consent(tm, zap.NewNop(), proxyBaseURL, oauth2Cfg, handlers.ConsentConfig{}),
-		Callback: handlers.Callback(tm, zap.NewNop(), proxyBaseURL, oauth2Cfg, verifier, handlers.CallbackConfig{
-			GroupsClaim:     "groups",
-			ForwardIdPToken: opt.forwardIdPToken,
-		}),
-		Token: handlers.Token(tm, zap.NewNop(), proxyBaseURL, time.Time{}, replayStore, handlers.TokenConfig{
-			ForwardIdPToken: opt.forwardIdPToken,
-			IdPRefresher:    idpRefresher,
-			VerifyIDToken:   verifier.Verify,
-			GroupsClaim:     "groups",
-		}),
+		Consent:       handlers.Consent(tm, zap.NewNop(), proxyBaseURL, oauth2Cfg, handlers.ConsentConfig{}),
+		Callback:      handlers.Callback(tm, zap.NewNop(), proxyBaseURL, oauth2Cfg, verifier, newCallbackConfig(cfg, replayStore, nil)),
+		Token:         handlers.Token(tm, zap.NewNop(), proxyBaseURL, time.Time{}, replayStore, newTokenConfig(cfg, idpRefresher, nil, verifier.Verify)),
 		RegisterLimit: passthrough, AuthorizeLimit: passthrough, ConsentLimit: passthrough,
 		CallbackLimit: passthrough, TokenLimit: passthrough,
 	})
