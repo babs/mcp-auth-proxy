@@ -293,3 +293,36 @@ func TestRedisStore_ClaimOrCheckFamily_PastGraceRevokes(t *testing.T) {
 		t.Error("post-grace reuse must atomically write the family-revoked marker")
 	}
 }
+
+func TestRedisStore_Release_ReopensClaim(t *testing.T) {
+	s, mr := newTestRedis(t, "proxy-a:")
+	ctx := context.Background()
+
+	if _, _, _, err := s.ClaimOrCheckFamily(ctx, "fam:1", "refresh:A", time.Minute, time.Hour, 0); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if err := s.Release(ctx, "refresh:A"); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if mr.Exists("proxy-a:refresh:A") {
+		t.Errorf("prefixed claim key still present after release, keys=%v", mr.Keys())
+	}
+	revoked, racing, claimed, err := s.ClaimOrCheckFamily(ctx, "fam:1", "refresh:A", time.Minute, time.Hour, 0)
+	if err != nil || revoked || racing || claimed {
+		t.Fatalf("re-claim after release = (revoked=%v racing=%v claimed=%v err=%v), want a fresh claim", revoked, racing, claimed, err)
+	}
+	if mr.Exists("proxy-a:fam:1") {
+		t.Error("release must not revoke the family")
+	}
+	if err := s.Release(ctx, "never-claimed"); err != nil {
+		t.Errorf("releasing an absent key: %v, want nil", err)
+	}
+}
+
+func TestRedisStore_Release_BackendError(t *testing.T) {
+	s, mr := newTestRedis(t, "")
+	mr.Close()
+	if err := s.Release(context.Background(), "refresh:A"); err == nil {
+		t.Fatal("release against a dead Redis must return an error")
+	}
+}

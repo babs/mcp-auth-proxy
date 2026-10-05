@@ -78,6 +78,21 @@ type Store interface {
 	Close() error
 }
 
+// Releaser is implemented by stores that can give a claim back. Kept
+// out of Store so existing Store implementations keep compiling; both
+// built-in stores implement it.
+//
+// Release deletes a claim taken by ClaimOnce or ClaimOrCheckFamily so
+// the key can be claimed again. Callers use it only when the work the
+// claim guarded failed transiently BEFORE anything was issued (an IdP
+// outage in upstream IdP token forwarding mode): the client's retry with
+// the same code or refresh token must then not be read as a replay.
+// Never call it on a claim whose tokens were handed out. Releasing an
+// absent key is not an error.
+type Releaser interface {
+	Release(ctx context.Context, key string) error
+}
+
 // NamespacedKey prefixes a key so different consumers of the same Store
 // don't collide. Callers should use a stable prefix per use-case.
 func NamespacedKey(prefix, id string) string {

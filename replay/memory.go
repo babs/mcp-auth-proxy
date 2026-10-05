@@ -195,6 +195,16 @@ func (s *MemoryStore) ClaimOrCheckFamily(_ context.Context, familyKey, claimKey 
 	return false, false, false, nil
 }
 
+var _ Releaser = (*MemoryStore)(nil)
+
+// Release deletes a claim key; a missing key is not an error.
+func (s *MemoryStore) Release(_ context.Context, key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.entries, key)
+	return nil
+}
+
 func (s *MemoryStore) Close() error {
 	s.stopOnce.Do(func() { close(s.stop) })
 	return nil
