@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -1914,6 +1915,145 @@ func TestLoad_UpstreamAuthorizationHeader(t *testing.T) {
 			t.Errorf("want %q, got %q", "Bearer upstream-xyz", cfg.UpstreamAuthorization)
 		}
 	})
+}
+
+// TestLoad_UpstreamForwardIdPToken covers the forwarding toggle: off by
+// default, only an explicit "true" turns it on, and it cannot coexist
+// with the static upstream Authorization header.
+func TestLoad_UpstreamForwardIdPToken(t *testing.T) {
+	t.Run("default_off", func(t *testing.T) {
+		setAllRequired(t)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.UpstreamForwardIdPToken {
+			t.Error("UpstreamForwardIdPToken = true by default, want false")
+		}
+	})
+	t.Run("explicit_true", func(t *testing.T) {
+		setAllRequired(t)
+		t.Setenv("UPSTREAM_FORWARD_IDP_TOKEN", "TRUE")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !cfg.UpstreamForwardIdPToken {
+			t.Error("UpstreamForwardIdPToken = false, want true")
+		}
+	})
+	t.Run("non_true_value_stays_off", func(t *testing.T) {
+		setAllRequired(t)
+		t.Setenv("UPSTREAM_FORWARD_IDP_TOKEN", "yes")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.UpstreamForwardIdPToken {
+			t.Error("UpstreamForwardIdPToken = true for \"yes\", want false (only \"true\" opts in)")
+		}
+	})
+	t.Run("conflicts_with_upstream_authorization_header", func(t *testing.T) {
+		setAllRequired(t)
+		t.Setenv("UPSTREAM_FORWARD_IDP_TOKEN", "true")
+		t.Setenv("UPSTREAM_AUTHORIZATION_HEADER", "Bearer upstream-xyz")
+		_, err := Load()
+		if err == nil {
+			t.Fatal("Load accepted UPSTREAM_FORWARD_IDP_TOKEN together with UPSTREAM_AUTHORIZATION_HEADER")
+		}
+		for _, name := range []string{"UPSTREAM_FORWARD_IDP_TOKEN", "UPSTREAM_AUTHORIZATION_HEADER"} {
+			if !strings.Contains(err.Error(), name) {
+				t.Errorf("error %q does not name %s", err, name)
+			}
+		}
+	})
+	t.Run("static_header_alone_still_allowed", func(t *testing.T) {
+		setAllRequired(t)
+		t.Setenv("UPSTREAM_FORWARD_IDP_TOKEN", "false")
+		t.Setenv("UPSTREAM_AUTHORIZATION_HEADER", "Bearer upstream-xyz")
+		if _, err := Load(); err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+	})
+}
+
+func TestLoad_OIDCExtraScopes(t *testing.T) {
+	cases := []struct {
+		name   string
+		raw    string
+		want   []string
+		errSub string
+	}{
+		{name: "unset", raw: "", want: nil},
+		{name: "single", raw: "api://upstream-app/access_as_user", want: []string{"api://upstream-app/access_as_user"}},
+		{name: "whitespace_separated", raw: "  api://upstream-app/access_as_user\toffline_access\n", want: []string{"api://upstream-app/access_as_user", "offline_access"}},
+		{name: "base_scopes_dropped", raw: "openid offline_access email profile", want: []string{"offline_access"}},
+		{name: "duplicates_dropped", raw: "offline_access offline_access groups", want: []string{"offline_access", "groups"}},
+		{name: "quote_rejected", raw: `offline_access "bad"`, errSub: "OIDC_EXTRA_SCOPES"},
+		{name: "backslash_rejected", raw: `bad\scope`, errSub: "OIDC_EXTRA_SCOPES"},
+		{name: "non_ascii_rejected", raw: "scöpe", errSub: "OIDC_EXTRA_SCOPES"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setAllRequired(t)
+			t.Setenv("OIDC_EXTRA_SCOPES", tc.raw)
+			cfg, err := Load()
+			if tc.errSub != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.errSub) {
+					t.Fatalf("Load error = %v, want one containing %q", err, tc.errSub)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if !slices.Equal(cfg.OIDCExtraScopes, tc.want) {
+				t.Errorf("OIDCExtraScopes = %q, want %q", cfg.OIDCExtraScopes, tc.want)
+			}
+		})
+	}
+}
+
+func TestOIDCScopes_BasePlusExtras(t *testing.T) {
+	c := &Config{OIDCExtraScopes: []string{"api://upstream-app/access_as_user", "offline_access"}}
+	want := []string{"openid", "email", "profile", "api://upstream-app/access_as_user", "offline_access"}
+	got := c.OIDCScopes()
+	if !slices.Equal(got, want) {
+		t.Fatalf("OIDCScopes() = %q, want %q", got, want)
+	}
+	// Appending to one result must not leak into the next or into the
+	// shared base list.
+	_ = append(got[:3], "mutated")
+	if again := c.OIDCScopes(); !slices.Equal(again, want) {
+		t.Errorf("OIDCScopes() after caller mutation = %q, want %q", again, want)
+	}
+	if !slices.Equal(BaseOIDCScopes, []string{"openid", "email", "profile"}) {
+		t.Errorf("BaseOIDCScopes mutated: %q", BaseOIDCScopes)
+	}
+	if got := (&Config{}).OIDCScopes(); !slices.Equal(got, BaseOIDCScopes) {
+		t.Errorf("OIDCScopes() without extras = %q, want the base scopes", got)
+	}
+}
+
+func TestForwardingScopeWarning(t *testing.T) {
+	cases := []struct {
+		name     string
+		cfg      Config
+		wantWarn bool
+	}{
+		{name: "forwarding_off", cfg: Config{}, wantWarn: false},
+		{name: "forwarding_off_with_scopes", cfg: Config{OIDCExtraScopes: []string{"offline_access"}}, wantWarn: false},
+		{name: "forwarding_on_no_scopes", cfg: Config{UpstreamForwardIdPToken: true}, wantWarn: true},
+		{name: "forwarding_on_with_scopes", cfg: Config{UpstreamForwardIdPToken: true, OIDCExtraScopes: []string{"offline_access"}}, wantWarn: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.cfg.ForwardingScopeWarning()
+			if (got != "") != tc.wantWarn {
+				t.Errorf("ForwardingScopeWarning() = %q, want warning=%v", got, tc.wantWarn)
+			}
+		})
+	}
 }
 
 func TestLoad_OIDCIssuerURL_AllowsExplicitDevCleartext(t *testing.T) {

@@ -91,6 +91,10 @@ func main() {
 		zap.Bool("allowed_groups_set", len(cfg.AllowedGroups) > 0),
 		zap.Bool("revoke_before_set", !cfg.RevokeBefore.IsZero()),
 		zap.Bool("upstream_authorization_set", cfg.UpstreamAuthorization != ""),
+		zap.Bool("upstream_forward_idp_token", cfg.UpstreamForwardIdPToken),
+		// Scope names are not secrets; logging them lets oncall confirm
+		// which upstream audience the IdP is asked for.
+		zap.Strings("oidc_extra_scopes", cfg.OIDCExtraScopes),
 		zap.String("access_log_skip_re", accessLogSkipPattern(cfg.AccessLogSkipRE)),
 		// Surface the per-tool metrics toggle so an operator inspecting
 		// startup logs can confirm `MCP_TOOL_METRICS=true` actually took
@@ -106,6 +110,9 @@ func main() {
 	// post-mortem rotation (L1).
 	if w := cfg.SecretWeaknessWarning(); w != "" {
 		logger.Warn("token_signing_secret_weak", zap.String("reason", w))
+	}
+	if w := cfg.ForwardingScopeWarning(); w != "" {
+		logger.Warn("upstream_forward_idp_token_scopes_missing", zap.String("reason", w))
 	}
 
 	// OIDC discovery — works with any compliant IdP (Keycloak, Entra, Auth0, Okta...).
@@ -125,7 +132,7 @@ func main() {
 		ClientSecret: cfg.OIDCClientSecret,
 		Endpoint:     oidcProvider.Endpoint(),
 		RedirectURL:  cfg.ProxyBaseURL + "/callback",
-		Scopes:       []string{"openid", "email", "profile"},
+		Scopes:       cfg.OIDCScopes(),
 	}
 
 	idTokenVerifier := oidcProvider.Verifier(&oidc.Config{ClientID: cfg.OIDCClientID})

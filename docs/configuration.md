@@ -37,7 +37,9 @@ secure production posture (`PROD_MODE=true`); flags listed here as
 | `GROUPS_CLAIM` | `groups` | Flat claim name in the IdP id_token holding user groups. |
 | `ALLOWED_GROUPS` | (empty) | Comma-separated allowlist; empty = allow all authenticated users. |
 | `MCP_RESOURCE_NAME` | (empty) | Human-readable name advertised under `resource_name` in the RFC 9728 PRM (e.g. `"ACME MCP"`). Used by MCP clients for display / consent UI. Optional; field is omitted when unset. |
-| `UPSTREAM_AUTHORIZATION_HEADER` | (empty) | When set, sent verbatim as the `Authorization` header on every request to the upstream MCP backend. Full header value incl. scheme, e.g. `Bearer xyz`. Treat as a secret. |
+| `UPSTREAM_AUTHORIZATION_HEADER` | (empty) | When set, sent verbatim as the `Authorization` header on every request to the upstream MCP backend. Full header value incl. scheme, e.g. `Bearer xyz`. Treat as a secret. Mutually exclusive with `UPSTREAM_FORWARD_IDP_TOKEN`. |
+| `UPSTREAM_FORWARD_IDP_TOKEN` | `false` | `true` forwards the signed-in user's IdP access token to the upstream as `Authorization: Bearer`, for upstreams that call other APIs as the user (e.g. on-behalf-of). The proxy keeps the IdP refresh token sealed inside its own tokens (still stateless) and renews the IdP access token on every refresh grant, so refresh then needs the IdP to be reachable. Startup fails when set together with `UPSTREAM_AUTHORIZATION_HEADER`. The upstream must validate the forwarded token itself (issuer, audience, signature, expiry). See specs.md "Upstream IdP token forwarding". |
+| `OIDC_EXTRA_SCOPES` | (empty) | Space-separated scopes appended to `openid email profile` on the IdP authorize request and, in forwarding mode, on every IdP refresh request — e.g. `api://<upstream-app>/access_as_user offline_access` on Entra ID. Operator-only: MCP clients still cannot request scopes and `scopes_supported` stays `[]`. Duplicates of the base scopes are ignored; a value that is not an RFC 6749 scope-token fails startup. With forwarding on and this empty, startup logs `upstream_forward_idp_token_scopes_missing`. |
 
 ## Token signing and rotation
 

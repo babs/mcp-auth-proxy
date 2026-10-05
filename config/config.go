@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -192,6 +193,20 @@ type Config struct {
 	// env: UPSTREAM_AUTHORIZATION_HEADER. Treat as a secret in
 	// deployment (mount from a Secret, not a ConfigMap).
 	UpstreamAuthorization string
+	// UpstreamForwardIdPToken switches on upstream IdP token forwarding:
+	// the proxy keeps the IdP refresh token sealed inside its own tokens
+	// and sends the user's IdP access token upstream as
+	// `Authorization: Bearer` on every MCP request, renewing it at the
+	// IdP on every refresh grant. Mutually exclusive with
+	// UpstreamAuthorization — both own the upstream Authorization header.
+	// env: UPSTREAM_FORWARD_IDP_TOKEN (default false).
+	UpstreamForwardIdPToken bool
+	// OIDCExtraScopes are appended to BaseOIDCScopes on the IdP
+	// authorize request and, in forwarding mode, on every IdP refresh
+	// request. Operator-only: clients still cannot request scopes, and
+	// scopes_supported stays empty. Duplicates of the base scopes are
+	// dropped. env: OIDC_EXTRA_SCOPES (space-separated).
+	OIDCExtraScopes []string
 	// CSPFormActionExtra is DEPRECATED and ignored. The consent POST
 	// is now answered with a same-origin navigation interstitial
 	// (handlers.renderNavInterstitial), which ends Chromium's
@@ -540,6 +555,20 @@ func Load() (*Config, error) {
 
 	c.UpstreamAuthorization = os.Getenv("UPSTREAM_AUTHORIZATION_HEADER")
 
+	c.UpstreamForwardIdPToken = strings.ToLower(os.Getenv("UPSTREAM_FORWARD_IDP_TOKEN")) == "true"
+	// Both settings write the upstream Authorization header; letting one
+	// silently win would send the upstream a credential the operator did
+	// not expect, so the combination is refused outright.
+	if c.UpstreamForwardIdPToken && c.UpstreamAuthorization != "" {
+		return nil, fmt.Errorf("UPSTREAM_FORWARD_IDP_TOKEN=true and UPSTREAM_AUTHORIZATION_HEADER are mutually exclusive: both set the upstream Authorization header")
+	}
+
+	extraScopes, err := parseExtraScopes(os.Getenv("OIDC_EXTRA_SCOPES"))
+	if err != nil {
+		return nil, err
+	}
+	c.OIDCExtraScopes = extraScopes
+
 	if raw := os.Getenv("CSP_FORM_ACTION_EXTRA"); raw != "" {
 		for _, o := range strings.Split(raw, ",") {
 			o = strings.TrimSpace(o)
@@ -630,6 +659,56 @@ func envOrDefault(key, def string) string {
 // sane. Caller logs it at startup (main.go) so Load() stays logger-free.
 func (c *Config) SecretWeaknessWarning() string {
 	return c.secretWeakWarning
+}
+
+// BaseOIDCScopes are always requested from the IdP: the proxy needs an
+// id_token carrying the subject, email and profile claims.
+var BaseOIDCScopes = []string{"openid", "email", "profile"}
+
+// OIDCScopes returns the scope list sent to the IdP: BaseOIDCScopes
+// followed by OIDC_EXTRA_SCOPES. A fresh slice on every call, so a
+// caller appending to it cannot alias another caller's list.
+func (c *Config) OIDCScopes() []string {
+	return append(slices.Clone(BaseOIDCScopes), c.OIDCExtraScopes...)
+}
+
+// ForwardingScopeWarning returns a non-empty message when forwarding is
+// on but no extra scope names the upstream API. The IdP then issues an
+// access token for its own default audience (a Graph token on Entra),
+// which a correctly configured upstream rejects on the audience check:
+// every MCP call fails with 401 although sign-in succeeded. A warning,
+// not an error — an IdP that stamps the upstream audience through a
+// protocol mapper needs no extra scope.
+func (c *Config) ForwardingScopeWarning() string {
+	if !c.UpstreamForwardIdPToken || len(c.OIDCExtraScopes) > 0 {
+		return ""
+	}
+	return "UPSTREAM_FORWARD_IDP_TOKEN=true with OIDC_EXTRA_SCOPES empty: the IdP access token is issued for the IdP's default audience; add the upstream API scope (and offline_access where the IdP requires it for a refresh token)"
+}
+
+// parseExtraScopes splits OIDC_EXTRA_SCOPES on whitespace, drops
+// duplicates and base scopes, and rejects anything that is not an
+// RFC 6749 §3.3 scope-token — a quote or backslash would otherwise
+// reach the IdP authorize URL and fail there with an opaque error.
+func parseExtraScopes(raw string) ([]string, error) {
+	var out []string
+	seen := map[string]bool{}
+	for _, s := range BaseOIDCScopes {
+		seen[s] = true
+	}
+	for _, s := range strings.Fields(raw) {
+		for i := range len(s) {
+			if c := s[i]; c < 0x21 || c == '"' || c == '\\' || c > 0x7E {
+				return nil, fmt.Errorf("OIDC_EXTRA_SCOPES contains invalid scope %q (RFC 6749 §3.3: printable ASCII except space, '\"' and '\\')", s)
+			}
+		}
+		if seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out, nil
 }
 
 // weakSecretReason returns a non-empty human-readable reason when b
