@@ -48,6 +48,31 @@ const sealRotationThreshold uint64 = 1 << 28
 // timeout on grown inputs.
 const maxSealedLen = 16 * 1024
 
+// ForwardingMaxSealedLen is the open() cap for codes, access tokens and
+// refresh tokens in upstream IdP token forwarding mode, where they also
+// carry IdP tokens (an Entra access token with a groups claim runs to
+// several KB). Pinned to the 64 KB header block (MaxHeaderBytes in
+// main.go): an access token longer than that cannot reach the proxy in
+// an Authorization header at all, so a higher cap would only widen the
+// decode work an attacker can force without admitting any legitimate
+// token.
+const ForwardingMaxSealedLen = 64 << 10
+
+// idpTokenExpirySkew is taken off the IdP access token's expiry when
+// deriving the proxy access token's lifetime, so the client refreshes
+// while the forwarded token still has a minute left in flight.
+const idpTokenExpirySkew = 60 * time.Second
+
+// ErrIdPTokenLifetime is returned by IssueWithIdPToken when the IdP
+// access token expires within idpTokenExpirySkew: a proxy token minted
+// from it would be dead on arrival.
+var ErrIdPTokenLifetime = errors.New("idp access token expires too soon")
+
+// ErrSealedTooLarge is returned by IssueWithIdPToken when the sealed
+// access token would exceed the access open() cap — the token would be
+// minted and then refused on every request.
+var ErrSealedTooLarge = errors.New("sealed token exceeds the open() cap")
+
 // Purpose constants bind every sealed payload to a specific role via AEAD
 // additional-data (AAD). A ciphertext minted with one purpose cannot be
 // opened as any other, which closes the sealed-type confusion family
@@ -94,6 +119,18 @@ type Claims struct {
 	ClientID  string    `json:"cid"`
 	IssuedAt  time.Time `json:"iat"`
 	ExpiresAt time.Time `json:"exp"`
+	// IdPAccessToken is the user's IdP access token, forwarded upstream
+	// as `Authorization: Bearer` in upstream IdP token forwarding mode.
+	// Empty outside that mode; omitempty keeps default-mode payloads
+	// byte-identical to tokens minted before the field existed.
+	IdPAccessToken string `json:"idp_at,omitempty"`
+}
+
+// IdPToken is the IdP access token sealed into a proxy access token in
+// forwarding mode. A zero ExpiresAt means the IdP did not state one.
+type IdPToken struct {
+	AccessToken string
+	ExpiresAt   time.Time
 }
 
 // DefaultGroupsMaxBytes bounds the groups claim carried inside an
@@ -127,6 +164,13 @@ func capGroups(groups []string, logger *zap.Logger, subject string, maxBytes int
 	if maxBytes <= 0 {
 		maxBytes = DefaultGroupsMaxBytes
 	}
+	return truncateGroups(groups, logger, subject, maxBytes)
+}
+
+// truncateGroups is capGroups without the zero-means-default rule:
+// maxBytes 0 keeps no group at all. The forwarding path needs that when
+// the IdP access token alone consumes the whole budget.
+func truncateGroups(groups []string, logger *zap.Logger, subject string, maxBytes int) []string {
 	total := 0
 	for i, g := range groups {
 		total += len(g) + 1
@@ -196,6 +240,10 @@ type Manager struct {
 	// package keeps zero dependency on the metrics package — the
 	// startup wiring in main.go provides the closure.
 	sealMetric func(purpose string)
+	// sealedCaps overrides maxSealedLen per purpose. Written only during
+	// startup (SetMaxSealedLen), read-only afterwards, so open() reads it
+	// without a lock.
+	sealedCaps map[string]int
 }
 
 // NewManager creates a token manager from a single signing secret
@@ -250,6 +298,29 @@ func buildAEAD(secret []byte) (cipher.AEAD, error) {
 // it still caps rather than minting an unbounded token.
 func (m *Manager) SetGroupsMaxBytes(n int) {
 	m.groupsMaxBytes = n
+}
+
+// SetMaxSealedLen sets the open() length cap for one purpose; n <= 0
+// restores the default maxSealedLen. Forwarding mode raises it for
+// codes, access and refresh tokens, which then carry IdP tokens. Call
+// during startup only: the map is read without a lock afterwards.
+func (m *Manager) SetMaxSealedLen(purpose string, n int) {
+	if n <= 0 {
+		delete(m.sealedCaps, purpose)
+		return
+	}
+	if m.sealedCaps == nil {
+		m.sealedCaps = map[string]int{}
+	}
+	m.sealedCaps[purpose] = n
+}
+
+// maxSealedLenFor returns the open() cap for purpose.
+func (m *Manager) maxSealedLenFor(purpose string) int {
+	if n, ok := m.sealedCaps[purpose]; ok {
+		return n
+	}
+	return maxSealedLen
 }
 
 // SetLogger attaches a zap logger for the one-shot seal-rotation warning.
@@ -329,8 +400,8 @@ func (m *Manager) open(sealed, purpose string) ([]byte, error) {
 	// caller cannot force seconds of work on a multi-megabyte string.
 	// HTTP handlers already cap header / body sizes in production, but
 	// every defensive layer that protects the AEAD path adds margin.
-	if len(sealed) > maxSealedLen {
-		return nil, fmt.Errorf("sealed data exceeds %d-byte cap", maxSealedLen)
+	if limit := m.maxSealedLenFor(purpose); len(sealed) > limit {
+		return nil, fmt.Errorf("sealed data exceeds %d-byte cap", limit)
 	}
 	ciphertext, err := base64.RawURLEncoding.DecodeString(sealed)
 	if err != nil {
@@ -387,7 +458,7 @@ func (m *Manager) OpenJSON(sealed string, v any, purpose string) error {
 func (m *Manager) Issue(audience, subject, email, clientID string, groups []string, ttl time.Duration, resource string) (string, *Claims, error) {
 	groups = capGroups(groups, m.logger, subject, m.groupsMaxBytes)
 	now := time.Now()
-	claims := &Claims{
+	return m.issue(&Claims{
 		TokenID:   uuid.New().String(),
 		Typ:       PurposeAccess,
 		Audience:  audience,
@@ -398,8 +469,63 @@ func (m *Manager) Issue(audience, subject, email, clientID string, groups []stri
 		ClientID:  clientID,
 		IssuedAt:  now,
 		ExpiresAt: now.Add(ttl),
-	}
+	})
+}
 
+// IssueWithIdPToken is Issue for upstream IdP token forwarding mode: it
+// seals idp.AccessToken into the claims so the auth middleware can hand
+// it to the reverse proxy.
+//
+// The token expires at min(now+ttl, idp.ExpiresAt-60s), so it never
+// outlives the IdP token it carries; the client's refresh then renews
+// both. The IdP token's length is taken off the groups budget, keeping
+// the sealed token inside the same header envelope that
+// GROUPS_CLAIM_MAX_BYTES was sized for. Returns ErrIdPTokenLifetime
+// when the IdP token is about to expire and ErrSealedTooLarge when the
+// result would not pass the access open() cap.
+func (m *Manager) IssueWithIdPToken(audience, subject, email, clientID string, groups []string, ttl time.Duration, resource string, idp IdPToken) (string, *Claims, error) {
+	if idp.AccessToken == "" {
+		return "", nil, errors.New("idp access token empty")
+	}
+	now := time.Now()
+	exp := now.Add(ttl)
+	if !idp.ExpiresAt.IsZero() {
+		if limit := idp.ExpiresAt.Add(-idpTokenExpirySkew); limit.Before(exp) {
+			exp = limit
+		}
+		if !exp.After(now) {
+			return "", nil, ErrIdPTokenLifetime
+		}
+	}
+	budget := m.groupsMaxBytes
+	if budget <= 0 {
+		budget = DefaultGroupsMaxBytes
+	}
+	groups = truncateGroups(groups, m.logger, subject, max(budget-len(idp.AccessToken), 0))
+	encoded, claims, err := m.issue(&Claims{
+		TokenID:        uuid.New().String(),
+		Typ:            PurposeAccess,
+		Audience:       audience,
+		Resource:       resource,
+		Subject:        subject,
+		Email:          email,
+		Groups:         groups,
+		ClientID:       clientID,
+		IssuedAt:       now,
+		ExpiresAt:      exp,
+		IdPAccessToken: idp.AccessToken,
+	})
+	if err != nil {
+		return "", nil, err
+	}
+	if len(encoded) > m.maxSealedLenFor(PurposeAccess) {
+		return "", nil, ErrSealedTooLarge
+	}
+	return encoded, claims, nil
+}
+
+// issue marshals and seals claims as an access token.
+func (m *Manager) issue(claims *Claims) (string, *Claims, error) {
 	plaintext, err := json.Marshal(claims)
 	if err != nil {
 		return "", nil, fmt.Errorf("marshal claims: %w", err)
