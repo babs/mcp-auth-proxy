@@ -8,6 +8,13 @@ refresh happens** — but refresh does NOT call the IdP, it only
 consults the sealed refresh token and the local replay store. So a
 brief IdP outage has a smaller blast radius than you might expect.
 
+**Exception: upstream IdP token forwarding.** With
+`UPSTREAM_FORWARD_IDP_TOKEN=true` every refresh grant (and every code
+redemption) DOES call the IdP, to renew the IdP access token the
+upstream receives. In that mode an IdP outage stops refreshes too —
+see [Forwarding mode](#forwarding-mode-upstream_forward_idp_token)
+below.
+
 Error codes quoted below (and by users off the error page) are
 catalogued in the [specs.md error-code
 table](../../specs.md#oauth2-error-handling).
@@ -82,6 +89,51 @@ Post-rotation symptom: token-exchange calls return
 `invalid_client`/`invalid_grant`. Look at the proxy log for
 `upstream_token_exchange_failed`. Fix: update the `Secret` and
 rollout-restart.
+
+### Forwarding mode (`UPSTREAM_FORWARD_IDP_TOKEN`)
+
+In this mode the proxy redeems the IdP refresh token sealed inside
+its own tokens at every `/token` call, so the IdP is on the refresh
+path as well as on sign-in.
+
+Signals:
+
+- `mcp_auth_idp_refresh_total{result="unavailable"}` climbs; log
+  `idp_refresh_unavailable` carries the IdP's status and error code
+  (never a token).
+- Clients get 503 `temporarily_unavailable` +
+  `error_code=idp_refresh_unavailable` + `Retry-After` at `/token`.
+  The code or refresh token they sent is **not** consumed (its
+  single-use claim is released), so their retry succeeds once the IdP
+  recovers. A `replay_claim_release_failed` log line means the release
+  itself failed (usually Redis at the same time): that client's retry
+  will then read as a reuse and revoke its family — expect a re-login,
+  not an attack.
+- Access tokens stop at `min(1h, IdP token expiry − 60 s)`, so a
+  forwarding deployment loses service after at most that long, not
+  after 7 days.
+
+`mcp_auth_idp_refresh_total{result="rejected"}` is different: the IdP
+refused the grant (`invalid_grant`, `interaction_required`, …) and the
+client must sign in again (`error_code=idp_refresh_rejected`). A spike
+right after a password-reset wave, an account disablement or a
+Conditional Access change is expected; a spike out of nowhere usually
+means the operator changed `OIDC_EXTRA_SCOPES` or the IdP client lost
+its consent. `invalid_client` / `unauthorized_client` from the IdP are
+counted as `unavailable`, not `rejected`: a new sign-in would not fix
+the proxy's own client registration — check `OIDC_CLIENT_SECRET`.
+
+A slow IdP has one more side effect: the IdP call runs while the
+client's single-use claim is held, so a client that resends the same
+code or refresh token after `REFRESH_RACE_GRACE_SEC` but before the
+first request returns is read as a replay (`authorization_code_replay`
+/ `refresh_token_reuse_detected`, family revoked, one extra sign-in).
+During an IdP slowdown, treat such alerts as noise unless they persist
+after the IdP recovers.
+
+Response: nothing to do on the proxy side for an outage. Do NOT switch
+forwarding off to "keep things working": the upstream would then
+receive no credential at all and refuse every call.
 
 ## What NOT to do
 

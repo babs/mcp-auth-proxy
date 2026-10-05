@@ -77,6 +77,12 @@ already wired up, see [Demo stack](#demo-stack).
 - Federates authentication to **any OIDC-compliant IdP** via
   auto-discovery (no vendor lock-in, zero IdP-specific code).
 - Reverse-proxies to your **unmodified** upstream MCP server.
+- **Optional upstream IdP token forwarding** (`UPSTREAM_FORWARD_IDP_TOKEN`,
+  off by default) for MCP servers that call other APIs *as the user*
+  (e.g. on-behalf-of): the user's IdP access token reaches the upstream
+  as `Authorization: Bearer`, renewed at the IdP on every refresh, while
+  the IdP tokens stay sealed inside the proxy's own tokens. See
+  [specs.md](./specs.md#upstream-idp-token-forwarding-opt-in).
 - **Stateless design** — every transient state (registrations, codes,
   tokens) is AEAD-sealed into opaque strings; scale horizontally by
   sharing one secret.

@@ -65,6 +65,7 @@ All transient OAuth state (client registrations, authorize sessions, authorizati
 | Authorization code | `code` parameter (encrypted blob, 60s TTL) | yes |
 | Access token | Opaque token (encrypted claims, 1h TTL) | yes |
 | Refresh token | Opaque token (encrypted claims + `iat`, 7d TTL) | yes |
+| IdP refresh / access token (forwarding mode only) | the authorization `code` (refresh token only), the refresh token (refresh token) and the access token (access token) — see [Upstream IdP token forwarding](#upstream-idp-token-forwarding-opt-in) | inherited from the carrier |
 
 #### Audience binding (cross-instance replay protection)
 
@@ -467,6 +468,7 @@ type Claims struct {
     ClientID  string
     IssuedAt  time.Time
     ExpiresAt time.Time
+    IdPAccessToken string // forwarding mode only (omitempty); see below
 }
 ```
 
@@ -498,7 +500,7 @@ All MCP routes (`/*` except OAuth endpoints):
 2. Decode and validate the opaque token (AES-GCM decryption, expiry check)
 3. Verify `claims.Audience == PROXY_BASE_URL` — rejects tokens minted by a sibling instance sharing the same secret but with a different baseURL
 4. If `REVOKE_BEFORE` is configured, reject if `iat` < cutoff (bulk revocation)
-5. Inject into context: `sub`, `email`, `groups`
+5. Inject into context: `sub`, `email`, `groups` — and, in forwarding mode, the IdP access token; a token without one is refused with `invalid_token` (minted before the mode was switched on)
 6. On failure, return `401` per RFC 6750 §3.1:
    - Missing or malformed `Authorization` header → `{ "error": "invalid_request", "error_description": "bearer credential is missing or malformed" }`
    - Token decrypt/expiry/audience/iat failures → `{ "error": "invalid_token", "error_description": "bearer token is invalid, expired, or not intended for this resource" }`
@@ -518,12 +520,90 @@ r.Header.Set("X-User-Sub", claims.Subject)
 r.Header.Set("X-User-Email", claims.Email)
 r.Header.Set("X-User-Groups", "group1,group2")  // comma-separated, omitted if empty
 r.Header.Del("Authorization")  // do not leak the internal token
+// Forwarding mode only: the user's IdP access token, re-applied on
+// every same-origin redirect hop. Otherwise UPSTREAM_AUTHORIZATION_HEADER
+// when set, otherwise nothing.
+r.Header.Set("Authorization", "Bearer "+idpAccessToken)
 
 // Support SSE (text/event-stream): no response buffering
 // Support Streamable HTTP (chunked): immediate flush
 ```
 
 Use `httputil.ReverseProxy` with `FlushInterval: -1` (immediate flush) to support SSE and streaming. The underlying `*http.Transport` sets `ResponseHeaderTimeout: 30s` so a wedged upstream fails fast during header negotiation — stream bodies themselves remain uncapped. The transport follows 307/308 redirects server-side (Python FastAPI/Starlette backends), same-host only, body replayed, max 10 hops. On exhaustion the proxy responds **502 Bad Gateway** with `{"error":"bad_gateway","error_description":"too many upstream redirects"}` rather than echoing the last 307/308 (which would leak a broken upstream `Location:` to the MCP client). Proxied request bodies are capped at 16 MiB via `http.MaxBytesReader` to bound the memory the redirect-follow buffer can hold.
+
+### Upstream IdP token forwarding (opt-in)
+
+Off by default. For upstream MCP servers that must call other APIs **as the user** — typically
+through an on-behalf-of exchange at the IdP — knowing who the user is from
+`X-User-*` is not enough; they need a token the IdP issued for them. With
+`UPSTREAM_FORWARD_IDP_TOKEN=true`:
+
+1. **`/authorize`** asks the IdP for `openid email profile` plus `OIDC_EXTRA_SCOPES` (e.g.
+   `api://<upstream-app>/access_as_user offline_access` on Entra ID). Clients still cannot request
+   scopes: `scopes_supported` stays `[]` and the client's `scope` is ignored.
+2. **`/callback`** verifies the id_token as usual and also keeps the IdP **refresh** token, sealed
+   into the authorization code. The IdP access token is not kept: the code travels in a redirect
+   URL and an access token with a groups claim can run to several KB. An IdP that returns no
+   refresh token fails the sign-in with `idp_refresh_token_missing`.
+3. **`/token` (code grant)**, after PKCE and the single-use claim, redeems the IdP refresh token
+   once at the IdP token endpoint with an explicit `scope`. The proxy access token carries the IdP
+   access token and expires at `min(1h, IdP expiry − 60 s)` (`expires_in` reports the real
+   remaining lifetime; an IdP token that would leave the proxy token under a minute — one living
+   under about two minutes — is refused); the proxy refresh
+   token carries the latest IdP refresh token. When the IdP sends no `expires_in`, a JWT access
+   token's own `exp` bounds the lifetime.
+4. **Each MCP request**: the auth middleware hands the IdP access token to the reverse proxy,
+   which — after stripping the client's own token as always — sends it as
+   `Authorization: Bearer`. `X-User-*` are injected as before.
+5. **`/token` (refresh grant)**, after the existing cutoff, family and reuse checks (so a revoked
+   or replayed refresh token never reaches the IdP), refreshes at the IdP and seals the new IdP
+   tokens into the new proxy tokens. A verified id_token returned on refresh re-applies the sign-in
+   policy: same `sub` (else `id_token_verification_failed`), `email_verified`, group-name
+   validation and `ALLOWED_GROUPS`, and updates email and groups. Without a verified id_token the
+   previous email and groups are kept, never widened, and a warning is logged.
+
+IdP failures at `/token` map to three outcomes. **Rejected** (`invalid_grant`,
+`interaction_required`, `login_required`, `consent_required`, `invalid_scope`): 400 `invalid_grant`
+/ `idp_refresh_rejected`, the client signs in again. **Unavailable** (transport error, timeout,
+5xx, 429, or the proxy's own client credentials refused) and **throttled** (`IDP_EXCHANGE_*`):
+503 `temporarily_unavailable` + `Retry-After`, and the single-use claim is released so the client
+retries with the **same** code or refresh token (a custom replay store without `Release`, or a
+failed release, answers `invalid_grant` instead, since the retry would read as a replay).
+**Failed** (a permanent 4xx, or a 2xx without a usable Bearer token, after which the IdP has
+probably rotated its refresh token): 400 `invalid_grant` / `idp_refresh_failed`, the token stays
+spent. Any failure to mint tokens after the IdP call also answers `invalid_grant`, never a 5xx: the
+client's token is spent, and a retry would only trip reuse detection. The IdP refresh is a hand-written
+RFC 6749 §6 call — x/oauth2 cannot add a `scope` to a refresh, and without one some IdPs (Entra ID)
+choose the new token's audience themselves. Client authentication follows the endpoint's
+`AuthStyle`; auto-detection tries Basic, falls back to form parameters on a non-grant 4xx, and
+remembers the style once the IdP accepts the credentials. Redirects are never followed.
+
+What does not change: the stateless design (the IdP tokens are optional fields inside the existing
+sealed payloads; Redis still holds replay markers only), AEAD purpose and audience binding, RFC
+8707 resource binding, PKCE, DCR, the consent page, refresh rotation with reuse detection and
+`REVOKE_BEFORE`. This is not the "token passthrough" anti-pattern of the MCP security best
+practices: the token the client presents is never forwarded; the upstream receives a different
+token, minted by the IdP for the upstream's own audience. The upstream must validate it itself
+(issuer, audience, signature, expiry).
+
+Trade-offs, also in [`docs/threat-model.md`](docs/threat-model.md) row 17: whoever holds
+`TOKEN_SIGNING_SECRET` can now open the IdP refresh tokens inside client-held tokens; refresh
+needs the IdP to be reachable ([`docs/runbooks/idp-outage.md`](docs/runbooks/idp-outage.md));
+codes, access and refresh tokens grow by the IdP token sizes, so their `open()` cap is raised to
+the 64 KB header block in this mode (only for those three purposes), the IdP access token's length
+comes off the groups budget, and a code, access or refresh token that would not pass its own cap is
+never minted. In
+return, revocation gets stronger: every refresh asks the IdP, so a password reset, a disabled
+account or a group removal bites within one access-token lifetime. A verified refresh id_token
+without the groups claim reads as "no groups", exactly as at sign-in (fail closed), and is logged
+as `idp_refresh_groups_claim_missing`.
+
+**Known limitation.** The IdP call (up to 10 s) runs while the client's single-use claim is held.
+A client that resends the same code or refresh token more than `REFRESH_RACE_GRACE_SEC` after the
+first request, while that request is still waiting on the IdP, is read as a replay: the family is
+revoked and `authorization_code_replay` / `refresh_token_reuse_detected` fires. It fails closed (no
+extra tokens; the user signs in once more) but raises a false alert. Marking claims "in flight" in
+the replay store would remove it; left out of this change to keep the replay semantics untouched.
 
 ### Upstream path handling
 
