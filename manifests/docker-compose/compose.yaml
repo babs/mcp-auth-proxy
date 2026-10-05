@@ -6,6 +6,11 @@
 #   mcp-server  — tiny FastMCP hello-world server (Streamable HTTP)
 #   mcp-auth-proxy — this proxy, built from the project root
 #
+# Profile "forwarding" (docker compose --profile forwarding up) adds a
+# second proxy on :8081 with UPSTREAM_FORWARD_IDP_TOKEN=true in front of
+# a test-only header-echo upstream. The Keycloak e2e suite uses it; the
+# default demo does not start it.
+#
 # Prerequisites: add "127.0.0.1 keycloak" to your /etc/hosts (see README).
 # Quick start:   bash scripts/up.sh
 # Teardown:      bash scripts/down.sh
@@ -101,4 +106,50 @@ services:
         condition: service_healthy
     # No healthcheck: distroless image has no shell or utilities.
     # up.sh polls http://localhost:8080/healthz from the host instead.
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Profile "forwarding": upstream IdP token forwarding, for the e2e suite.
+  # header-echo answers with the headers it received, including the
+  # forwarded bearer token — TEST ONLY, never front a real upstream with it.
+  # ---------------------------------------------------------------------------
+  header-echo:
+    profiles: ["forwarding"]
+    image: python:3.12-slim
+    command: ["python", "/app/header_echo.py"]
+    volumes:
+      - ./header-echo:/app:ro
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import socket; s=socket.socket(); s.connect(('localhost', 8000)); s.close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  mcp-auth-proxy-forwarding:
+    profiles: ["forwarding"]
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    env_file: .env
+    # Overrides on top of .env: own client, own mount, own Redis prefix.
+    environment:
+      PROXY_BASE_URL: http://localhost:8081
+      OIDC_CLIENT_ID: mcp-auth-proxy-forwarding
+      UPSTREAM_MCP_URL: http://header-echo:8000/mcp
+      UPSTREAM_FORWARD_IDP_TOKEN: "true"
+      # Keycloak issues refresh tokens without it; requesting it here
+      # exercises the scope pass-through the way Entra ID needs it.
+      OIDC_EXTRA_SCOPES: offline_access
+      REDIS_KEY_PREFIX: "mcp-auth-proxy-forwarding:"
+      METRICS_ADDR: 127.0.0.1:9090
+    ports:
+      - "8081:8080"
+    depends_on:
+      keycloak:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      header-echo:
+        condition: service_healthy
     restart: unless-stopped

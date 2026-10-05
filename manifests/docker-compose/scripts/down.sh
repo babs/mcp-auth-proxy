@@ -9,5 +9,6 @@ readonly COMPOSE_DIR
 readonly COMPOSE_FILE="$COMPOSE_DIR/compose.yaml"
 
 echo "==> Stopping and removing the demo stack (volumes included)..."
-docker compose -f "$COMPOSE_FILE" down -v
+# --profile forwarding also removes the optional forwarding-mode services.
+docker compose -f "$COMPOSE_FILE" --profile forwarding down -v
 echo "Done."
