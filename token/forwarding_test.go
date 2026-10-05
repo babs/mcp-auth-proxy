@@ -105,6 +105,8 @@ func TestIssueWithIdPToken_ExpiryRule(t *testing.T) {
 		{name: "idp_exactly_ttl_plus_skew", idpExp: ttl + time.Minute, want: ttl},
 		{name: "idp_expiry_unknown", idpExp: 0, want: ttl},
 		{name: "idp_inside_skew", idpExp: 30 * time.Second, wantErr: ErrIdPTokenLifetime},
+		{name: "idp_leaves_under_a_minute", idpExp: 90 * time.Second, wantErr: ErrIdPTokenLifetime},
+		{name: "idp_three_minutes", idpExp: 3 * time.Minute, want: 2 * time.Minute},
 		{name: "idp_already_expired", idpExp: -time.Minute, wantErr: ErrIdPTokenLifetime},
 	}
 	for _, tc := range cases {
@@ -238,5 +240,25 @@ func TestIssue_DefaultModeOmitsIdPField(t *testing.T) {
 	}
 	if strings.Contains(string(plain), "idp_at") {
 		t.Errorf("default-mode access token carries the forwarding field: %s", plain)
+	}
+}
+
+func TestFitsOpenCap(t *testing.T) {
+	m := mustNewManager(t, make([]byte, 32))
+	small, _ := m.SealJSON(map[string]string{"k": "v"}, PurposeRefresh)
+	big, _ := m.SealJSON(map[string]string{"k": strings.Repeat("x", maxSealedLen)}, PurposeRefresh)
+	if !m.FitsOpenCap(small, PurposeRefresh) {
+		t.Error("small payload reported over the cap")
+	}
+	if m.FitsOpenCap(big, PurposeRefresh) {
+		t.Error("payload over maxSealedLen reported as fitting the default cap")
+	}
+	m.SetMaxSealedLen(PurposeRefresh, ForwardingMaxSealedLen)
+	if !m.FitsOpenCap(big, PurposeRefresh) {
+		t.Error("payload under the raised cap reported over it")
+	}
+	var out map[string]string
+	if err := m.OpenJSON(big, &out, PurposeRefresh); err != nil {
+		t.Errorf("FitsOpenCap and open() disagree: %v", err)
 	}
 }

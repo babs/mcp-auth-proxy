@@ -578,16 +578,16 @@ type OAuthError struct {
 | `code_replay` | Authorization code reused (requires Redis) | `invalid_grant` |
 | `refresh_reuse_detected` | Refresh token replayed after rotation → family revoked (requires Redis) | `invalid_grant` |
 | `refresh_family_revoked` | Refresh token whose family was previously revoked | `invalid_grant` |
-| `email_not_verified` | id_token `email_verified` is `false` (metric label: `email_unverified`) | `access_denied` |
+| `email_not_verified` | id_token `email_verified` is `false` (metric label: `email_unverified`); also re-checked on a forwarding-mode refresh | `access_denied` (`invalid_grant` at `/token`) |
 | `subject_missing` | IdP returned a verified id_token without a `sub` claim (L5) | `access_denied` |
-| `group_invalid` | IdP group name contains `,` `\r` `\n` `\x00` | `access_denied` |
-| `group_not_allowed` | User belongs to none of `ALLOWED_GROUPS` (metric label: `group`) | `access_denied` |
+| `group_invalid` | IdP group name contains `,` `\r` `\n` `\x00`; also re-checked on a forwarding-mode refresh | `access_denied` (`invalid_grant` at `/token`) |
+| `group_not_allowed` | User belongs to none of `ALLOWED_GROUPS` (metric label: `group`); also re-checked on a forwarding-mode refresh, so a removal bites within one access-token lifetime | `access_denied` (`invalid_grant` at `/token`) |
 | `session_expired` / `session_audience_mismatch` / `callback_params_missing` | `/callback` flow state is unusable; the page tells the user to start again | `invalid_request` |
 | `session_unknown` | `/callback` state cannot be opened. Paired `error` is `invalid_request`, **or** the allowlisted IdP `error` when the IdP itself returned one | `invalid_request` (or the IdP's) |
 | `consent_token_missing` / `consent_token_invalid` / `consent_token_expired` / `consent_token_audience_mismatch` | `/consent` flow state is unusable; same "start again" advice | `invalid_request` |
 | `idp_exchange_failed` / `id_token_missing` / `id_token_claims_unparsable` | Upstream IdP failed the exchange or returned an unusable id_token | `server_error` |
 | `callback_state_replay` | `/callback` replayed (requires Redis); metric: `mcp_auth_replay_detected_total{kind="callback_state"}` — not an `access_denied_total` reason | `invalid_request` |
-| `idp_exchange_throttled` | Outbound IdP exchange throttled (`IDP_EXCHANGE_RATE_PER_SEC`) | `temporarily_unavailable` |
+| `idp_exchange_throttled` | Outbound IdP exchange throttled (`IDP_EXCHANGE_RATE_PER_SEC`) — at `/callback`, and at `/token` in forwarding mode, where the code or refresh token stays usable for the retry (`invalid_grant` instead if it could not be given back) | `temporarily_unavailable` (or `invalid_grant` at `/token`) |
 | `refresh_concurrent_submit` | Racing refresh inside `REFRESH_RACE_GRACE_SEC` | `invalid_grant` |
 | `redirect_uri_missing` / `redirect_uri_mismatch` | `redirect_uri` absent or not registered (client input, `/authorize`) | `invalid_request` |
 | `redirect_uri_malformed` | An already-validated `redirect_uri` failed to re-parse at `/authorize`, `/consent` or `/callback`, leaving nowhere to deliver the §4.1.2.1 envelope — invariant violation, see the browser-facing rendering note | the original envelope's `error` (`server_error`, `access_denied`, `unsupported_response_type`, `invalid_target`, `invalid_request`, or the allowlisted IdP one) |
@@ -601,8 +601,13 @@ type OAuthError struct {
 | `client_id_unknown` | `client_id` did not decrypt, **or** decrypted with the wrong purpose tag. One code for both on purpose: distinct codes would tell an unauthenticated caller which of the two happened, i.e. whether a blob they hold is a genuine token of this proxy. The metric labels stay distinct (`client_id_invalid`, `client_typ_mismatch`) | `invalid_client` / `invalid_grant` |
 | `client_audience_mismatch` / `client_registration_expired` | Client registered for another `PROXY_BASE_URL`, or past its TTL; each matches the metric label of the same name | `invalid_client` |
 | `replay_store_unavailable` | Redis unreachable; handler fails closed | `server_error` |
-| `id_token_verification_failed` | go-oidc rejected the IdP id_token | `server_error` |
-| `token_issue_failed` | AES-GCM seal error when minting an access token | `server_error` |
+| `id_token_verification_failed` | go-oidc rejected the IdP id_token; at `/token` in forwarding mode, the id_token returned on refresh names a different `sub` (`invalid_grant`) | `server_error` (or `invalid_grant`) |
+| `token_issue_failed` | AES-GCM seal error when minting an access token. In forwarding mode also an IdP access token that would leave the proxy token under a minute (i.e. lives under about two minutes), or IdP tokens that would push an access or refresh token over its `open()` cap; there the code or refresh token is already spent, so the answer is `invalid_grant` — a 5xx would invite a retry that reads as a replay | `server_error` (`invalid_grant` in forwarding mode) |
+| `idp_refresh_token_missing` | `/callback` in forwarding mode (`UPSTREAM_FORWARD_IDP_TOKEN`): the IdP code exchange returned no refresh token — offline access not granted to the proxy's client | `server_error` |
+| `idp_token_missing` | `/token` in forwarding mode: the code or refresh token was minted before the mode was switched on and carries no IdP token; the client signs in again | `invalid_grant` |
+| `idp_refresh_rejected` | `/token` in forwarding mode: the IdP refused the refresh (`invalid_grant`, `interaction_required`, `login_required`, `consent_required`, `invalid_scope`); the client signs in again. Metric: `mcp_auth_idp_refresh_total{result="rejected"}` | `invalid_grant` |
+| `idp_refresh_unavailable` | `/token` in forwarding mode: IdP transport error, timeout, 5xx or 429, or the proxy's own client credentials refused (`invalid_client`, `unauthorized_client`). The code or refresh token is NOT consumed — retry after `Retry-After`. If giving it back fails (replay store down at the same time), the answer is `invalid_grant` without `Retry-After`: a retry would read as a replay. Metric: `mcp_auth_idp_refresh_total{result="unavailable"}` | `temporarily_unavailable` (or `invalid_grant`) |
+| `idp_refresh_failed` | `/token` in forwarding mode: a failure waiting will not clear — a permanent IdP 4xx (`invalid_request`, `unsupported_grant_type`, …) or a 2xx without a usable Bearer access token (or one whose body broke off), after which the IdP has probably rotated its refresh token already. The code or refresh token stays spent; the client signs in again. Metric: `mcp_auth_idp_refresh_total{result="failed"}` | `invalid_grant` |
 
 **Browser-facing rendering.** `/authorize`, `/consent` and `/callback` terminate in the user's
 browser, not in the MCP client — a raw JSON body there is a dead end for the human reading it. Those

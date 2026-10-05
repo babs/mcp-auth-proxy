@@ -63,9 +63,15 @@ const ForwardingMaxSealedLen = 64 << 10
 // while the forwarded token still has a minute left in flight.
 const idpTokenExpirySkew = 60 * time.Second
 
+// minForwardingLifetime is the shortest proxy access token
+// IssueWithIdPToken mints. Anything shorter would have the client
+// refreshing in a tight loop (expires_in rounds down to 0).
+const minForwardingLifetime = 60 * time.Second
+
 // ErrIdPTokenLifetime is returned by IssueWithIdPToken when the IdP
-// access token expires within idpTokenExpirySkew: a proxy token minted
-// from it would be dead on arrival.
+// access token would leave the proxy token less than
+// minForwardingLifetime once idpTokenExpirySkew is taken off — i.e.
+// when the IdP issues access tokens that live under two minutes.
 var ErrIdPTokenLifetime = errors.New("idp access token expires too soon")
 
 // ErrSealedTooLarge is returned by IssueWithIdPToken when the sealed
@@ -315,6 +321,14 @@ func (m *Manager) SetMaxSealedLen(purpose string, n int) {
 	m.sealedCaps[purpose] = n
 }
 
+// FitsOpenCap reports whether sealed passes the open() length cap for
+// purpose. Forwarding mode checks codes and refresh tokens with it right
+// after sealing, so a payload swollen by IdP tokens is refused at mint
+// time instead of being handed out and failing to open later.
+func (m *Manager) FitsOpenCap(sealed, purpose string) bool {
+	return len(sealed) <= m.maxSealedLenFor(purpose)
+}
+
 // maxSealedLenFor returns the open() cap for purpose.
 func (m *Manager) maxSealedLenFor(purpose string) int {
 	if n, ok := m.sealedCaps[purpose]; ok {
@@ -493,7 +507,7 @@ func (m *Manager) IssueWithIdPToken(audience, subject, email, clientID string, g
 		if limit := idp.ExpiresAt.Add(-idpTokenExpirySkew); limit.Before(exp) {
 			exp = limit
 		}
-		if !exp.After(now) {
+		if exp.Sub(now) < minForwardingLifetime {
 			return "", nil, ErrIdPTokenLifetime
 		}
 	}

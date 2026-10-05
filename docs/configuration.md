@@ -57,7 +57,7 @@ secure production posture (`PROD_MODE=true`); flags listed here as
 | `REDIS_REQUIRED` | `true` | Fail startup when `REDIS_URL` is unset. Set `false` only for dev / single-replica; stateless mode leaves codes / refresh tokens replayable within their TTL. Rejected by `PROD_MODE`. |
 | `REDIS_KEY_PREFIX` | `mcp-auth-proxy:` | Key prefix for shared Redis. Set to empty to opt out of namespacing. |
 | `REFRESH_RACE_GRACE_SEC` | `2` | Grace window in seconds during which a refresh-rotation collision is treated as a benign concurrent submit (parallel-tab refresh, slow-network double-submit) and returns 429 `refresh_concurrent_submit` without revoking the family. Outside the window every collision still revokes. Range `[0, 10]`; `0` disables. The 10s ceiling is a security cap — wider windows are statistically attacker-shaped. |
-| `IDP_EXCHANGE_RATE_PER_SEC` | (disabled) | Cap on outbound proxy → IdP token-endpoint requests at `/callback`. Defense in depth: a flood of `/callback` hits that slips past the per-IP limiter (distributed sources, permissive XFF trust matrix) is bounded by this token bucket before reaching the IdP. Denied requests get 503 `temporarily_unavailable` + `error_code=idp_exchange_throttled` + `Retry-After` (2-4s, jittered so N replicas' rejected callers do not re-converge on one instant). Set to a positive number (e.g. `20`) to enable. **Per-replica scope:** an `N`-replica deployment admits up to `N × IDP_EXCHANGE_RATE_PER_SEC` to the IdP — divide your IdP-side ceiling by replica count. |
+| `IDP_EXCHANGE_RATE_PER_SEC` | (disabled) | Cap on outbound proxy → IdP token-endpoint requests at `/callback` — and, with `UPSTREAM_FORWARD_IDP_TOKEN=true`, at every `/token` call too (one IdP refresh per code redemption and per refresh), through the same bucket. In forwarding mode, enabling it is recommended: size it for the expected refresh rate (roughly active sessions ÷ 3600 per second, since access tokens last at most an hour) plus sign-ins, and give `IDP_EXCHANGE_BURST` room for the herd of clients refreshing after a deploy or an IdP blip; a throttled `/token` call leaves the client's code or refresh token usable for its retry. Defense in depth: a flood of `/callback` hits that slips past the per-IP limiter (distributed sources, permissive XFF trust matrix) is bounded by this token bucket before reaching the IdP. Denied requests get 503 `temporarily_unavailable` + `error_code=idp_exchange_throttled` + `Retry-After` (2-4s, jittered so N replicas' rejected callers do not re-converge on one instant). Set to a positive number (e.g. `20`) to enable. **Per-replica scope:** an `N`-replica deployment admits up to `N × IDP_EXCHANGE_RATE_PER_SEC` to the IdP — divide your IdP-side ceiling by replica count. |
 | `GROUPS_CLAIM_MAX_BYTES` | `32768` | Byte budget for the `groups` claim sealed into an access token; the excess is dropped at mint time. Range `[1024, 40960]`. The ceiling is measured, not chosen: the seal expands the claim ~1.39x, so a 40 KB budget already mints a 56 KB `Authorization` header against the 64 KB block. Raise it only if your directory uses long DNs **and** your MCP clients send few other headers; watch `mcp_auth_groups_claim_truncated_total`. |
 | `IDP_EXCHANGE_BURST` | `50` | Burst size for the IdP-exchange limiter when `IDP_EXCHANGE_RATE_PER_SEC > 0`. Higher burst absorbs a short spike (e.g. a deploy-time reconnect storm) without 503s; lower burst keeps the ceiling tighter. Ignored when `IDP_EXCHANGE_RATE_PER_SEC` is unset/zero. |
 
@@ -162,7 +162,7 @@ quotes — the full code → meaning table lives in
 where a bullet says otherwise. These buckets carry no wire `error_code`
 at all — nothing on those paths renders a support code:
 `invalid_token`, `token_expired`, `audience_mismatch`,
-`resource_mismatch`, `token_revoked_iat_cutoff` (all
+`resource_mismatch`, `token_revoked_iat_cutoff`, `idp_token_missing` (all
 `middleware/auth.go`), `subject_concurrency_exceeded`
 (`internal/subjectlimiter`), and `state_missing`
 (`handlers/authorize.go`, which delivers an RFC 6749 §4.1.2.1 redirect
@@ -184,6 +184,12 @@ instead of a rendered error).
     `invalid_token` so the latter is unambiguously the attack channel).
   - `audience_mismatch` / `resource_mismatch`.
   - `token_revoked_iat_cutoff` — `REVOKE_BEFORE` rejection.
+  - `idp_token_missing` — forwarding mode only: an access token
+    without an IdP token (minted before `UPSTREAM_FORWARD_IDP_TOKEN`
+    was switched on) reached the MCP route and got the 401 challenge.
+    Expected right after enabling the mode, while clients refresh or
+    sign in again; it should decay to zero within one access-token
+    lifetime.
   - `id_token_verification_failed` — IdP signature / nonce / claim
     parse.
   - `replay_store_unavailable` — Redis down (fail-closed).
@@ -243,7 +249,32 @@ instead of a rendered error).
   (`IDP_EXCHANGE_RATE_PER_SEC`). A spike under steady inbound
   traffic usually means a distributed flood is slipping past the
   per-IP limiter, or the IdP is slow enough that the bucket fills
-  faster than it drains.
+  faster than it drains. Counts `/callback` only; forwarding-mode
+  refreshes throttled by the same bucket land in
+  `mcp_auth_idp_refresh_total{result="throttled"}`.
+
+### Upstream IdP token forwarding
+
+Only populated with `UPSTREAM_FORWARD_IDP_TOKEN=true`.
+
+- `mcp_auth_idp_refresh_total{result}` — IdP `refresh_token` grants
+  made at `/token` (once per code redemption, once per refresh):
+  `ok`; `rejected` (the IdP refused the grant, the client signs in
+  again — a burst after a password-reset wave or a Conditional Access
+  change is expected); `unavailable` (IdP transport error, timeout,
+  5xx/429, or the proxy's own client credentials refused — the client
+  keeps its token and retries); `failed` (a permanent IdP 4xx or a 2xx
+  without a usable token — the client signs in again; any count here
+  is worth a look); `throttled` (the `IDP_EXCHANGE_*` bucket was
+  empty, no IdP call made). Sustained
+  `unavailable` means clients cannot renew once their access token
+  expires: see `docs/runbooks/idp-outage.md`.
+- `mcp_auth_upstream_idp_token_forwarded_total` — MCP requests proxied
+  with the user's IdP access token as the upstream `Authorization:
+  Bearer` (once per request; redirect hops are not counted again). It
+  should track the MCP request rate; a gap means requests reached the
+  proxy handler without a token, which the auth middleware is meant to
+  prevent.
 
 ### Crypto bookkeeping
 

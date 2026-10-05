@@ -158,6 +158,19 @@ func main() {
 	tm.SetSealMetric(func(purpose string) {
 		metrics.TokenSeals.WithLabelValues(purpose).Inc()
 	})
+	// Forwarding mode seals IdP tokens into codes, access and refresh
+	// tokens, which can then outgrow the default open() cap. Raised for
+	// those three purposes only; every other sealed type keeps the
+	// tighter default.
+	var idpRefresher *handlers.IdPRefresher
+	if cfg.UpstreamForwardIdPToken {
+		for _, purpose := range []string{token.PurposeCode, token.PurposeAccess, token.PurposeRefresh} {
+			tm.SetMaxSealedLen(purpose, token.ForwardingMaxSealedLen)
+		}
+		// Same 10 s budget as the /callback code exchange.
+		idpRefresher = handlers.NewIdPRefresher(oauth2Cfg, 10*time.Second)
+		logger.Info("upstream_forward_idp_token_enabled", zap.Strings("idp_scopes", oauth2Cfg.Scopes))
+	}
 
 	// Optional replay protection: when REDIS_URL is set, authorization codes
 	// become single-use across all replicas. When unset, behavior is stateless
@@ -193,6 +206,7 @@ func main() {
 
 	proxyHandler, err := proxy.Handler(cfg.UpstreamMCPURL, logger, proxy.Config{
 		UpstreamAuthorization: cfg.UpstreamAuthorization,
+		ForwardIdPToken:       cfg.UpstreamForwardIdPToken,
 	})
 	if err != nil {
 		logger.Fatal("proxy_handler_init_failed", zap.Error(err))
@@ -202,6 +216,7 @@ func main() {
 	}
 
 	authMW := middleware.NewAuth(tm, logger, cfg.ProxyBaseURL, cfg.UpstreamMCPMountPath, cfg.RevokeBefore)
+	authMW.SetForwardIdPToken(cfg.UpstreamForwardIdPToken)
 
 	// Signal lifecycle. Three handlers listen for SIGINT/SIGTERM over the
 	// process lifetime; Go's signal package fans out each delivery to every
@@ -366,9 +381,16 @@ func main() {
 			GroupsClaim:        cfg.GroupsClaim,
 			ReplayStore:        replayStore,
 			IdPExchangeLimiter: idpExchangeLimiter,
+			ForwardIdPToken:    cfg.UpstreamForwardIdPToken,
 		}),
 		Token: handlers.Token(tm, logger, cfg.ProxyBaseURL, cfg.RevokeBefore, replayStore, handlers.TokenConfig{
-			RefreshRaceGrace: cfg.RefreshRaceGrace,
+			RefreshRaceGrace:   cfg.RefreshRaceGrace,
+			ForwardIdPToken:    cfg.UpstreamForwardIdPToken,
+			IdPRefresher:       idpRefresher,
+			IdPExchangeLimiter: idpExchangeLimiter,
+			VerifyIDToken:      idTokenVerifier.Verify,
+			GroupsClaim:        cfg.GroupsClaim,
+			AllowedGroups:      cfg.AllowedGroups,
 		}, cfg.ProxyBaseURL+cfg.UpstreamMCPMountPath),
 		RegisterLimit:  registerLimit,
 		AuthorizeLimit: authorizeLimit,

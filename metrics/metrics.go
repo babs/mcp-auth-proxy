@@ -133,6 +133,29 @@ var (
 		Help: "Upstream IdP token-endpoint exchanges denied by the proxy outbound rate-limit bucket.",
 	})
 
+	// IdPRefresh counts IdP refresh_token grants made at /token in
+	// upstream IdP token forwarding mode, by result: ok; rejected (the
+	// IdP refused the grant, the user signs in again); unavailable (IdP
+	// transport error, timeout, 5xx/429, or the proxy's own client
+	// credentials refused — the client retries); failed (a permanent IdP
+	// 4xx or a 2xx without a usable token — the user signs in again);
+	// throttled (IDP_EXCHANGE_* bucket empty, no IdP call made).
+	// Sustained unavailable means clients cannot renew once their access
+	// token expires — see the IdP outage runbook.
+	IdPRefresh = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "mcp_auth_idp_refresh_total",
+		Help: "IdP refresh_token grants made in upstream IdP token forwarding mode, by result.",
+	}, []string{"result"})
+
+	// UpstreamIdPTokenForwarded counts MCP requests proxied with the
+	// user's IdP access token as the upstream Bearer (one per request,
+	// redirect hops not counted again). Compared with the MCP request
+	// rate it shows forwarding is actually in effect.
+	UpstreamIdPTokenForwarded = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "mcp_auth_upstream_idp_token_forwarded_total",
+		Help: "MCP requests forwarded upstream with the user's IdP access token as Bearer.",
+	})
+
 	// ConsentDecisions counts user clicks on the proxy-rendered
 	// consent page, labelled by outcome (approved / denied). Distinct
 	// from AccessDenied: a user clicking "Deny" is not a policy

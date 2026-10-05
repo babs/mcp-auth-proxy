@@ -67,6 +67,11 @@ func TestErrorCodeValues_ArePinned(t *testing.T) {
 		codeRefreshRevokedCutoff:         "refresh_revoked_iat_cutoff",
 		codeRefreshReuse:                 "refresh_reuse_detected",
 		codeTokenIssueFailed:             "token_issue_failed",
+		codeIdPRefreshTokenMissing:       "idp_refresh_token_missing",
+		codeIdPRefreshRejected:           "idp_refresh_rejected",
+		codeIdPRefreshUnavailable:        "idp_refresh_unavailable",
+		codeIdPRefreshFailed:             "idp_refresh_failed",
+		codeIdPTokenMissing:              "idp_token_missing",
 	}
 	for got, want := range pinned {
 		if got != want {
@@ -358,6 +363,21 @@ var descToCode = map[string]string{
 	"callbackHandler: session expired":                                               codeSessionExpired,
 	"callbackHandler: unknown or expired state":                                      codeSessionUnknown,
 	"callbackHandler: upstream IdP exchange throttled; retry shortly":                codeIdPExchangeThrottled,
+	"callbackHandler: identity provider returned no refresh token":                   codeIdPRefreshTokenMissing,
+	"handleAuthorizationCode: authorization code carries no identity provider token": codeIdPTokenMissing,
+	"idpRefreshThrottled: upstream IdP exchange throttled; retry shortly":            codeIdPExchangeThrottled,
+	"redeemIdPRefresh: identity provider rejected the refresh token":                 codeIdPRefreshRejected,
+	"redeemIdPRefresh: identity provider unavailable; retry shortly":                 codeIdPRefreshUnavailable,
+	"redeemIdPRefresh: identity provider unavailable; sign in again":                 codeIdPRefreshUnavailable,
+	"writeIssueFailure: failed to issue token":                                       codeTokenIssueFailed,
+	"writeIssueFailure: failed to issue token; sign in again":                        codeTokenIssueFailed,
+	"redeemIdPRefresh: identity provider returned an unusable token response":        codeIdPRefreshFailed,
+	"idpRefreshThrottled: upstream IdP exchange throttled; sign in again":            codeIdPExchangeThrottled,
+	"handleRefreshToken: refresh token carries no identity provider token":           codeIdPTokenMissing,
+	"refreshIdentity: refreshed id_token names a different subject":                  codeIDTokenVerificationFailed,
+	"refreshIdentity: email address is not verified":                                 codeEmailNotVerified,
+	"refreshIdentity: group name contains invalid characters":                        codeGroupInvalid,
+	"refreshIdentity: user not in any allowed group":                                 codeGroupNotAllowed,
 	"callbackHandler: upstream authentication failed":                                codeIdPExchangeFailed,
 	"callbackHandler: user not in any allowed group":                                 codeGroupNotAllowed,
 	"handleAuthorizationCode: PKCE verification failed":/* no code */ "",
@@ -369,14 +389,12 @@ var descToCode = map[string]string{
 	"handleAuthorizationCode: code_verifier is required":/* no code */ "",
 	"handleAuthorizationCode: code_verifier must be 43-128 unreserved characters":/* no code */ "",
 	"handleAuthorizationCode: code_verifier supplied but code was issued without a code_challenge":/* no code */ "",
-	"handleAuthorizationCode: failed to issue token": codeTokenIssueFailed,
 	"handleAuthorizationCode: internal error":/* no code */ "",
 	"handleAuthorizationCode: invalid or expired authorization code":/* no code */ "",
 	"handleAuthorizationCode: missing required parameters":/* no code */ "",
 	"handleAuthorizationCode: redirect_uri mismatch":/* no code */ "",
 	"handleAuthorizationCode: replay store unavailable": codeReplayStoreUnavailable,
 	"handleRefreshToken: client_id mismatch":/* no code */ "",
-	"handleRefreshToken: failed to issue token": codeTokenIssueFailed,
 	"handleRefreshToken: internal error":/* no code */ "",
 	"handleRefreshToken: invalid or expired refresh token":/* no code */ "",
 	"handleRefreshToken: missing required parameters":/* no code */ "",
@@ -980,6 +998,7 @@ func TestBrowserReachableCodes_HaveDeliberateAdvice(t *testing.T) {
 		codeCodeSealFailed:            true, // internal
 		codeInterstitialFailed:        true, // internal
 		codeIDTokenMissing:            true, // IdP misconfiguration
+		codeIdPRefreshTokenMissing:    true, // IdP misconfiguration (no offline access granted)
 		codeIDTokenVerificationFailed: true, // IdP misconfiguration or attack
 		codeIDTokenClaimsUnparsable:   true, // IdP schema drift
 		codeSubjectMissing:            true, // IdP schema drift

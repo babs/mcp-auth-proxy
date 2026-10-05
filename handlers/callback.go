@@ -96,6 +96,13 @@ type CallbackConfig struct {
 	// `idp_exchange_throttled` log + metric; the user can retry once
 	// the bucket refills. nil = no outbound throttling.
 	IdPExchangeLimiter *rate.Limiter
+	// ForwardIdPToken (UPSTREAM_FORWARD_IDP_TOKEN) keeps the IdP refresh
+	// token from the code exchange and seals it into the authorization
+	// code, so /token can obtain the IdP access token the upstream will
+	// receive. An IdP that returns no refresh token fails the sign-in
+	// with idp_refresh_token_missing: without one the proxy could not
+	// renew the forwarded token past its first expiry.
+	ForwardIdPToken bool
 }
 
 // Callback handles GET /callback (IdP redirect after user authentication).
@@ -319,6 +326,21 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 			return
 		}
 
+		// Forwarding mode needs the IdP refresh token: /token redeems it
+		// for the access token the upstream receives, and every refresh
+		// grant renews it. Checked after the id_token is authenticated
+		// so a forged response cannot reach this branch. The usual cause
+		// is a missing offline_access in OIDC_EXTRA_SCOPES (Entra ID) or
+		// a client not allowed refresh tokens — an operator fix.
+		if cbCfg.ForwardIdPToken && oauth2Token.RefreshToken == "" {
+			logger.Error("idp_refresh_token_missing",
+				zap.String("subject", idToken.Subject),
+				zap.String("hint", "the IdP returned no refresh token; grant offline access (e.g. add offline_access to OIDC_EXTRA_SCOPES) or allow refresh tokens for this client"),
+			)
+			writeOAuthError(w, r, http.StatusBadGateway, "server_error", "identity provider returned no refresh token", codeIdPRefreshTokenMissing)
+			return
+		}
+
 		var claims struct {
 			Sub           string `json:"sub"`
 			Email         string `json:"email"`
@@ -357,57 +379,20 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 			return
 		}
 
-		// Extract groups from the configured claim name. A non-[]string
-		// shape (e.g. IdP emits a space-separated string, or a nested
-		// object) is treated as "no groups" — ignoring the unmarshal
-		// error lets the group allowlist make the final call instead of
-		// failing the login on a shape mismatch we can't reason about.
-		//
-		// When the shape is wrong AND ALLOWED_GROUPS is enforced, every
-		// login will be denied — an IdP-format change (a new scope
-		// layout, a schema migration) would silently mass-lockout users
-		// with only a single `group` denial counter to go on. We emit
-		// at Warn with a dedicated reason so the denial is visible
-		// without enabling id_token debug logging, and increment a
-		// dedicated counter so operators can alert on the transition
-		// instead of having to spot a spike in `group` denials.
-		var groups []string
-		if cbCfg.GroupsClaim != "" {
-			var raw map[string]json.RawMessage
-			if err := idToken.Claims(&raw); err == nil {
-				if v, ok := raw[cbCfg.GroupsClaim]; ok {
-					if err := json.Unmarshal(v, &groups); err != nil {
-						// Distinct counter: the user is admitted with
-						// empty groups — this is NOT a denial. Sharing
-						// the AccessDenied counter would conflate IdP
-						// shape drift with real auth-policy denials and
-						// double-count when the empty-groups admit later
-						// trips an AllowedGroups mismatch.
-						metrics.GroupsClaimShapeMismatch.Inc()
-						logger.Warn("groups_claim_shape_mismatch",
-							zap.String("claim", cbCfg.GroupsClaim),
-							zap.String("subject", claims.Sub),
-							zap.Error(err),
-						)
-					}
-				}
-			}
-		}
+		groups := groupsFromIDToken(idToken, cbCfg.GroupsClaim, logger, claims.Sub)
 
 		// M12: reject group names containing the delimiter "," (which
 		// splits into two groups at the X-User-Groups header parser) or
 		// the control characters "\r" / "\n" / "\x00" (header smuggling
 		// / log injection). Rejected at callback time so the malformed
 		// name never reaches the code/refresh sealed payload.
-		for _, g := range groups {
-			if strings.ContainsAny(g, ",\r\n\x00") {
-				metrics.AccessDenied.WithLabelValues("group_invalid").Inc()
-				logger.Warn("access_denied_group_invalid",
-					zap.String("subject", claims.Sub),
-				)
-				writeOAuthError(w, r, http.StatusForbidden, "access_denied", "group name contains invalid characters", codeGroupInvalid)
-				return
-			}
+		if !validGroupNames(groups) {
+			metrics.AccessDenied.WithLabelValues("group_invalid").Inc()
+			logger.Warn("access_denied_group_invalid",
+				zap.String("subject", claims.Sub),
+			)
+			writeOAuthError(w, r, http.StatusForbidden, "access_denied", "group name contains invalid characters", codeGroupInvalid)
+			return
 		}
 
 		// Enforce group allowlist if configured
@@ -452,8 +437,17 @@ func callbackHandler(tm *token.Manager, logger *zap.Logger, audience string, oau
 			Resource:      session.Resource,
 			ExpiresAt:     time.Now().Add(codeTTL),
 		}
+		if cbCfg.ForwardIdPToken {
+			sc.IdPRefreshToken = oauth2Token.RefreshToken
+		}
 
 		code, err := tm.SealJSON(sc, token.PurposeCode)
+		if err == nil && cbCfg.ForwardIdPToken && !tm.FitsOpenCap(code, token.PurposeCode) {
+			// The IdP refresh token pushed the code past its open() cap
+			// (usually a very large groups claim on top of it): refuse
+			// now rather than issue a code /token cannot open.
+			err = token.ErrSealedTooLarge
+		}
 		if err != nil {
 			logger.Error("authorization_code_seal_failed", zap.Error(err))
 			writeOAuthError(w, r, http.StatusInternalServerError, "server_error", "internal error", codeCodeSealFailed)
@@ -542,4 +536,62 @@ func authzErrorURL(redirectURI, state, errCode, errDesc, audience string) (strin
 	u.Fragment = ""
 	u.RawFragment = ""
 	return u.String(), nil
+}
+
+// groupsFromIDToken extracts groups from the configured flat claim. A
+// non-[]string shape (e.g. IdP emits a space-separated string, or a
+// nested object) is treated as "no groups" — ignoring the unmarshal
+// error lets the group allowlist make the final call instead of failing
+// the login on a shape mismatch we can't reason about.
+//
+// When the shape is wrong AND ALLOWED_GROUPS is enforced, every login
+// will be denied — an IdP-format change (a new scope layout, a schema
+// migration) would silently mass-lockout users with only a single
+// `group` denial counter to go on. We emit at Warn with a dedicated
+// reason so the denial is visible without enabling id_token debug
+// logging, and increment a dedicated counter so operators can alert on
+// the transition instead of having to spot a spike in `group` denials.
+//
+// Shared by /callback and the forwarding-mode refresh, which re-applies
+// the sign-in policy to the id_token the IdP returns on refresh.
+func groupsFromIDToken(idToken *oidc.IDToken, claimName string, logger *zap.Logger, subject string) []string {
+	if claimName == "" {
+		return nil
+	}
+	var raw map[string]json.RawMessage
+	if err := idToken.Claims(&raw); err != nil {
+		return nil
+	}
+	v, ok := raw[claimName]
+	if !ok {
+		return nil
+	}
+	var groups []string
+	if err := json.Unmarshal(v, &groups); err != nil {
+		// Distinct counter: the user is admitted with empty groups —
+		// this is NOT a denial. Sharing the AccessDenied counter would
+		// conflate IdP shape drift with real auth-policy denials and
+		// double-count when the empty-groups admit later trips an
+		// AllowedGroups mismatch.
+		metrics.GroupsClaimShapeMismatch.Inc()
+		logger.Warn("groups_claim_shape_mismatch",
+			zap.String("claim", claimName),
+			zap.String("subject", subject),
+			zap.Error(err),
+		)
+	}
+	// On a shape mismatch json.Unmarshal may have filled part of the
+	// slice; returned as-is, exactly as /callback always behaved.
+	return groups
+}
+
+// validGroupNames reports whether every group name is free of the
+// X-User-Groups delimiter "," and of "\r", "\n", "\x00" (M12).
+func validGroupNames(groups []string) bool {
+	for _, g := range groups {
+		if strings.ContainsAny(g, ",\r\n\x00") {
+			return false
+		}
+	}
+	return true
 }
