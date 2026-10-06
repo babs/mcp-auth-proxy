@@ -119,6 +119,14 @@ const (
 	codeRefreshRevokedCutoff = "refresh_revoked_iat_cutoff"
 	codeRefreshReuse         = "refresh_reuse_detected"
 	codeTokenIssueFailed     = "token_issue_failed"
+
+	// Upstream IdP token forwarding (UPSTREAM_FORWARD_IDP_TOKEN). The
+	// first is emitted by /callback, the others by /token.
+	codeIdPRefreshTokenMissing = "idp_refresh_token_missing" //nolint:gosec // G101 false positive: an error code, not a credential
+	codeIdPRefreshRejected     = "idp_refresh_rejected"
+	codeIdPRefreshUnavailable  = "idp_refresh_unavailable"
+	codeIdPRefreshFailed       = "idp_refresh_failed"
+	codeIdPTokenMissing        = "idp_token_missing"
 )
 
 // Sealed types: all OAuth flow state is encrypted into tokens/parameters,
@@ -220,6 +228,12 @@ type sealedCode struct {
 	Typ         string    `json:"typ"`
 	Audience    string    `json:"aud"`
 	ExpiresAt   time.Time `json:"exp"`
+	// IdPRefreshToken is the IdP refresh token from the /callback code
+	// exchange, set only in upstream IdP token forwarding mode. /token
+	// redeems it once for the IdP access token. The IdP access token
+	// itself stays out of the code: the code travels in a redirect URL,
+	// and an access token with a groups claim can run to several KB.
+	IdPRefreshToken string `json:"idp_rt,omitempty"`
 }
 
 // sealedConsent carries validated /authorize parameters across the
@@ -295,6 +309,11 @@ type sealedRefresh struct {
 	// rolling deploy keeps active sessions valid.
 	FamilyIssuedAt time.Time `json:"fiat,omitempty"`
 	ExpiresAt      time.Time `json:"exp"`
+	// IdPRefreshToken is the latest IdP refresh token, set only in
+	// upstream IdP token forwarding mode. Every refresh grant redeems it
+	// at the IdP and seals the rotated one into the next refresh token,
+	// so the proxy stays stateless.
+	IdPRefreshToken string `json:"idp_rt,omitempty"`
 }
 
 // maxBodySize limits POST request bodies to prevent memory exhaustion.

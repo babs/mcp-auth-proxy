@@ -19,12 +19,11 @@ import (
 	"github.com/go-jose/go-jose/v4"
 	josejwt "github.com/go-jose/go-jose/v4/jwt"
 	"go.uber.org/zap"
-	"golang.org/x/oauth2"
 
 	"github.com/babs/mcp-auth-proxy/config"
 	"github.com/babs/mcp-auth-proxy/handlers"
-	"github.com/babs/mcp-auth-proxy/middleware"
 	"github.com/babs/mcp-auth-proxy/proxy"
+	"github.com/babs/mcp-auth-proxy/replay"
 	"github.com/babs/mcp-auth-proxy/token"
 )
 
@@ -38,6 +37,9 @@ type mockOIDCProvider struct {
 	// real OIDC provider that received a nonce on the authorization request.
 	// Tests set this from the upstream Location header before driving /callback.
 	Nonce string
+	// TokenHandler, when set, answers /token instead of the default
+	// authorization_code response (forwarding tests need refresh grants).
+	TokenHandler http.HandlerFunc
 }
 
 func newMockOIDCProvider(t *testing.T) *mockOIDCProvider {
@@ -81,6 +83,10 @@ func newMockOIDCProvider(t *testing.T) *mockOIDCProvider {
 	})
 
 	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		if m.TokenHandler != nil {
+			m.TokenHandler(w, r)
+			return
+		}
 		idToken := m.signIDToken(t, "test-subject-123", "user@example.com", "Test User", []string{"mcp-users", "dev"}, m.EmailVerified, m.Nonce)
 
 		w.Header().Set("Content-Type", "application/json")
@@ -175,21 +181,39 @@ func (m *mockMCPServer) Close() {
 
 // buildTestProxy wires up the full proxy router using real components
 // but pointing at mock OIDC and mock MCP.
-func buildTestProxy(t *testing.T, oidcProvider *mockOIDCProvider, mcpServer *mockMCPServer, proxyBaseURL string, renderConsent bool) http.Handler {
+// testProxyOptions switches optional features on in buildTestProxy.
+type testProxyOptions struct {
+	// forwardIdPToken wires UPSTREAM_FORWARD_IDP_TOKEN end to end, with
+	// extraScopes appended to the IdP scopes and an in-memory replay
+	// store so single-use claims and their release are exercised.
+	forwardIdPToken bool
+	extraScopes     []string
+}
+
+func buildTestProxy(t *testing.T, oidcProvider *mockOIDCProvider, mcpServer *mockMCPServer, proxyBaseURL string, renderConsent bool, opts ...testProxyOptions) http.Handler {
 	t.Helper()
+	var opt testProxyOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
 
 	provider, err := oidc.NewProvider(t.Context(), oidcProvider.Server.URL)
 	if err != nil {
 		t.Fatalf("oidc.NewProvider: %v", err)
 	}
 
-	oauth2Cfg := &oauth2.Config{
-		ClientID:     oidcProvider.ClientID,
-		ClientSecret: "test-oidc-secret",
-		Endpoint:     provider.Endpoint(),
-		RedirectURL:  proxyBaseURL + "/callback",
-		Scopes:       []string{"openid", "email", "profile"},
+	// Built through main's own constructors, so the harness cannot
+	// drift from the production wiring.
+	cfg := &config.Config{
+		OIDCClientID:            oidcProvider.ClientID,
+		OIDCClientSecret:        "test-oidc-secret",
+		ProxyBaseURL:            proxyBaseURL,
+		UpstreamMCPMountPath:    "/mcp",
+		GroupsClaim:             "groups",
+		OIDCExtraScopes:         opt.extraScopes,
+		UpstreamForwardIdPToken: opt.forwardIdPToken,
 	}
+	oauth2Cfg := newOAuth2Config(cfg, provider.Endpoint())
 
 	verifier := provider.Verifier(&oidc.Config{ClientID: oidcProvider.ClientID})
 
@@ -198,12 +222,20 @@ func buildTestProxy(t *testing.T, oidcProvider *mockOIDCProvider, mcpServer *moc
 		t.Fatalf("token.NewManager: %v", err)
 	}
 
-	proxyHandler, err := proxy.Handler(mcpServer.Server.URL, zap.NewNop(), proxy.Config{})
+	var replayStore replay.Store
+	idpRefresher := enableForwarding(cfg, tm, oauth2Cfg)
+	if opt.forwardIdPToken {
+		mem := replay.NewMemoryStore()
+		t.Cleanup(func() { _ = mem.Close() })
+		replayStore = mem
+	}
+
+	proxyHandler, err := proxy.Handler(mcpServer.Server.URL, zap.NewNop(), newProxyConfig(cfg))
 	if err != nil {
 		t.Fatalf("proxy.Handler: %v", err)
 	}
 
-	authMW := middleware.NewAuth(tm, zap.NewNop(), proxyBaseURL, "/mcp", time.Time{})
+	authMW := newAuthMiddleware(cfg, tm, zap.NewNop())
 
 	r := chi.NewRouter()
 	// The production middleware chain, not a bare router: the error
@@ -224,11 +256,9 @@ func buildTestProxy(t *testing.T, oidcProvider *mockOIDCProvider, mcpServer *moc
 			// TestE2E_ConsentFlowThroughProductionRouter runs it true.
 			RenderConsentPage: renderConsent,
 		}),
-		Consent: handlers.Consent(tm, zap.NewNop(), proxyBaseURL, oauth2Cfg, handlers.ConsentConfig{}),
-		Callback: handlers.Callback(tm, zap.NewNop(), proxyBaseURL, oauth2Cfg, verifier, handlers.CallbackConfig{
-			GroupsClaim: "groups",
-		}),
-		Token:         handlers.Token(tm, zap.NewNop(), proxyBaseURL, time.Time{}, nil, handlers.TokenConfig{}),
+		Consent:       handlers.Consent(tm, zap.NewNop(), proxyBaseURL, oauth2Cfg, handlers.ConsentConfig{}),
+		Callback:      handlers.Callback(tm, zap.NewNop(), proxyBaseURL, oauth2Cfg, verifier, newCallbackConfig(cfg, replayStore, nil)),
+		Token:         handlers.Token(tm, zap.NewNop(), proxyBaseURL, time.Time{}, replayStore, newTokenConfig(cfg, idpRefresher, nil, verifier.Verify)),
 		RegisterLimit: passthrough, AuthorizeLimit: passthrough, ConsentLimit: passthrough,
 		CallbackLimit: passthrough, TokenLimit: passthrough,
 	})

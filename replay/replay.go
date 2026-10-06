@@ -74,6 +74,12 @@ type Store interface {
 	// alreadyClaimed} is true on a given call.
 	ClaimOrCheckFamily(ctx context.Context, familyKey, claimKey string, claimTTL, familyTTL, graceWindow time.Duration) (familyRevoked bool, racing bool, alreadyClaimed bool, err error)
 
+	// Release deletes a claim taken by ClaimOnce or ClaimOrCheckFamily so
+	// the key can be claimed again; an absent key is not an error. Only
+	// for a claim whose guarded work failed transiently BEFORE anything
+	// was issued. Never call it once tokens were handed out.
+	Release(ctx context.Context, key string) error
+
 	// Close releases any underlying resources (connections, goroutines).
 	Close() error
 }

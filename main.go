@@ -91,6 +91,10 @@ func main() {
 		zap.Bool("allowed_groups_set", len(cfg.AllowedGroups) > 0),
 		zap.Bool("revoke_before_set", !cfg.RevokeBefore.IsZero()),
 		zap.Bool("upstream_authorization_set", cfg.UpstreamAuthorization != ""),
+		zap.Bool("upstream_forward_idp_token", cfg.UpstreamForwardIdPToken),
+		// Scope names are not secrets; logging them lets oncall confirm
+		// which upstream audience the IdP is asked for.
+		zap.Strings("oidc_extra_scopes", cfg.OIDCExtraScopes),
 		zap.String("access_log_skip_re", accessLogSkipPattern(cfg.AccessLogSkipRE)),
 		// Surface the per-tool metrics toggle so an operator inspecting
 		// startup logs can confirm `MCP_TOOL_METRICS=true` actually took
@@ -107,6 +111,9 @@ func main() {
 	if w := cfg.SecretWeaknessWarning(); w != "" {
 		logger.Warn("token_signing_secret_weak", zap.String("reason", w))
 	}
+	if w := cfg.ForwardingScopeWarning(); w != "" {
+		logger.Warn("upstream_forward_idp_token_scopes_missing", zap.String("reason", w))
+	}
 
 	// OIDC discovery — works with any compliant IdP (Keycloak, Entra, Auth0, Okta...).
 	// Retry with capped exponential backoff so a transient IdP blip at pod
@@ -120,13 +127,7 @@ func main() {
 		logger.Fatal("oidc_discovery_failed", zap.String("issuer", cfg.OIDCIssuerURL), zap.Error(err))
 	}
 
-	oauth2Cfg := &oauth2.Config{
-		ClientID:     cfg.OIDCClientID,
-		ClientSecret: cfg.OIDCClientSecret,
-		Endpoint:     oidcProvider.Endpoint(),
-		RedirectURL:  cfg.ProxyBaseURL + "/callback",
-		Scopes:       []string{"openid", "email", "profile"},
-	}
+	oauth2Cfg := newOAuth2Config(cfg, oidcProvider.Endpoint())
 
 	idTokenVerifier := oidcProvider.Verifier(&oidc.Config{ClientID: cfg.OIDCClientID})
 
@@ -151,11 +152,11 @@ func main() {
 	tm.SetSealMetric(func(purpose string) {
 		metrics.TokenSeals.WithLabelValues(purpose).Inc()
 	})
+	idpRefresher := enableForwarding(cfg, tm, oauth2Cfg)
+	if idpRefresher != nil {
+		logger.Info("upstream_forward_idp_token_enabled", zap.Strings("idp_scopes", oauth2Cfg.Scopes))
+	}
 
-	// Optional replay protection: when REDIS_URL is set, authorization codes
-	// become single-use across all replicas. When unset, behavior is stateless
-	// (codes unique + short-lived + PKCE-bound but replayable within TTL).
-	//
 	// REDIS_REQUIRED=true (default) enforces Redis as a hard dependency —
 	// the stateless defaults are vulnerable to code/refresh replay within
 	// TTL (C3/C4). Operators must opt out (REDIS_REQUIRED=false) to run
@@ -165,28 +166,12 @@ func main() {
 			zap.String("hint", "set REDIS_URL, or REDIS_REQUIRED=false for dev"),
 		)
 	}
-	var replayStore replay.Store
-	// rs is kept separate so shutdown can close it after all in-flight
-	// handlers drain, even when srv.Shutdown returns early on deadline.
-	var rs *replay.RedisStore
-	if cfg.RedisURL != "" {
-		var err error
-		rs, err = replay.NewRedisStore(cfg.RedisURL, cfg.RedisKeyPrefix)
-		if err != nil {
-			logger.Fatal("replay_store_init_failed", zap.Error(err))
-		}
-		replayStore = rs
-		logger.Info("replay_store_enabled",
-			zap.String("backend", "redis"),
-			zap.String("key_prefix", cfg.RedisKeyPrefix),
-		)
-	} else {
-		logger.Info("replay_store_disabled")
+	replayStore, err := newReplayStore(cfg, logger)
+	if err != nil {
+		logger.Fatal("replay_store_init_failed", zap.Error(err))
 	}
 
-	proxyHandler, err := proxy.Handler(cfg.UpstreamMCPURL, logger, proxy.Config{
-		UpstreamAuthorization: cfg.UpstreamAuthorization,
-	})
+	proxyHandler, err := proxy.Handler(cfg.UpstreamMCPURL, logger, newProxyConfig(cfg))
 	if err != nil {
 		logger.Fatal("proxy_handler_init_failed", zap.Error(err))
 	}
@@ -194,7 +179,7 @@ func main() {
 		logger.Info("upstream_authorization_header_configured")
 	}
 
-	authMW := middleware.NewAuth(tm, logger, cfg.ProxyBaseURL, cfg.UpstreamMCPMountPath, cfg.RevokeBefore)
+	authMW := newAuthMiddleware(cfg, tm, logger)
 
 	// Signal lifecycle. Three handlers listen for SIGINT/SIGTERM over the
 	// process lifetime; Go's signal package fans out each delivery to every
@@ -227,7 +212,8 @@ func main() {
 
 	r := chi.NewRouter()
 	// inFlight tracks requests hitting the main router so shutdown can
-	// drain them before rs.Close() pulls Redis out from under them (H5).
+	// drain them before the replay store's Close() pulls Redis out from
+	// under them (H5).
 	// srv.Shutdown waits for handlers too, but returns early on the
 	// shutdown-context deadline; the WaitGroup lets us wait up to a
 	// bounded grace period past that deadline.
@@ -354,15 +340,9 @@ func main() {
 			ReplayStore:  replayStore,
 			ResourceName: cfg.ResourceName,
 		}),
-		Callback: handlers.Callback(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, idTokenVerifier, handlers.CallbackConfig{
-			AllowedGroups:      cfg.AllowedGroups,
-			GroupsClaim:        cfg.GroupsClaim,
-			ReplayStore:        replayStore,
-			IdPExchangeLimiter: idpExchangeLimiter,
-		}),
-		Token: handlers.Token(tm, logger, cfg.ProxyBaseURL, cfg.RevokeBefore, replayStore, handlers.TokenConfig{
-			RefreshRaceGrace: cfg.RefreshRaceGrace,
-		}, cfg.ProxyBaseURL+cfg.UpstreamMCPMountPath),
+		Callback: handlers.Callback(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, idTokenVerifier, newCallbackConfig(cfg, replayStore, idpExchangeLimiter)),
+		Token: handlers.Token(tm, logger, cfg.ProxyBaseURL, cfg.RevokeBefore, replayStore,
+			newTokenConfig(cfg, idpRefresher, idpExchangeLimiter, idTokenVerifier.Verify), cfg.ProxyBaseURL+cfg.UpstreamMCPMountPath),
 		RegisterLimit:  registerLimit,
 		AuthorizeLimit: authorizeLimit,
 		ConsentLimit:   consentLimit,
@@ -508,9 +488,9 @@ func main() {
 	// yanked. 5s grace is plenty for a handler that already passed
 	// Shutdown's ListenerClose; anything still running is a bug.
 	//
-	// Flip shuttingDown before rs.Close() so /readyz short-circuits
+	// Flip shuttingDown before Close() so /readyz short-circuits
 	// instead of probing a pool that's about to close under it.
-	if rs != nil {
+	if replayStore != nil {
 		drained := make(chan struct{})
 		go func() {
 			inFlight.Wait()
@@ -522,7 +502,7 @@ func main() {
 			logger.Warn("shutdown_inflight_grace_expired")
 		}
 		shuttingDown.Store(true)
-		if err := rs.Close(); err != nil {
+		if err := replayStore.Close(); err != nil {
 			logger.Warn("replay_store_close_failed", zap.Error(err))
 		}
 	}
@@ -1015,6 +995,96 @@ func zapMiddleware(logger *zap.Logger, skipRE *regexp.Regexp, rpcObs *rpcMetrics
 				}
 			}
 		})
+	}
+}
+
+// The constructors below hold the wiring UPSTREAM_FORWARD_IDP_TOKEN and
+// the sign-in policy depend on. main and the e2e harness both build
+// through them, and TestForwardingWiring pins their fields: a dropped
+// one would otherwise fail open in production.
+
+func newOAuth2Config(cfg *config.Config, endpoint oauth2.Endpoint) *oauth2.Config {
+	return &oauth2.Config{
+		ClientID:     cfg.OIDCClientID,
+		ClientSecret: cfg.OIDCClientSecret,
+		Endpoint:     endpoint,
+		RedirectURL:  cfg.ProxyBaseURL + "/callback",
+		Scopes:       cfg.OIDCScopes(),
+	}
+}
+
+// enableForwarding returns nil when the mode is off. When on, it raises
+// the open() cap for the three sealed types that then carry IdP tokens;
+// every other type keeps the tighter default.
+func enableForwarding(cfg *config.Config, tm *token.Manager, oauth2Cfg *oauth2.Config) *handlers.IdPRefresher {
+	if !cfg.UpstreamForwardIdPToken {
+		return nil
+	}
+	for _, purpose := range []string{token.PurposeCode, token.PurposeAccess, token.PurposeRefresh} {
+		tm.SetMaxSealedLen(purpose, token.ForwardingMaxSealedLen)
+	}
+	// Same 10 s budget as the /callback code exchange.
+	return handlers.NewIdPRefresher(oauth2Cfg, 10*time.Second)
+}
+
+func newAuthMiddleware(cfg *config.Config, tm *token.Manager, logger *zap.Logger) *middleware.Auth {
+	authMW := middleware.NewAuth(tm, logger, cfg.ProxyBaseURL, cfg.UpstreamMCPMountPath, cfg.RevokeBefore)
+	authMW.SetForwardIdPToken(cfg.UpstreamForwardIdPToken)
+	return authMW
+}
+
+func newCallbackConfig(cfg *config.Config, replayStore replay.Store, idpLimiter *rate.Limiter) handlers.CallbackConfig {
+	return handlers.CallbackConfig{
+		AllowedGroups:      cfg.AllowedGroups,
+		GroupsClaim:        cfg.GroupsClaim,
+		ReplayStore:        replayStore,
+		IdPExchangeLimiter: idpLimiter,
+		ForwardIdPToken:    cfg.UpstreamForwardIdPToken,
+	}
+}
+
+func newTokenConfig(cfg *config.Config, idpRefresher *handlers.IdPRefresher, idpLimiter *rate.Limiter, verify func(context.Context, string) (*oidc.IDToken, error)) handlers.TokenConfig {
+	return handlers.TokenConfig{
+		RefreshRaceGrace:   cfg.RefreshRaceGrace,
+		ForwardIdPToken:    cfg.UpstreamForwardIdPToken,
+		IdPRefresher:       idpRefresher,
+		IdPExchangeLimiter: idpLimiter,
+		VerifyIDToken:      verify,
+		GroupsClaim:        cfg.GroupsClaim,
+		AllowedGroups:      cfg.AllowedGroups,
+	}
+}
+
+// newReplayStore returns Redis when REDIS_URL is set, else nil
+// (stateless). Forwarding never runs without a store: in-memory when
+// REDIS_URL is empty, which config.Load only allows outside PROD_MODE.
+func newReplayStore(cfg *config.Config, logger *zap.Logger) (replay.Store, error) {
+	if cfg.RedisURL != "" {
+		rs, err := replay.NewRedisStore(cfg.RedisURL, cfg.RedisKeyPrefix)
+		if err != nil {
+			return nil, err
+		}
+		logger.Info("replay_store_enabled",
+			zap.String("backend", "redis"),
+			zap.String("key_prefix", cfg.RedisKeyPrefix),
+		)
+		return rs, nil
+	}
+	if cfg.UpstreamForwardIdPToken {
+		logger.Warn("replay_store_in_memory",
+			zap.String("reason", "UPSTREAM_FORWARD_IDP_TOKEN without REDIS_URL"),
+			zap.String("hint", "single instance only: replay state lives in this process, is not shared between replicas and is lost on restart; set REDIS_URL to run more than one replica"),
+		)
+		return replay.NewMemoryStore(), nil
+	}
+	logger.Info("replay_store_disabled")
+	return nil, nil
+}
+
+func newProxyConfig(cfg *config.Config) proxy.Config {
+	return proxy.Config{
+		UpstreamAuthorization: cfg.UpstreamAuthorization,
+		ForwardIdPToken:       cfg.UpstreamForwardIdPToken,
 	}
 }
 

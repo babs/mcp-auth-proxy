@@ -77,6 +77,12 @@ already wired up, see [Demo stack](#demo-stack).
 - Federates authentication to **any OIDC-compliant IdP** via
   auto-discovery (no vendor lock-in, zero IdP-specific code).
 - Reverse-proxies to your **unmodified** upstream MCP server.
+- **Optional upstream IdP token forwarding** (`UPSTREAM_FORWARD_IDP_TOKEN`,
+  off by default) for MCP servers that call other APIs *as the user*
+  (e.g. on-behalf-of): the user's IdP access token reaches the upstream
+  as `Authorization: Bearer`, renewed at the IdP on every refresh, while
+  the IdP tokens stay sealed inside the proxy's own tokens. See
+  [specs.md](./specs.md#upstream-idp-token-forwarding-opt-in).
 - **Stateless design** — every transient state (registrations, codes,
   tokens) is AEAD-sealed into opaque strings; scale horizontally by
   sharing one secret.
@@ -201,7 +207,7 @@ alone remain replayable within their TTL.
 | Client registration | `client_id` | 7d (configurable via `CLIENT_REGISTRATION_TTL`; `0` = never expires) |
 | Authorize session | IdP `state` parameter | 10min |
 | Authorization code | `code` parameter | 60s |
-| Access token | Opaque bearer | 1h |
+| Access token | Opaque bearer | 1h (at most 1h with `UPSTREAM_FORWARD_IDP_TOKEN=true`: `min(1h, IdP expiry − 60 s)`) |
 | Refresh token | Opaque bearer | 7d |
 
 Every payload verifies its audience on open. Two deployments that
@@ -348,7 +354,9 @@ go test -cover ./...                    # coverage
 The mock-IdP e2e (`e2e_test.go`) exercises registration → authorize →
 callback → token → refresh → bearer-protected proxy. The
 `keycloak_e2e` build tag runs the same flows + four negative-path
-tests against the Docker Compose demo stack with real Keycloak. CI
+tests against the Docker Compose demo stack with real Keycloak. The
+forwarding test (`TestKeycloakE2E_ForwardsIdPAccessToken`) needs the
+stack started with `--profile forwarding` and is skipped otherwise. CI
 runs both paths automatically on every PR.
 
 ---

@@ -56,6 +56,11 @@ the outage — it degrades the proxy to stateless mode where codes are
 replayable within their 60s TTL and refresh tokens rotate without
 reuse detection.
 
+With `UPSTREAM_FORWARD_IDP_TOKEN=true` the proxy does not go stateless:
+it keeps replay state in memory, per replica (log
+`replay_store_in_memory`). Scale to a single replica first, or a token
+used on one replica is not seen as spent by another.
+
 **Do not flip this switch on a production deployment.** The 60s +
 7-day replay windows are the specific attacker primitive the audit
 was built to close. If you must keep the MCP service serving, accept

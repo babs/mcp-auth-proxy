@@ -80,8 +80,8 @@ var (
 		Help: "Access denied counts, by reason.",
 	}, []string{"reason"})
 
-	// ReplayDetected counts replay attempts caught by the replay store
-	// (requires REDIS_URL). Labelled by kind: code, refresh, consent,
+	// ReplayDetected counts replay attempts caught by the replay store.
+	// Labelled by kind: code, refresh, consent,
 	// callback_state.
 	ReplayDetected = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "mcp_auth_replay_detected_total",
@@ -121,9 +121,9 @@ var (
 		Help: "Requests rejected by the per-IP rate limiter, by endpoint.",
 	}, []string{"endpoint"})
 
-	// IdPExchangeThrottled counts /callback hits whose upstream IdP
-	// token-endpoint exchange was throttled by the proxy's outbound
-	// rate-limit bucket (defense in depth on the proxy → IdP leg).
+	// IdPExchangeThrottled counts IdP token-endpoint calls (at /callback
+	// and, in forwarding mode, at /token) throttled by the proxy's
+	// outbound rate-limit bucket (defense in depth on the proxy → IdP leg).
 	// A spike here under steady inbound traffic usually means a
 	// distributed flood is slipping past the per-IP limiter or the
 	// IdP itself is slow enough that the bucket is filling faster
@@ -131,6 +131,28 @@ var (
 	IdPExchangeThrottled = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "mcp_auth_idp_exchange_throttled_total",
 		Help: "Upstream IdP token-endpoint exchanges denied by the proxy outbound rate-limit bucket.",
+	})
+
+	// IdPRefresh counts IdP refresh_token grants made at /token in
+	// upstream IdP token forwarding mode, by result: ok; rejected (the
+	// IdP refused the grant, the user signs in again); unavailable (the
+	// IdP did not process the grant, the client retries); failed (the
+	// user signs in again); throttled (IDP_EXCHANGE_* bucket empty, no
+	// IdP call made). handlers/idp_refresh.go holds the classification.
+	// Sustained unavailable means clients cannot renew once their access
+	// token expires — see the IdP outage runbook.
+	IdPRefresh = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "mcp_auth_idp_refresh_total",
+		Help: "IdP refresh_token grants made in upstream IdP token forwarding mode, by result.",
+	}, []string{"result"})
+
+	// UpstreamIdPTokenForwarded counts MCP requests proxied with the
+	// user's IdP access token as the upstream Bearer (one per request,
+	// redirect hops not counted again). Compared with the MCP request
+	// rate it shows forwarding is actually in effect.
+	UpstreamIdPTokenForwarded = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "mcp_auth_upstream_idp_token_forwarded_total",
+		Help: "MCP requests forwarded upstream with the user's IdP access token as Bearer.",
 	})
 
 	// ConsentDecisions counts user clicks on the proxy-rendered

@@ -119,6 +119,16 @@ data:
   # not from this ConfigMap. Listed here for visibility only.
   # UPSTREAM_AUTHORIZATION_HEADER: ""  # use envFrom: secretRef instead
 
+  # Forward the signed-in user's IdP access token to the upstream as
+  # Authorization: Bearer. Mutually exclusive with
+  # UPSTREAM_AUTHORIZATION_HEADER. Needs REDIS_URL under PROD_MODE;
+  # without it (PROD_MODE=false and REDIS_REQUIRED=false) the replay
+  # store is in memory, single instance only.
+  # UPSTREAM_FORWARD_IDP_TOKEN: "true"
+  # Space-separated scopes added to "openid email profile" at the IdP.
+  # In forwarding mode, set the upstream's scope here.
+  # OIDC_EXTRA_SCOPES: "api://<upstream-app>/<scope> offline_access"
+
   # Access-log path filter (public listener only). Go RE2 regexp matched
   # against r.URL.Path; matches are dropped from the access log. Handler
   # response, Prometheus counters, and panic recovery are unaffected.

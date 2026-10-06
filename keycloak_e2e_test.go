@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -12,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -723,4 +725,147 @@ func postRefresh(t *testing.T, client *http.Client, proxyBaseURL, registeredClie
 func readSnippet(r io.Reader) string {
 	b, _ := io.ReadAll(io.LimitReader(r, 4096))
 	return string(b)
+}
+
+// TestKeycloakE2E_ForwardsIdPAccessToken drives the forwarding-mode
+// proxy (compose profile "forwarding", :8081, UPSTREAM_FORWARD_IDP_TOKEN
+// =true, OIDC_EXTRA_SCOPES=offline_access) against real Keycloak. The
+// header-echo upstream returns the bearer it received, so the test can
+// check it is a Keycloak-issued access token for the upstream's
+// audience — not the proxy token — and that every refresh renews it at
+// Keycloak.
+func TestKeycloakE2E_ForwardsIdPAccessToken(t *testing.T) {
+	proxyBaseURL := envOrDefaultForTest("KEYCLOAK_E2E_FORWARDING_PROXY_BASE_URL", "http://localhost:8081")
+	keycloakBrowserBaseURL := envOrDefaultForTest("KEYCLOAK_BROWSER_BASE_URL", "http://localhost:8180")
+	redirectURI := envOrDefaultForTest("KEYCLOAK_E2E_REDIRECT_URI", "http://127.0.0.1:8765/callback")
+
+	client := newE2EClient(t)
+	// The forwarding proxy only runs under the compose "forwarding"
+	// profile. CI sets the variable, so its absence fails there.
+	if os.Getenv("KEYCLOAK_E2E_FORWARDING_PROXY_BASE_URL") == "" {
+		resp, err := client.Get(proxyBaseURL + "/healthz")
+		if err != nil {
+			t.Skipf("forwarding proxy not reachable at %s (start the stack with --profile forwarding): %v", proxyBaseURL, err)
+		}
+		_ = resp.Body.Close()
+	}
+	requireHealthy(t, client, proxyBaseURL)
+	registeredClientID := registerE2EClient(t, client, proxyBaseURL, redirectURI)
+	codeVerifier := "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+	internalCode := authorizeViaKeycloak(t, client, proxyBaseURL, keycloakBrowserBaseURL, registeredClientID, redirectURI, codeVerifier)
+	accessToken, refreshToken := exchangeCodeForTokens(t, client, proxyBaseURL, registeredClientID, redirectURI, internalCode, codeVerifier)
+
+	previous := ""
+	for round := range 3 {
+		forwarded := forwardedUpstreamToken(t, client, proxyBaseURL, accessToken)
+		if forwarded == accessToken {
+			t.Fatalf("round %d: the upstream received the proxy token", round)
+		}
+		if forwarded == previous {
+			t.Fatalf("round %d: the refresh did not renew the forwarded token at Keycloak", round)
+		}
+		previous = forwarded
+		if round < 2 {
+			accessToken, refreshToken = refreshForTokens(t, client, proxyBaseURL, registeredClientID, refreshToken)
+		}
+	}
+}
+
+// forwardedUpstreamToken calls the MCP mount and returns the bearer the
+// header-echo upstream received, after checking it is a Keycloak access
+// token for the upstream audience, issued to the forwarding client, for
+// the user the proxy names in X-User-Sub.
+func forwardedUpstreamToken(t *testing.T, client *http.Client, proxyBaseURL, accessToken string) string {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, proxyBaseURL+"/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`))
+	if err != nil {
+		t.Fatalf("build MCP request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("POST /mcp: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /mcp: got %d, want 200: %s", resp.StatusCode, readSnippet(resp.Body))
+	}
+	var echo struct {
+		Authorization string `json:"authorization"`
+		XUserSub      string `json:"x_user_sub"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&echo); err != nil {
+		t.Fatalf("decode header-echo response: %v", err)
+	}
+	bearer, ok := strings.CutPrefix(echo.Authorization, "Bearer ")
+	if !ok || bearer == "" {
+		t.Fatalf("upstream Authorization = %q, want a Bearer token", echo.Authorization)
+	}
+
+	parts := strings.Split(bearer, ".")
+	if len(parts) != 3 {
+		t.Fatalf("forwarded token is not a JWT (%d segments)", len(parts))
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatalf("decode forwarded token payload: %v", err)
+	}
+	var claims struct {
+		Iss string          `json:"iss"`
+		Aud json.RawMessage `json:"aud"`
+		Azp string          `json:"azp"`
+		Sub string          `json:"sub"`
+		Exp int64           `json:"exp"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		t.Fatalf("parse forwarded token claims: %v", err)
+	}
+	if !strings.HasSuffix(claims.Iss, "/realms/mcp-demo") {
+		t.Errorf("forwarded token iss = %q, want the demo realm", claims.Iss)
+	}
+	if !audienceContains(claims.Aud, "mcp-upstream") {
+		t.Errorf("forwarded token aud = %s, want it to include mcp-upstream", claims.Aud)
+	}
+	if claims.Azp != "mcp-auth-proxy-forwarding" {
+		t.Errorf("forwarded token azp = %q, want mcp-auth-proxy-forwarding", claims.Azp)
+	}
+	if claims.Sub == "" || claims.Sub != echo.XUserSub {
+		t.Errorf("forwarded token sub = %q, X-User-Sub = %q, want the same user", claims.Sub, echo.XUserSub)
+	}
+	if time.Unix(claims.Exp, 0).Before(time.Now()) {
+		t.Errorf("forwarded token already expired at %v", time.Unix(claims.Exp, 0))
+	}
+	return bearer
+}
+
+func audienceContains(raw json.RawMessage, want string) bool {
+	var one string
+	if json.Unmarshal(raw, &one) == nil {
+		return one == want
+	}
+	var many []string
+	if json.Unmarshal(raw, &many) == nil {
+		return slices.Contains(many, want)
+	}
+	return false
+}
+
+// refreshForTokens runs a refresh grant and returns the new access and
+// refresh tokens.
+func refreshForTokens(t *testing.T, client *http.Client, proxyBaseURL, registeredClientID, refreshToken string) (string, string) {
+	t.Helper()
+	resp := postRefresh(t, client, proxyBaseURL, registeredClientID, refreshToken)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("refresh: want 200, got %d: %s", resp.StatusCode, readSnippet(resp.Body))
+	}
+	var tokenResp struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+		t.Fatalf("decode refresh: %v", err)
+	}
+	return tokenResp.AccessToken, tokenResp.RefreshToken
 }

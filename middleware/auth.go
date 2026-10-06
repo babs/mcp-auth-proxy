@@ -23,6 +23,10 @@ const (
 	ContextRPCMethod contextKey = "rpc_method" // JSON-RPC method from request body
 	ContextRPCTool   contextKey = "rpc_tool"   // params.name for tools/call
 	ContextRPCID     contextKey = "rpc_id"     // request id (number|string, raw JSON)
+	// ContextIdPAccessToken carries the user's IdP access token to the
+	// reverse proxy in upstream IdP token forwarding mode. Set only when
+	// forwarding is on.
+	ContextIdPAccessToken contextKey = "idp_access_token"
 )
 
 // Auth validates Bearer tokens on proxied MCP routes.
@@ -47,6 +51,10 @@ type Auth struct {
 	// before the field existed accepted during a rolling deploy.
 	expectedResource string
 	revokeBefore     time.Time // tokens with iat before this are rejected (zero = disabled)
+	// forwardIdPToken (UPSTREAM_FORWARD_IDP_TOKEN) requires every access
+	// token to carry an IdP access token and hands it to the reverse
+	// proxy through ContextIdPAccessToken.
+	forwardIdPToken bool
 }
 
 // NewAuth builds the bearer-token middleware.
@@ -79,6 +87,14 @@ func NewAuth(tm *token.Manager, logger *zap.Logger, baseURL, protectedResourcePa
 		expectedResource:      expected,
 		revokeBefore:          revokeBefore,
 	}
+}
+
+// SetForwardIdPToken switches on upstream IdP token forwarding. Call
+// during startup only. When on, an access token without an IdP token is
+// refused (invalid_token) rather than reaching the upstream without a
+// credential; when off, an IdP token in a claim is never passed on.
+func (a *Auth) SetForwardIdPToken(on bool) {
+	a.forwardIdPToken = on
 }
 
 // bearerPrefix is used for a case-insensitive match on the auth scheme,
@@ -171,9 +187,19 @@ func (a *Auth) Validate(next http.Handler) http.Handler {
 			return
 		}
 
+		if a.forwardIdPToken && claims.IdPAccessToken == "" {
+			a.logger.Debug("token_idp_token_missing", zap.String("subject", claims.Subject))
+			metrics.AccessDenied.WithLabelValues("idp_token_missing").Inc()
+			a.writeAuthError(w, "invalid_token")
+			return
+		}
+
 		ctx := context.WithValue(r.Context(), ContextSubject, claims.Subject)
 		ctx = context.WithValue(ctx, ContextEmail, claims.Email)
 		ctx = context.WithValue(ctx, ContextGroups, claims.Groups)
+		if a.forwardIdPToken {
+			ctx = context.WithValue(ctx, ContextIdPAccessToken, claims.IdPAccessToken)
+		}
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }

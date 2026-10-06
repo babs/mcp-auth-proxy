@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/babs/mcp-auth-proxy/metrics"
 	"github.com/babs/mcp-auth-proxy/middleware"
 	"go.uber.org/zap"
 )
@@ -106,14 +107,34 @@ func normalizedHostPort(u *url.URL) string {
 // Python MCP backends (FastAPI/Starlette) redirect /mcp → /mcp/ with 307.
 // MCP clients can't follow 307 on POST per HTTP spec, so the proxy handles it.
 //
-// upstreamAuthorization mirrors Config.UpstreamAuthorization so each
-// redirect hop re-applies the operator-configured Authorization after
-// sanitizeRequestHeaders runs (sanitize does not strip Authorization
-// today, but re-applying keeps the Director and the redirect hop on
-// identical header shapes regardless of future sanitize changes).
+// upstreamAuthorization and forwardIdPToken mirror the Config fields so
+// each redirect hop re-applies the upstream Authorization after
+// sanitizeRequestHeaders strips it, keeping the first hop and every
+// redirect hop on identical header shapes. The forwarded IdP token is
+// read from the request context, which req.Clone carries across hops.
 type redirectFollowingTransport struct {
 	base                  http.RoundTripper
 	upstreamAuthorization string
+	forwardIdPToken       bool
+}
+
+// applyUpstreamAuthorization sets the upstream Authorization header
+// after sanitizeRequestHeaders has stripped the client's. Exactly one
+// source owns it (config refuses both): the user's IdP access token in
+// forwarding mode, else the operator's static value, else none. Shared
+// by the first hop and every redirect hop so they cannot drift.
+func applyUpstreamAuthorization(req *http.Request, forwardIdPToken bool, static string) bool {
+	if forwardIdPToken {
+		if tok, ok := req.Context().Value(middleware.ContextIdPAccessToken).(string); ok && tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
+			return true
+		}
+		return false
+	}
+	if static != "" {
+		req.Header.Set("Authorization", static)
+	}
+	return false
 }
 
 func (t *redirectFollowingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -214,15 +235,8 @@ func (t *redirectFollowingTransport) RoundTrip(req *http.Request) (*http.Respons
 		// transitions via redirect chains (H9).
 		sanitizeRequestHeaders(req)
 		injectIdentityHeaders(req)
-		// Re-apply the operator-configured upstream Authorization on
-		// every hop. The Director's Del("Authorization") + Set pair
-		// runs only on the first hop; without this, a future change
-		// to sanitizeRequestHeaders that starts stripping
-		// Authorization would silently drop the upstream credential
-		// on redirect.
-		if t.upstreamAuthorization != "" {
-			req.Header.Set("Authorization", t.upstreamAuthorization)
-		}
+		// sanitizeRequestHeaders just stripped Authorization: re-apply.
+		applyUpstreamAuthorization(req, t.forwardIdPToken, t.upstreamAuthorization)
 		if bodyBytes != nil {
 			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 			req.ContentLength = int64(len(bodyBytes))
@@ -266,6 +280,15 @@ type Config struct {
 	// request un-authenticated at the HTTP layer and must rely on the
 	// proxy-injected X-User-* identity headers.
 	UpstreamAuthorization string
+
+	// ForwardIdPToken (UPSTREAM_FORWARD_IDP_TOKEN) sets the user's IdP
+	// access token, handed over by the auth middleware, as
+	// `Authorization: Bearer` on every request and redirect hop to the
+	// upstream. Mutually exclusive with UpstreamAuthorization (config
+	// refuses both). The client's proxy token is still stripped: what
+	// the upstream receives is a different token, issued by the IdP for
+	// the upstream's own audience.
+	ForwardIdPToken bool
 
 	// ResponseHeaderTimeoutOverride, when non-zero, replaces the
 	// 30s upstreamResponseHeaderTimeout default. Test-only knob —
@@ -329,12 +352,12 @@ func Handler(upstreamURL string, logger *zap.Logger, cfg Config) (http.Handler, 
 			// UPSTREAM_AUTHORIZATION injection below so the operator-
 			// configured value is not accidentally clobbered.
 			pr.Out.Header.Del("Authorization")
-			if cfg.UpstreamAuthorization != "" {
-				pr.Out.Header.Set("Authorization", cfg.UpstreamAuthorization)
+			if applyUpstreamAuthorization(pr.Out, cfg.ForwardIdPToken, cfg.UpstreamAuthorization) {
+				metrics.UpstreamIdPTokenForwarded.Inc()
 			}
 		},
 		// Python backends redirect /mcp → /mcp/ with 307; follow it server-side
-		Transport:     &redirectFollowingTransport{base: baseTransport, upstreamAuthorization: cfg.UpstreamAuthorization},
+		Transport:     &redirectFollowingTransport{base: baseTransport, upstreamAuthorization: cfg.UpstreamAuthorization, forwardIdPToken: cfg.ForwardIdPToken},
 		FlushInterval: -1, // Immediate flush for SSE/streaming
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			logger.Error("proxy_error", zap.Error(err))

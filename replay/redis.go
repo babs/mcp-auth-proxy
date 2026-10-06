@@ -191,6 +191,14 @@ func (s *RedisStore) ClaimOrCheckFamily(ctx context.Context, familyKey, claimKey
 	return revoked == 1, race == 1, claimed == 1, nil
 }
 
+// Release deletes a claim key (DEL); a missing key is not an error.
+func (s *RedisStore) Release(ctx context.Context, key string) error {
+	if err := s.client.Del(ctx, s.k(key)).Err(); err != nil {
+		return fmt.Errorf("redis del: %w", err)
+	}
+	return nil
+}
+
 // Close releases the underlying Redis connection pool.
 func (s *RedisStore) Close() error {
 	return s.client.Close()

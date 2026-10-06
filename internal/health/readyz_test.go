@@ -32,7 +32,8 @@ func (f *fakeStore) Exists(_ context.Context, _ string) (bool, error) {
 func (f *fakeStore) ClaimOrCheckFamily(_ context.Context, _, _ string, _, _, _ time.Duration) (bool, bool, bool, error) {
 	return false, false, false, nil
 }
-func (f *fakeStore) Close() error { return nil }
+func (f *fakeStore) Release(context.Context, string) error { return nil }
+func (f *fakeStore) Close() error                          { return nil }
 
 // Compile-time check that fakeStore satisfies replay.Store.
 var _ replay.Store = (*fakeStore)(nil)

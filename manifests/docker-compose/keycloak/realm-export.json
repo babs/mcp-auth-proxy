@@ -50,6 +50,51 @@
           }
         }
       ]
+    },
+    {
+      "clientId": "mcp-auth-proxy-forwarding",
+      "name": "MCP Auth Proxy (upstream IdP token forwarding)",
+      "description": "OIDC confidential client for the forwarding-mode proxy (compose profile 'forwarding') — DEMO ONLY",
+      "enabled": true,
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "changeme-DEMO-ONLY",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "http://localhost:8081/callback"
+      ],
+      "webOrigins": [
+        "http://localhost:8081"
+      ],
+      "protocolMappers": [
+        {
+          "name": "groups",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-group-membership-mapper",
+          "consentRequired": false,
+          "config": {
+            "full.path": "false",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "groups",
+            "userinfo.token.claim": "false"
+          }
+        },
+        {
+          "name": "upstream-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.custom.audience": "mcp-upstream",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
     }
   ],
   "groups": [
@@ -74,6 +119,9 @@
       ],
       "groups": [
         "/demo-users"
+      ],
+      "realmRoles": [
+        "offline_access"
       ]
     }
   ]

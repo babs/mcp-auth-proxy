@@ -1,11 +1,14 @@
 package handlers
 
 import (
+	"cmp"
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/babs/mcp-auth-proxy/metrics"
@@ -13,6 +16,7 @@ import (
 	"github.com/babs/mcp-auth-proxy/token"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -33,7 +37,33 @@ type TokenConfig struct {
 	// Outside the window the prior strict "every collision revokes"
 	// behavior applies. Set to 0 to disable.
 	RefreshRaceGrace time.Duration
+
+	// ForwardIdPToken (UPSTREAM_FORWARD_IDP_TOKEN) mints access tokens
+	// that carry the user's IdP access token, obtained by redeeming the
+	// IdP refresh token sealed in the code or refresh token. Requires
+	// IdPRefresher.
+	ForwardIdPToken bool
+	// IdPRefresher redeems IdP refresh tokens in forwarding mode.
+	IdPRefresher *IdPRefresher
+	// IdPExchangeLimiter throttles the IdP refresh calls; the same
+	// bucket as /callback, so IDP_EXCHANGE_* bounds every proxy → IdP
+	// token-endpoint call. nil = unthrottled.
+	IdPExchangeLimiter *rate.Limiter
+	// VerifyIDToken verifies the id_token the IdP returns on a refresh
+	// in forwarding mode (same verifier as /callback). Required when
+	// ForwardIdPToken is set.
+	VerifyIDToken verifyIDTokenFunc
+	// GroupsClaim and AllowedGroups mirror CallbackConfig: a verified
+	// refresh id_token re-applies the same identity policy as sign-in.
+	GroupsClaim   string
+	AllowedGroups []string
 }
+
+// idpClaimReleaseTimeout bounds the release of a single-use claim after
+// a transient IdP failure. Detached from the request context: a client
+// that hung up mid-refresh still deserves a retry that is not read as
+// a replay.
+const idpClaimReleaseTimeout = 2 * time.Second
 
 // audience binds issued tokens to a specific proxy deployment; revokeBefore
 // is the bulk-revocation cutoff applied to refresh tokens (the access-token
@@ -43,6 +73,11 @@ type TokenConfig struct {
 // retains stateless behavior (codes/refresh tokens unique, audience-bound
 // and expiry-checked but not single-use).
 func Token(tm *token.Manager, logger *zap.Logger, audience string, revokeBefore time.Time, replayStore replay.Store, cfg TokenConfig, resourceURIs ...string) http.HandlerFunc {
+	if cfg.ForwardIdPToken && (cfg.IdPRefresher == nil || cfg.VerifyIDToken == nil) {
+		// Wiring bug, not a runtime condition: fail at startup instead
+		// of answering every grant with a nil dereference.
+		panic("handlers.Token: ForwardIdPToken requires an IdPRefresher and a VerifyIDToken")
+	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 
@@ -118,16 +153,16 @@ func Token(tm *token.Manager, logger *zap.Logger, audience string, revokeBefore 
 
 		switch grantType {
 		case "authorization_code":
-			handleAuthorizationCode(w, r, tm, logger, audience, replayStore)
+			handleAuthorizationCode(w, r, tm, logger, audience, replayStore, cfg)
 		case "refresh_token":
-			handleRefreshToken(w, r, tm, logger, audience, revokeBefore, replayStore, cfg.RefreshRaceGrace)
+			handleRefreshToken(w, r, tm, logger, audience, revokeBefore, replayStore, cfg)
 		default:
 			writeOAuthError(w, r, http.StatusBadRequest, "unsupported_grant_type", "grant_type must be authorization_code or refresh_token")
 		}
 	}
 }
 
-func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.Manager, logger *zap.Logger, audience string, replayStore replay.Store) {
+func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.Manager, logger *zap.Logger, audience string, replayStore replay.Store, cfg TokenConfig) {
 	codeStr := r.FormValue("code")
 	redirectURI := r.FormValue("redirect_uri")
 	clientIDStr := r.FormValue("client_id")
@@ -222,15 +257,24 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 		return
 	}
 
+	// A code minted before forwarding was switched on carries no IdP
+	// refresh token: nothing to forward, the user signs in again.
+	// Checked before the single-use claim, so it burns nothing.
+	if cfg.ForwardIdPToken && code.IdPRefreshToken == "" {
+		metrics.AccessDenied.WithLabelValues("idp_token_missing").Inc()
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "authorization code carries no identity provider token", codeIdPTokenMissing)
+		return
+	}
+
 	// Enforce single-use (RFC 6749 §4.1.2). The claim happens AFTER all other
 	// validations so that a malformed retry by the legitimate client does not
 	// burn the code. Claim TTL matches the remaining code lifetime so the
 	// record expires naturally once replay is no longer possible. TokenID is
 	// guaranteed non-empty by the upfront check above.
+	claimKey := replay.NamespacedKey("authz_code", code.TokenID)
 	if replayStore != nil {
 		remaining := max(time.Until(code.ExpiresAt), time.Second)
-		key := replay.NamespacedKey("authz_code", code.TokenID)
-		if err := replayStore.ClaimOnce(r.Context(), key, remaining); err != nil {
+		if err := replayStore.ClaimOnce(r.Context(), claimKey, remaining); err != nil {
 			if errors.Is(err, replay.ErrAlreadyClaimed) {
 				// RFC 6749 §4.1.2: "If an authorization code is used
 				// more than once, the authorization server MUST deny
@@ -273,10 +317,16 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 		}
 	}
 
-	accessToken, _, err := tm.Issue(audience, code.Subject, code.Email, client.ID, code.Groups, accessTokenTTL, code.Resource)
+	tokens, ok := redeemIdPRefresh(w, r, cfg, logger, replayStore, claimKey, code.IdPRefreshToken, code.Subject, client.ID)
+	if !ok {
+		return
+	}
+	idp, idpRefreshToken := tokens.forSealing(code.IdPRefreshToken)
+
+	accessToken, claims, err := issueAccessToken(tm, cfg.ForwardIdPToken, audience, code.Subject, code.Email, client.ID, code.Groups, code.Resource, idp)
 	if err != nil {
 		logger.Error("token_issue_failed", zap.Error(err))
-		writeOAuthError(w, r, http.StatusInternalServerError, "server_error", "failed to issue token", codeTokenIssueFailed)
+		writeIssueFailure(w, r, cfg.ForwardIdPToken)
 		return
 	}
 
@@ -305,13 +355,14 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 		// compared against this stamp so a steadily rotating
 		// attacker cannot outlive a bulk revocation by pushing
 		// IssuedAt forward on every refresh.
-		FamilyIssuedAt: now,
-		ExpiresAt:      now.Add(refreshTokenTTL),
+		FamilyIssuedAt:  now,
+		ExpiresAt:       now.Add(refreshTokenTTL),
+		IdPRefreshToken: idpRefreshToken,
 	}
-	refreshToken, err := tm.SealJSON(refresh, token.PurposeRefresh)
+	refreshToken, err := sealRefreshToken(tm, cfg.ForwardIdPToken, refresh)
 	if err != nil {
 		logger.Error("refresh_token_seal_failed", zap.Error(err))
-		writeOAuthError(w, r, http.StatusInternalServerError, "server_error", "internal error")
+		writeRefreshSealFailure(w, r, cfg.ForwardIdPToken)
 		return
 	}
 
@@ -324,12 +375,12 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 	writeJSON(w, http.StatusOK, map[string]any{
 		"access_token":  accessToken,
 		"token_type":    "Bearer",
-		"expires_in":    int(accessTokenTTL.Seconds()),
+		"expires_in":    expiresIn(claims, cfg.ForwardIdPToken),
 		"refresh_token": refreshToken,
 	})
 }
 
-func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manager, logger *zap.Logger, audience string, revokeBefore time.Time, replayStore replay.Store, refreshRaceGrace time.Duration) {
+func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manager, logger *zap.Logger, audience string, revokeBefore time.Time, replayStore replay.Store, cfg TokenConfig) {
 	refreshTokenStr := r.FormValue("refresh_token")
 	clientIDStr := r.FormValue("client_id")
 
@@ -408,6 +459,15 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 		return
 	}
 
+	// A refresh token minted before forwarding was switched on carries
+	// no IdP refresh token: nothing to renew, the user signs in again.
+	// Checked before the single-use claim, so it burns nothing.
+	if cfg.ForwardIdPToken && refresh.IdPRefreshToken == "" {
+		metrics.AccessDenied.WithLabelValues("idp_token_missing").Inc()
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "refresh token carries no identity provider token", codeIdPTokenMissing)
+		return
+	}
+
 	// Refresh rotation with reuse detection (RFC 6749 §10.4 / OAuth 2.1 §6.1).
 	// Only active when a replay store is wired — the stateless fallback keeps
 	// the original behavior (rotation without reuse detection).
@@ -420,9 +480,9 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 	//   2. TokenID single-use → a refresh already rotated once (legitimately)
 	//      cannot be rotated again. A second claim on the same TokenID is the
 	//      signal that the token was leaked.
+	claimKey := replay.NamespacedKey("refresh", refresh.TokenID)
 	if replayStore != nil {
 		familyKey := replay.NamespacedKey("refresh_family_revoked", refresh.FamilyID)
-		claimKey := replay.NamespacedKey("refresh", refresh.TokenID)
 		claimTTL := max(time.Until(refresh.ExpiresAt), time.Second)
 		// ClaimOrCheckFamily runs check + claim + on-reuse-revocation
 		// as a single linearizable operation. When alreadyClaimed is
@@ -430,7 +490,7 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 		// store; the handler does not need (and must not attempt) a
 		// separate Mark — doing so would reintroduce the fail-open
 		// path a client cancel could cut short.
-		revoked, racing, alreadyClaimed, err := replayStore.ClaimOrCheckFamily(r.Context(), familyKey, claimKey, claimTTL, refreshTokenTTL, refreshRaceGrace)
+		revoked, racing, alreadyClaimed, err := replayStore.ClaimOrCheckFamily(r.Context(), familyKey, claimKey, claimTTL, refreshTokenTTL, cfg.RefreshRaceGrace)
 		if err != nil {
 			logger.Error("replay_store_error", zap.String("op", "claim_refresh_family"), zap.Error(err))
 			metrics.AccessDenied.WithLabelValues("replay_store_unavailable").Inc()
@@ -491,10 +551,25 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 		}
 	}
 
-	accessToken, _, err := tm.Issue(audience, refresh.Subject, refresh.Email, client.ID, refresh.Groups, accessTokenTTL, refresh.Resource)
+	// Forwarding mode renews the IdP tokens on every rotation. It runs
+	// after the cutoff, family and reuse checks above, so a revoked or
+	// replayed refresh token never reaches the IdP.
+	email, groups := refresh.Email, refresh.Groups
+	tokens, ok := redeemIdPRefresh(w, r, cfg, logger, replayStore, claimKey, refresh.IdPRefreshToken, refresh.Subject, client.ID)
+	if !ok {
+		return
+	}
+	if tokens != nil {
+		if email, groups, ok = refreshIdentity(w, r, cfg, logger, tokens.IDToken, &refresh); !ok {
+			return
+		}
+	}
+	idp, idpRefreshToken := tokens.forSealing(refresh.IdPRefreshToken)
+
+	accessToken, claims, err := issueAccessToken(tm, cfg.ForwardIdPToken, audience, refresh.Subject, email, client.ID, groups, refresh.Resource, idp)
 	if err != nil {
 		logger.Error("token_refresh_issue_failed", zap.Error(err))
-		writeOAuthError(w, r, http.StatusInternalServerError, "server_error", "failed to issue token", codeTokenIssueFailed)
+		writeIssueFailure(w, r, cfg.ForwardIdPToken)
 		return
 	}
 
@@ -512,23 +587,24 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 		familyIssuedAt = refresh.IssuedAt
 	}
 	newRefresh := sealedRefresh{
-		TokenID:        uuid.New().String(),
-		FamilyID:       refresh.FamilyID,
-		Subject:        refresh.Subject,
-		Email:          refresh.Email,
-		Groups:         refresh.Groups,
-		ClientID:       client.ID,
-		Typ:            token.PurposeRefresh,
-		Audience:       audience,
-		Resource:       refresh.Resource,
-		IssuedAt:       now,
-		FamilyIssuedAt: familyIssuedAt,
-		ExpiresAt:      now.Add(refreshTokenTTL),
+		TokenID:         uuid.New().String(),
+		FamilyID:        refresh.FamilyID,
+		Subject:         refresh.Subject,
+		Email:           email,
+		Groups:          groups,
+		ClientID:        client.ID,
+		Typ:             token.PurposeRefresh,
+		Audience:        audience,
+		Resource:        refresh.Resource,
+		IssuedAt:        now,
+		FamilyIssuedAt:  familyIssuedAt,
+		ExpiresAt:       now.Add(refreshTokenTTL),
+		IdPRefreshToken: idpRefreshToken,
 	}
-	newRefreshToken, err := tm.SealJSON(newRefresh, token.PurposeRefresh)
+	newRefreshToken, err := sealRefreshToken(tm, cfg.ForwardIdPToken, newRefresh)
 	if err != nil {
 		logger.Error("refresh_token_reseal_failed", zap.Error(err))
-		writeOAuthError(w, r, http.StatusInternalServerError, "server_error", "internal error")
+		writeRefreshSealFailure(w, r, cfg.ForwardIdPToken)
 		return
 	}
 
@@ -541,7 +617,7 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 	writeJSON(w, http.StatusOK, map[string]any{
 		"access_token":  accessToken,
 		"token_type":    "Bearer",
-		"expires_in":    int(accessTokenTTL.Seconds()),
+		"expires_in":    expiresIn(claims, cfg.ForwardIdPToken),
 		"refresh_token": newRefreshToken,
 	})
 }
@@ -577,4 +653,208 @@ func validPKCEValue(s string) bool {
 		}
 	}
 	return true
+}
+
+// issueAccessToken mints the access token for either mode. Forwarding
+// mode seals the IdP access token in and may shorten the lifetime to
+// the IdP token's own.
+func issueAccessToken(tm *token.Manager, forward bool, audience, subject, email, clientID string, groups []string, resource string, idp token.IdPToken) (string, *token.Claims, error) {
+	if forward {
+		return tm.IssueWithIdPToken(audience, subject, email, clientID, groups, accessTokenTTL, resource, idp)
+	}
+	return tm.Issue(audience, subject, email, clientID, groups, accessTokenTTL, resource)
+}
+
+// writeIssueFailure answers a failure to mint tokens. In forwarding mode
+// the IdP refresh token is already redeemed, so the client's token is
+// dead: 400 invalid_grant, because a 5xx would invite a retry that reads
+// as a replay.
+func writeIssueFailure(w http.ResponseWriter, r *http.Request, forward bool) {
+	if forward {
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "failed to issue token; sign in again", codeTokenIssueFailed)
+		return
+	}
+	writeOAuthError(w, r, http.StatusInternalServerError, "server_error", "failed to issue token", codeTokenIssueFailed)
+}
+
+// sealRefreshToken seals a refresh token. In forwarding mode it refuses one
+// that would not pass its own open() cap: it could never be redeemed.
+func sealRefreshToken(tm *token.Manager, forward bool, sr sealedRefresh) (string, error) {
+	sealed, err := tm.SealJSON(sr, token.PurposeRefresh)
+	if err == nil && forward && !tm.FitsOpenCap(sealed, token.PurposeRefresh) {
+		err = token.ErrSealedTooLarge
+	}
+	return sealed, err
+}
+
+// writeRefreshSealFailure answers a refresh token that could not be
+// sealed. Default mode keeps its 500 without an error_code.
+func writeRefreshSealFailure(w http.ResponseWriter, r *http.Request, forward bool) {
+	if forward {
+		writeIssueFailure(w, r, true)
+		return
+	}
+	writeOAuthError(w, r, http.StatusInternalServerError, "server_error", "internal error")
+}
+
+// expiresIn is the token response's expires_in. Forwarding mode reports
+// the real remaining lifetime, rounded down.
+func expiresIn(claims *token.Claims, forward bool) int {
+	if !forward {
+		return int(accessTokenTTL.Seconds())
+	}
+	return max(int(time.Until(claims.ExpiresAt).Seconds()), 0)
+}
+
+// idpRetryAfterMax caps a Retry-After taken from the IdP.
+const idpRetryAfterMax = 120 * time.Second
+
+// redeemIdPRefresh redeems an IdP refresh token and, on failure, writes
+// the response itself. With forwarding off it does nothing: (nil, true). It must run AFTER the single-use claim named by
+// claimKey, so a replayed token never reaches the IdP or its bucket.
+//
+// Throttled and unavailable release the claim (503 + Retry-After, the
+// client retries the same token; 400 if the release fails). Rejected and
+// failed keep it spent (400 invalid_grant).
+func redeemIdPRefresh(w http.ResponseWriter, r *http.Request, cfg TokenConfig, logger *zap.Logger, store replay.Store, claimKey, idpRefreshToken, subject, clientID string) (*idpTokens, bool) {
+	if !cfg.ForwardIdPToken {
+		return nil, true
+	}
+	if cfg.IdPExchangeLimiter != nil && !cfg.IdPExchangeLimiter.Allow() {
+		metrics.IdPExchangeThrottled.Inc()
+		metrics.IdPRefresh.WithLabelValues("throttled").Inc()
+		logger.Warn("idp_refresh_throttled", zap.String("client_id", clientID))
+		if releaseForRetry(r, store, claimKey, logger, "idp_refresh_throttled") {
+			retryAfterIdPExchange(w.Header())
+			writeOAuthError(w, r, http.StatusServiceUnavailable, "temporarily_unavailable", "upstream IdP exchange throttled; retry shortly", codeIdPExchangeThrottled)
+		} else {
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "upstream IdP exchange throttled; sign in again", codeIdPExchangeThrottled)
+		}
+		return nil, false
+	}
+
+	tokens, err := cfg.IdPRefresher.Refresh(r.Context(), idpRefreshToken)
+	if err == nil {
+		metrics.IdPRefresh.WithLabelValues("ok").Inc()
+		return tokens, true
+	}
+	var re *idpRefreshError
+	if !errors.As(err, &re) {
+		re = &idpRefreshError{Kind: idpRefreshUnavailable, Err: err}
+	}
+	metrics.IdPRefresh.WithLabelValues(re.Kind.String()).Inc()
+	fields := []zap.Field{zap.String("subject", subject), zap.String("client_id", clientID), zap.Error(err)}
+
+	switch re.Kind {
+	case idpRefreshRejected:
+		logger.Warn("idp_refresh_rejected", fields...)
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "identity provider rejected the refresh token", codeIdPRefreshRejected)
+	case idpRefreshFailed:
+		logger.Error("idp_refresh_failed", fields...)
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "identity provider returned an unusable token response", codeIdPRefreshFailed)
+	default:
+		logger.Error("idp_refresh_unavailable", fields...)
+		if releaseForRetry(r, store, claimKey, logger, "idp_refresh_unavailable") {
+			retryAfterIdPExchange(w.Header())
+			// Only ever lengthens the jittered 2-4 s default.
+			if d := min(re.RetryAfter, idpRetryAfterMax); d > 4*time.Second {
+				w.Header().Set("Retry-After", strconv.Itoa(int(d.Seconds())))
+			}
+			writeOAuthError(w, r, http.StatusServiceUnavailable, "temporarily_unavailable", "identity provider unavailable; retry shortly", codeIdPRefreshUnavailable)
+		} else {
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "identity provider unavailable; sign in again", codeIdPRefreshUnavailable)
+		}
+	}
+	return nil, false
+}
+
+// releaseForRetry gives the single-use claim back after a transient
+// failure, before anything was issued, and reports whether the client
+// may retry with the same token. Detached from the request context: a
+// client that hung up still needs its retry not to read as a replay.
+func releaseForRetry(r *http.Request, store replay.Store, claimKey string, logger *zap.Logger, op string) bool {
+	if store == nil {
+		return true
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), idpClaimReleaseTimeout)
+	defer cancel()
+	if err := store.Release(ctx, claimKey); err != nil {
+		logger.Error("replay_claim_release_failed", zap.String("op", op), zap.Error(err))
+		return false
+	}
+	return true
+}
+
+// refreshIdentity re-applies the sign-in policy to the id_token the IdP
+// returned on a forwarding-mode refresh and returns the email and groups
+// the new tokens carry. On a refusal it writes the response and ok is
+// false.
+//
+// Only an ABSENT id_token keeps the previous email and groups. One that
+// is present but unverifiable is refused: keeping the old groups there
+// would let a removed user ride out an IdP key or clock problem.
+func refreshIdentity(w http.ResponseWriter, r *http.Request, cfg TokenConfig, logger *zap.Logger, rawIDToken string, prev *sealedRefresh) (email string, groups []string, ok bool) {
+	if rawIDToken == "" {
+		logger.Warn("idp_refresh_id_token_missing",
+			zap.String("subject", prev.Subject),
+			zap.String("hint", "identity not re-checked on this refresh; previous email and groups kept"),
+		)
+		return prev.Email, prev.Groups, true
+	}
+	// Detached and bounded: the IdP has already rotated its refresh
+	// token, and a JWKS fetch must not hang on the client's patience.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), oidcExchangeTTL)
+	defer cancel()
+	var claims struct {
+		Email         string `json:"email"`
+		EmailVerified *bool  `json:"email_verified"`
+	}
+	idToken, err := cfg.VerifyIDToken(ctx, rawIDToken)
+	if err == nil {
+		err = idToken.Claims(&claims)
+	}
+	if err != nil {
+		metrics.AccessDenied.WithLabelValues("id_token_verification_failed").Inc()
+		logger.Warn("idp_refresh_id_token_unverified", zap.String("subject", prev.Subject), zap.Error(err))
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "refreshed id_token failed verification", codeIDTokenVerificationFailed)
+		return "", nil, false
+	}
+	if idToken.Subject != prev.Subject {
+		metrics.AccessDenied.WithLabelValues("id_token_verification_failed").Inc()
+		logger.Warn("idp_refresh_subject_mismatch",
+			zap.String("subject", prev.Subject),
+			zap.String("id_token_subject", idToken.Subject),
+		)
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "refreshed id_token names a different subject", codeIDTokenVerificationFailed)
+		return "", nil, false
+	}
+	groups, hasGroupsClaim, denial := checkIdentityPolicy(idToken, claims.EmailVerified, cfg.GroupsClaim, cfg.AllowedGroups, logger, prev.Subject)
+	if cfg.GroupsClaim != "" && !hasGroupsClaim && denial != denyEmailUnverified {
+		// Read as "no groups", as at /callback. Logged apart so an IdP
+		// that trims claims on refresh is told from a real group removal.
+		logger.Warn("idp_refresh_groups_claim_missing",
+			zap.String("subject", prev.Subject),
+			zap.String("claim", cfg.GroupsClaim),
+		)
+	}
+	switch denial {
+	case denyEmailUnverified:
+		logger.Warn("access_denied_email_unverified", zap.String("subject", prev.Subject))
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "email address is not verified", codeEmailNotVerified)
+		return "", nil, false
+	case denyGroupInvalid:
+		logger.Warn("access_denied_group_invalid", zap.String("subject", prev.Subject))
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "group name contains invalid characters", codeGroupInvalid)
+		return "", nil, false
+	case denyGroup:
+		logger.Warn("access_denied_group",
+			zap.String("subject", prev.Subject),
+			zap.Strings("user_groups", groups),
+			zap.Strings("allowed_groups", cfg.AllowedGroups),
+		)
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "user not in any allowed group", codeGroupNotAllowed)
+		return "", nil, false
+	}
+	// An IdP that trims claims on refresh must not blank X-User-Email.
+	return cmp.Or(claims.Email, prev.Email), groups, true
 }

@@ -245,3 +245,39 @@ func TestMemoryStore_SizeCap_FailsClosed(t *testing.T) {
 		t.Errorf("Mark overwrite at cap should succeed, got %v", err)
 	}
 }
+
+// Release reopens a claim slot: the retry after a transient failure must
+// not read as a replay, and the family must not be touched.
+func TestMemoryStore_Release_ReopensClaim(t *testing.T) {
+	s := NewMemoryStore()
+	defer func() { _ = s.Close() }()
+	ctx := context.Background()
+
+	if err := s.ClaimOnce(ctx, "authz_code:1", time.Minute); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if err := s.Release(ctx, "authz_code:1"); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if err := s.ClaimOnce(ctx, "authz_code:1", time.Minute); err != nil {
+		t.Fatalf("re-claim after release: %v", err)
+	}
+
+	if _, _, _, err := s.ClaimOrCheckFamily(ctx, "fam:1", "refresh:A", time.Minute, time.Hour, 0); err != nil {
+		t.Fatalf("family claim: %v", err)
+	}
+	if err := s.Release(ctx, "refresh:A"); err != nil {
+		t.Fatalf("release refresh claim: %v", err)
+	}
+	revoked, racing, claimed, err := s.ClaimOrCheckFamily(ctx, "fam:1", "refresh:A", time.Minute, time.Hour, 0)
+	if err != nil || revoked || racing || claimed {
+		t.Fatalf("re-claim after release = (revoked=%v racing=%v claimed=%v err=%v), want a fresh claim", revoked, racing, claimed, err)
+	}
+	if ok, _ := s.Exists(ctx, "fam:1"); ok {
+		t.Error("release must not revoke the family")
+	}
+
+	if err := s.Release(ctx, "never-claimed"); err != nil {
+		t.Errorf("releasing an absent key: %v, want nil", err)
+	}
+}

@@ -115,17 +115,19 @@ jobs:
         run: bash manifests/docker-compose/scripts/generate-secrets.sh
 
       - name: start demo stack
-        run: docker compose -f manifests/docker-compose/compose.yaml up -d --build
+        # The forwarding profile adds the UPSTREAM_FORWARD_IDP_TOKEN proxy
+        # on :8081 that TestKeycloakE2E_ForwardsIdPAccessToken drives.
+        run: docker compose -f manifests/docker-compose/compose.yaml --profile forwarding up -d --build
 
       - name: wait for proxy health
         run: |
           for i in {1..60}; do
-            if curl -fs http://localhost:8080/healthz >/dev/null; then
+            if curl -fs http://localhost:8080/healthz >/dev/null && curl -fs http://localhost:8081/healthz >/dev/null; then
               exit 0
             fi
             sleep 2
           done
-          docker compose -f manifests/docker-compose/compose.yaml logs
+          docker compose -f manifests/docker-compose/compose.yaml --profile forwarding logs
           exit 1
 
       - name: go test real Keycloak e2e
@@ -134,15 +136,18 @@ jobs:
         # refresh family revoke, resource mismatch). Adding new
         # negative-path tests does not require a CI workflow change
         # as long as they keep the TestKeycloakE2E_ prefix.
+        env:
+          # Set, so a missing forwarding proxy fails here instead of skipping.
+          KEYCLOAK_E2E_FORWARDING_PROXY_BASE_URL: http://localhost:8081
         run: go test -tags=keycloak_e2e -run "^TestKeycloakE2E" -count=1 -v .
 
       - name: dump compose logs on failure
         if: failure()
-        run: docker compose -f manifests/docker-compose/compose.yaml logs
+        run: docker compose -f manifests/docker-compose/compose.yaml --profile forwarding logs
 
       - name: stop demo stack
         if: always()
-        run: docker compose -f manifests/docker-compose/compose.yaml down -v
+        run: docker compose -f manifests/docker-compose/compose.yaml --profile forwarding down -v
 
   manifest-prod:
     name: manifest-prod
