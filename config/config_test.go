@@ -123,7 +123,6 @@ func TestLoad_Defaults(t *testing.T) {
 
 func TestLoad_TrailingSlashTrimmed(t *testing.T) {
 	setAllRequired(t)
-	t.Setenv("OIDC_ISSUER_URL", "https://issuer.example.com/")
 	t.Setenv("PROXY_BASE_URL", "https://proxy.example.com/")
 
 	cfg, err := Load()
@@ -131,11 +130,32 @@ func TestLoad_TrailingSlashTrimmed(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if cfg.OIDCIssuerURL != "https://issuer.example.com" {
-		t.Errorf("OIDCIssuerURL = %q, want trailing slash trimmed", cfg.OIDCIssuerURL)
-	}
 	if cfg.ProxyBaseURL != "https://proxy.example.com" {
 		t.Errorf("ProxyBaseURL = %q, want trailing slash trimmed", cfg.ProxyBaseURL)
+	}
+}
+
+// Issue #45: go-oidc compares the configured issuer byte-for-byte with
+// the discovery document's, and Authentik publishes its issuer with a
+// trailing slash. Any normalisation here breaks that deployment.
+func TestLoad_OIDCIssuerURL_KeptVerbatim(t *testing.T) {
+	for _, issuer := range []string{
+		"https://issuer.example.com",
+		"https://issuer.example.com/",
+		"https://idp.example.com/application/o/x/",
+		"https://idp.example.com/realms/mcp",
+	} {
+		t.Run(issuer, func(t *testing.T) {
+			setAllRequired(t)
+			t.Setenv("OIDC_ISSUER_URL", issuer)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cfg.OIDCIssuerURL != issuer {
+				t.Errorf("OIDCIssuerURL = %q, want %q (verbatim)", cfg.OIDCIssuerURL, issuer)
+			}
+		})
 	}
 }
 

@@ -14,7 +14,7 @@ secure production posture (`PROD_MODE=true`); flags listed here as
 
 | Variable | Description |
 |---|---|
-| `OIDC_ISSUER_URL` | OIDC issuer auto-discovered via `/.well-known/openid-configuration`. |
+| `OIDC_ISSUER_URL` | OIDC issuer auto-discovered via `/.well-known/openid-configuration`. Used verbatim and must match the `issuer` field of that document byte for byte: Authentik publishes it with a trailing slash, Keycloak and Entra without. |
 | `OIDC_CLIENT_ID` | Client registered on the IdP. |
 | `OIDC_CLIENT_SECRET` | IdP client secret. |
 | `PROXY_BASE_URL` | Public URL of this proxy. Audience-bound into every sealed token — two deployments accidentally sharing `TOKEN_SIGNING_SECRET` but differing on `PROXY_BASE_URL` cannot replay each other's tokens. |

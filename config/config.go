@@ -225,7 +225,9 @@ func Load() (*Config, error) {
 
 	var missing []string
 
-	c.OIDCIssuerURL = strings.TrimRight(os.Getenv("OIDC_ISSUER_URL"), "/")
+	// Kept verbatim: go-oidc requires byte-equality with the discovery
+	// document's issuer, and Authentik publishes it with a trailing slash.
+	c.OIDCIssuerURL = os.Getenv("OIDC_ISSUER_URL")
 	if c.OIDCIssuerURL == "" {
 		missing = append(missing, "OIDC_ISSUER_URL")
 	} else if err := validateOIDCIssuerURL(c.OIDCIssuerURL, allowInsecureOIDCHTTP); err != nil {

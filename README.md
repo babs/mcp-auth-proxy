@@ -143,7 +143,7 @@ production posture.
 
 | Variable | Description |
 |---|---|
-| **`OIDC_ISSUER_URL`** | OIDC issuer (auto-discovered via `/.well-known/openid-configuration`) |
+| **`OIDC_ISSUER_URL`** | OIDC issuer (auto-discovered via `/.well-known/openid-configuration`). Used verbatim and must match the `issuer` field of that document byte for byte: Authentik publishes it with a trailing slash, Keycloak and Entra without. |
 | **`OIDC_CLIENT_ID`** | Client registered on the IdP |
 | **`OIDC_CLIENT_SECRET`** | IdP client secret |
 | **`PROXY_BASE_URL`** | Public URL of this proxy (audience-bound into every sealed token) |
