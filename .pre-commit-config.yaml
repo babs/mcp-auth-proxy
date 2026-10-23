@@ -17,7 +17,7 @@ repos:
       - id: go-mod-tidy
 
   - repo: https://github.com/golangci/golangci-lint
-    rev: v2.13.2
+    rev: v2.15.0
     hooks:
       # -full: the plain hook lints only lines changed since HEAD, so a
       # dependency bump that deprecates an API we call passes locally
