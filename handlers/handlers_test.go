@@ -60,14 +60,22 @@ func pkceChallenge(verifier string) string {
 // and the internal UUID (for seeding test fixtures).
 func registerClient(t *testing.T, tm *token.Manager, redirectURIs []string) (encClientID, internalID string) {
 	t.Helper()
-	body := map[string]any{"redirect_uris": redirectURIs, "client_name": "test-app"}
-	b, _ := json.Marshal(body)
+	return registerClientWith(t, tm, RegisterConfig{ClientTTL: DefaultClientTTL}, redirectURIs)
+}
 
+// newRegisterRequest builds a /register JSON request for redirectURIs.
+func newRegisterRequest(redirectURIs []string) *http.Request {
+	b, _ := json.Marshal(map[string]any{"redirect_uris": redirectURIs, "client_name": "test-app"})
 	req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(string(b)))
 	req.Header.Set("Content-Type", "application/json")
-	rr := httptest.NewRecorder()
+	return req
+}
 
-	Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
+// registerClientWith is registerClient under an explicit RegisterConfig.
+func registerClientWith(t *testing.T, tm *token.Manager, regCfg RegisterConfig, redirectURIs []string) (encClientID, internalID string) {
+	t.Helper()
+	rr := httptest.NewRecorder()
+	Register(tm, zap.NewNop(), testBaseURL, regCfg)(rr, newRegisterRequest(redirectURIs))
 
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("registerClient: expected 201, got %d: %s", rr.Code, rr.Body.String())
@@ -248,7 +256,7 @@ func TestRegister_Success(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 
-	Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
+	Register(tm, zap.NewNop(), testBaseURL, RegisterConfig{ClientTTL: DefaultClientTTL})(rr, req)
 
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %s", rr.Code, rr.Body.String())
@@ -317,7 +325,7 @@ func TestRegister_NeverExpires(t *testing.T) {
 	rr := httptest.NewRecorder()
 
 	// clientTTL = 0 → never expires.
-	Register(tm, zap.NewNop(), testBaseURL, 0)(rr, req)
+	Register(tm, zap.NewNop(), testBaseURL, RegisterConfig{ClientTTL: 0})(rr, req)
 
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %s", rr.Code, rr.Body.String())
@@ -424,7 +432,7 @@ func TestRegister_UnsupportedAuthMethod(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 
-	Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
+	Register(tm, zap.NewNop(), testBaseURL, RegisterConfig{ClientTTL: DefaultClientTTL})(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
@@ -446,7 +454,7 @@ func TestRegister_ExplicitNoneAuthMethod(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 
-	Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
+	Register(tm, zap.NewNop(), testBaseURL, RegisterConfig{ClientTTL: DefaultClientTTL})(rr, req)
 
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %s", rr.Code, rr.Body.String())
@@ -468,7 +476,7 @@ func TestRegister_MissingRedirectURIs(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 
-	Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
+	Register(tm, zap.NewNop(), testBaseURL, RegisterConfig{ClientTTL: DefaultClientTTL})(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", rr.Code)
@@ -491,7 +499,7 @@ func TestRegister_InvalidJSON(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 
-	Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
+	Register(tm, zap.NewNop(), testBaseURL, RegisterConfig{ClientTTL: DefaultClientTTL})(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", rr.Code)
@@ -514,7 +522,7 @@ func TestRegister_RejectsTrailingJSON(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 
-	Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
+	Register(tm, zap.NewNop(), testBaseURL, RegisterConfig{ClientTTL: DefaultClientTTL})(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
@@ -1790,7 +1798,7 @@ func TestRegister_RejectsHTTPNonLoopback(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 
-	Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
+	Register(tm, zap.NewNop(), testBaseURL, RegisterConfig{ClientTTL: DefaultClientTTL})(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
@@ -1823,7 +1831,7 @@ func TestRegister_AllowsHTTPLoopback(t *testing.T) {
 			req.Header.Set("Content-Type", "application/json")
 			rr := httptest.NewRecorder()
 
-			Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
+			Register(tm, zap.NewNop(), testBaseURL, RegisterConfig{ClientTTL: DefaultClientTTL})(rr, req)
 
 			if rr.Code != http.StatusCreated {
 				t.Fatalf("expected 201 for loopback URI %q, got %d: %s", uri, rr.Code, rr.Body.String())
@@ -4529,7 +4537,7 @@ func TestRegister_RejectsHostlessOrOpaque(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(body))
 			req.Header.Set("Content-Type", "application/json")
 			rr := httptest.NewRecorder()
-			Register(tm, logger, testBaseURL, DefaultClientTTL)(rr, req)
+			Register(tm, logger, testBaseURL, RegisterConfig{ClientTTL: DefaultClientTTL})(rr, req)
 
 			if rr.Code != http.StatusBadRequest {
 				t.Fatalf("redirect_uri=%q: want 400, got %d body=%s", u, rr.Code, rr.Body.String())

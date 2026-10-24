@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/babs/mcp-auth-proxy/config"
 	"github.com/babs/mcp-auth-proxy/metrics"
 	"github.com/babs/mcp-auth-proxy/token"
 	"go.uber.org/zap"
@@ -565,7 +566,9 @@ func redirectURIMatches(requested, registered string) bool {
 	if !isLoopback(ru) || !isLoopback(re) {
 		return false
 	}
-	if !strings.EqualFold(ru.Scheme, re.Scheme) {
+	// RFC 8252 §7.3 port relaxation is for http(s) loopback listeners;
+	// a custom scheme carries no listening port.
+	if !strings.EqualFold(ru.Scheme, re.Scheme) || !config.IsWebScheme(ru.Scheme) {
 		return false
 	}
 	// Compare host literals after trailing-dot / case normalization.

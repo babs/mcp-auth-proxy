@@ -7,8 +7,10 @@ import (
 	"html/template"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
+	"github.com/babs/mcp-auth-proxy/config"
 	"github.com/babs/mcp-auth-proxy/metrics"
 	"github.com/babs/mcp-auth-proxy/replay"
 	"github.com/babs/mcp-auth-proxy/token"
@@ -32,14 +34,14 @@ const consentTTL = 5 * time.Minute
 // DCR time but accepted as arbitrary printable bytes) cannot inject
 // markup or scripts.
 type consentPageData struct {
-	ClientName     string
-	ResourceName   string
-	RedirectHost   string
-	ResourceURI    string
-	ConsentToken   string
-	ApproveURL     string
-	HasClientName  bool
-	HasResourceURI bool
+	ClientName      string
+	ResourceName    string
+	RedirectDisplay string
+	ResourceURI     string
+	ConsentToken    string
+	ApproveURL      string
+	HasClientName   bool
+	HasResourceURI  bool
 	// ReplayNotice is set when this render replaces a rejected
 	// replayed submit — the user sees why they are being asked again.
 	ReplayNotice bool
@@ -76,7 +78,7 @@ var consentTmpl = template.Must(template.New("consent").Parse(`<!doctype html>
 
   <dl>
     <dt>Will redirect to</dt>
-    <dd>{{.RedirectHost}}</dd>
+    <dd>{{.RedirectDisplay}}</dd>
     {{if .HasResourceURI}}
     <dt>Resource</dt>
     <dd>{{.ResourceURI}}</dd>
@@ -152,10 +154,37 @@ var navInterstitialTmpl = template.Must(template.New("nav").Parse(`<!doctype htm
 func renderNavInterstitial(w http.ResponseWriter, r *http.Request, logger *zap.Logger, targetURL string) {
 	// The target URL embeds a single-use sealed session (approve) or
 	// the client's error envelope — renderHTMLPage marks it no-store.
-	if err := renderHTMLPage(w, "interstitial", http.StatusOK, navInterstitialCSP, navInterstitialTmpl, struct{ URL string }{targetURL}); err != nil {
+	if reason, u := navTargetRefusal(targetURL); reason != "" {
+		metrics.PageRenderFailed.WithLabelValues("interstitial").Inc()
+		// No parse error: it quotes the full target, code and state included.
+		fields := []zap.Field{zap.String("reason", reason)}
+		if u != nil {
+			fields = append(fields, zap.String("scheme", u.Scheme))
+		}
+		logger.Warn("nav_interstitial_refused", fields...)
+		writeOAuthError(w, r, http.StatusInternalServerError, "server_error", "internal error", codeInterstitialFailed)
+		return
+	}
+	// html/template rewrites non-http(s) URLs to #ZgotmplZ; scheme denylist checked above.
+	if err := renderHTMLPage(w, "interstitial", http.StatusOK, navInterstitialCSP, navInterstitialTmpl, struct{ URL template.URL }{template.URL(targetURL)}); err != nil { //nolint:gosec // G203: scheme denylist checked above
 		logger.Warn("nav_interstitial_execute_failed", zap.Error(err))
 		writeOAuthError(w, r, http.StatusInternalServerError, "server_error", "internal error", codeInterstitialFailed)
 	}
+}
+
+// navTargetRefusal returns why the interstitial must not navigate to
+// target ("" = allowed): unparsable, relative (no scheme), or a denied scheme.
+func navTargetRefusal(target string) (reason string, u *url.URL) {
+	u, err := url.Parse(target)
+	switch {
+	case err != nil:
+		return "parse", nil
+	case u.Scheme == "":
+		return "empty_scheme", u
+	case config.IsDeniedRedirectScheme(u.Scheme):
+		return "denied", u
+	}
+	return "", u
 }
 
 // consentNavError delivers redirectAuthzError's RFC 6749 §4.1.2.1
@@ -197,17 +226,16 @@ func renderConsent(w http.ResponseWriter, r *http.Request, tm *token.Manager, lo
 		return
 	}
 
-	host := redirectHost(consent.RedirectURI)
 	data := consentPageData{
-		ClientName:     consent.ClientName,
-		HasClientName:  consent.ClientName != "",
-		ResourceName:   resourceName,
-		ResourceURI:    consent.Resource,
-		HasResourceURI: consent.Resource != "" && resourceName == "",
-		RedirectHost:   host,
-		ConsentToken:   consentToken,
-		ApproveURL:     baseURL + "/consent",
-		ReplayNotice:   replayNotice,
+		ClientName:      consent.ClientName,
+		HasClientName:   consent.ClientName != "",
+		ResourceName:    resourceName,
+		ResourceURI:     consent.Resource,
+		HasResourceURI:  consent.Resource != "" && resourceName == "",
+		RedirectDisplay: redirectDisplay(consent.RedirectURI),
+		ConsentToken:    consentToken,
+		ApproveURL:      baseURL + "/consent",
+		ReplayNotice:    replayNotice,
 	}
 
 	// Consent page must not be cached: a back-button replay after a
@@ -229,16 +257,19 @@ func renderConsent(w http.ResponseWriter, r *http.Request, tm *token.Manager, lo
 	}
 }
 
-// redirectHost returns the host[:port] component of a redirect URI
-// for the consent page's "Will redirect to" line. The full URI is
-// not shown because the path/query are noise for the user's trust
-// decision — the registered host is what matters. Falls back to the
-// raw input on parse failure (the URI was already validated at DCR
-// time, so a parse failure here is an invariant breach worth
-// surfacing rather than hiding behind an empty string).
-func redirectHost(redirectURI string) string {
+// redirectDisplay is the consent page's "Will redirect to" text:
+// host[:port] for http(s), the registered URI without its query for a
+// custom scheme (raw on parse failure).
+func redirectDisplay(redirectURI string) string {
 	u, err := url.Parse(redirectURI)
-	if err != nil || u.Host == "" {
+	if err != nil {
+		return redirectURI
+	}
+	if !config.IsWebScheme(u.Scheme) { // raw keeps percent-escapes, so no bidi/space spoofing
+		uri, _, _ := strings.Cut(redirectURI, "?")
+		return uri
+	}
+	if u.Host == "" {
 		return redirectURI
 	}
 	return u.Host
@@ -483,13 +514,8 @@ func Consent(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg *o
 			oauth2.S256ChallengeOption(upstreamVerifier),
 		)
 
-		// Counter + log + interstitial together — none of the three
-		// can fail (oauth2Cfg.AuthCodeURL is a string-builder, the
-		// interstitial render only logs on template error), so the
-		// order is observability-only. Keeping increment immediately
-		// before the render call keeps the funnel-counter semantics
-		// unambiguous if a future change introduces failure between
-		// these two lines.
+		// The approval is counted even if the interstitial then fails
+		// (template error or denied/unparsable target answers a 500).
 		//
 		// 200 interstitial, NOT a 302: see navInterstitialTmpl — a
 		// redirect here would re-enter Chromium's form-action chain

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"github.com/babs/mcp-auth-proxy/token"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -2257,4 +2258,226 @@ func TestGroupsCeilingFitsHeaderBudget(t *testing.T) {
 			ceiling, line, otherHeaders, maxHeaderBytes)
 	}
 	t.Logf("derived ceiling %d B, derived MaxHeaderBytes %d B -> Authorization %d B, %d B spare", ceiling, maxHeaderBytes, line, maxHeaderBytes-line)
+}
+
+// TestLoad_RedirectURIsExtra pins the REDIRECT_URIS_EXTRA contract:
+// exact URIs or <scheme>://*, everything else fails startup with a
+// reason-specific error.
+func TestLoad_RedirectURIsExtra(t *testing.T) {
+	t.Run("unset yields empty allowlist", func(t *testing.T) {
+		setAllRequired(t)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(cfg.RedirectURIsExtra.Entries()) != 0 {
+			t.Errorf("Entries = %v, want empty", cfg.RedirectURIsExtra.Entries())
+		}
+		if cfg.RedirectURIsExtra.Check("warp://x/cb") == nil {
+			t.Error("empty allowlist allowed warp://x/cb")
+		}
+	})
+
+	t.Run("accepts exact, wildcard and host-less entries", func(t *testing.T) {
+		setAllRequired(t)
+		t.Setenv("REDIRECT_URIS_EXTRA", " warp://dev.warp.Warp-Stable/mcp/callback , , vscode://h/cb?windowId=1&x=a%20b , warp://h/caf%C3%A9?q=%C3%A9 , myapp://h/a%20b%2Fc , CuRsOr://* , com.example.app:/cb , Warp://h/cb , cursor://* , warp://h/cb , warp://x/"+strings.Repeat("a", 503))
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// Duplicates (after scheme lower-casing) are dropped; 512 chars is the inclusive cap.
+		want := []string{"warp://dev.warp.Warp-Stable/mcp/callback", "vscode://h/cb?windowId=1&x=a%20b", "warp://h/caf%C3%A9?q=%C3%A9", "myapp://h/a%20b%2Fc", "cursor://*", "com.example.app:/cb", "warp://h/cb", "warp://x/" + strings.Repeat("a", 503)}
+		if !slices.Equal(cfg.RedirectURIsExtra.Entries(), want) {
+			t.Errorf("Entries = %v, want %v", cfg.RedirectURIsExtra.Entries(), want)
+		}
+		for raw, allowed := range map[string]bool{
+			"warp://dev.warp.Warp-Stable/mcp/callback": true,
+			"warp://dev.warp.Warp-Stable/mcp/other":    false,
+			"cursor://anything/at/all":                 true,
+			"CURSOR://anything":                        true,
+			"com.example.app:/cb":                      true,
+			"com.example.app:/other":                   false,
+			"https://dev.warp.Warp-Stable/cb":          false,
+			"warp://h/cb":                              true,
+			"WARP://h/cb":                              true,
+			"cursor://evil.com@x/cb":                   false,
+			"cursor://h/cb#f":                          false,
+			"cursor:foo":                               false,
+			"cursor://h/cb?q=a b":                      false,
+		} {
+			if got := cfg.RedirectURIsExtra.Check(raw) == nil; got != allowed {
+				t.Errorf("Check(%q) == nil is %v, want %v", raw, got, allowed)
+			}
+		}
+	})
+
+	for _, bad := range []struct{ name, val, wantErr string }{
+		{"bare wildcard", "*", "wildcards are only supported"},
+		{"path wildcard", "warp://host/*", "wildcards are only supported"},
+		{"scheme wildcard", "*://x", "wildcards are only supported"},
+		{"opaque wildcard", "warp:*", "wildcards are only supported"},
+		{"double wildcard", "*://*", "wildcards are only supported"},
+		{"empty scheme wildcard", "://*", "missing or invalid scheme"},
+		{"https exact", "https://x/cb", `scheme "https" is not allowed`},
+		{"http uppercase exact", "HTTP://localhost/cb", `scheme "http" is not allowed`},
+		{"https wildcard", "HTTPS://*", `scheme "https" is not allowed`},
+		{"intent", "intent://x/cb", `scheme "intent" is not allowed`},
+		{"view-source wildcard", "view-source://*", `scheme "view-source" is not allowed`},
+		{"jar", "jar://x/cb", `scheme "jar" is not allowed`},
+		{"filesystem", "filesystem://x/cb", `scheme "filesystem" is not allowed`},
+		{"chrome", "chrome://settings/x", `scheme "chrome" is not allowed`},
+		{"chrome-extension wildcard", "chrome-extension://*", `scheme "chrome-extension" is not allowed`},
+		{"moz-extension", "moz-extension://x/cb", `scheme "moz-extension" is not allowed`},
+		{"ms-settings", "ms-settings://x/cb", `scheme "ms-settings" is not allowed`},
+		{"ws", "ws://x/cb", `scheme "ws" is not allowed`},
+		{"wss wildcard", "WSS://*", `scheme "wss" is not allowed`},
+		{"ms-msdt", "ms-msdt://x/cb", `scheme "ms-msdt" is not allowed`},
+		{"search-ms wildcard", "search-ms://*", `scheme "search-ms" is not allowed`},
+		{"search", "search://x/cb", `scheme "search" is not allowed`},
+		{"ms-officecmd", "ms-officecmd://x/cb", `scheme "ms-officecmd" is not allowed`},
+		{"ms-word", "MS-WORD://x/cb", `scheme "ms-word" is not allowed`},
+		{"ms-excel wildcard", "ms-excel://*", `scheme "ms-excel" is not allowed`},
+		{"ms-powerpoint", "ms-powerpoint://x/cb", `scheme "ms-powerpoint" is not allowed`},
+		{"quote in host", `warp://a"b/cb`, "must not contain unencoded spaces"},
+		{"markup in host", "warp://a<script>/cb", "must not contain unencoded spaces"},
+		{"space in query", "warp://h/cb?q=a b", "must not contain unencoded spaces"},
+		{"control byte", "warp://h/c\x7fb", "invalid control character"},
+		{"bad escape in query", "warp://h/cb?x=%zz", "invalid percent-escape"},
+		{"semicolon query", "warp://h/cb?a=1;b=2", "must not use ';' separators"},
+		{"non-ASCII query", "warp://h/cb?q=é", "must not contain unencoded spaces"},
+		{"non-ASCII path", "warp://h/café", "must not contain unencoded spaces"},
+		{"non-ASCII host", "warp://hé/cb", "must not contain unencoded spaces"},
+		{"control byte 0x01", "warp://h/a\x01b", "invalid control character"},
+		{"control byte in query", "warp://h/cb?q=a\x01b", "invalid control character"},
+		{"encoded NUL", "myapp://h/%00", "percent-encoded control characters"},
+		{"encoded CRLF", "myapp://h/%0d%0a", "percent-encoded control characters"},
+		{"encoded DEL", "myapp://h/%7F", "percent-encoded control characters"},
+		{"encoded US in query", "myapp://h/cb?x=%1f", "percent-encoded control characters"},
+		{"trailing percent in query", "warp://h/cb?x=%", "invalid percent-escape"},
+		{"truncated escape in query", "warp://h/cb?x=%0", "invalid percent-escape"},
+		{"double percent in query", "warp://h/cb?x=%%", "invalid percent-escape"},
+		{"encoded CR in query", "warp://h/cb?x=%0D", "percent-encoded control characters"},
+		{"ms-access", "ms-access://x/cb", `scheme "ms-access" is not allowed`},
+		{"ms-visio", "ms-visio://x/cb", `scheme "ms-visio" is not allowed`},
+		{"ms-project", "ms-project://x/cb", `scheme "ms-project" is not allowed`},
+		{"ms-publisher", "ms-publisher://x/cb", `scheme "ms-publisher" is not allowed`},
+		{"ms-spd", "ms-spd://x/cb", `scheme "ms-spd" is not allowed`},
+		{"ms-infopath", "ms-infopath://x/cb", `scheme "ms-infopath" is not allowed`},
+		{"onenote", "onenote://x/cb", `scheme "onenote" is not allowed`},
+		{"microsoft-edge", "microsoft-edge://x/cb", `scheme "microsoft-edge" is not allowed`},
+		{"ie.http", "ie.http://x/cb", `scheme "ie.http" is not allowed`},
+		{"jnlp", "jnlp://x/cb", `scheme "jnlp" is not allowed`},
+		{"jnlps", "jnlps://x/cb", `scheme "jnlps" is not allowed`},
+		{"ms-search", "ms-search://x/cb", `scheme "ms-search" is not allowed`},
+		{"ms-help", "ms-help://x/cb", `scheme "ms-help" is not allowed`},
+		{"ldap", "ldap://x/cb", `scheme "ldap" is not allowed`},
+		{"ms-quick-assist", "ms-quick-assist://x/cb", `scheme "ms-quick-assist" is not allowed`},
+		{"ms-browser-extension", "ms-browser-extension://x/cb", `scheme "ms-browser-extension" is not allowed`},
+		{"x-apple.systempreferences", "x-apple.systempreferences://x/cb", `scheme "x-apple.systempreferences" is not allowed`},
+		{"ms-cxh", "ms-cxh://x/cb", `scheme "ms-cxh" is not allowed`},
+		{"ms-cxh-full", "ms-cxh-full://x/cb", `scheme "ms-cxh-full" is not allowed`},
+		{"ms-appinstaller wildcard", "ms-appinstaller://*", `scheme "ms-appinstaller" is not allowed`},
+		{"its", "its://x/cb", `scheme "its" is not allowed`},
+		{"ms-its", "ms-its://x/cb", `scheme "ms-its" is not allowed`},
+		{"mk", "mk://x/cb", `scheme "mk" is not allowed`},
+		{"hcp", "hcp://x/cb", `scheme "hcp" is not allowed`},
+		{"res", "res://x/cb", `scheme "res" is not allowed`},
+		{"shell wildcard", "SHELL://*", `scheme "shell" is not allowed`},
+		{"smb", "smb://x/cb", `scheme "smb" is not allowed`},
+		{"no host no path", "myapp://", "must include a host or a path"},
+		{"bare scheme", "myapp:", "must include a host or a path"},
+		{"space in path", "warp://x/c b", "must not contain unencoded spaces"},
+		{"quote in path", `warp://x/c"b`, "must not contain unencoded spaces"},
+		{"lt in path", "warp://x/c<b", "must not contain unencoded spaces"},
+		{"gt in path", "warp://x/c>b", "must not contain unencoded spaces"},
+		{"non-canonical pipe", "warp://x/a|b", "must be in canonical form"},
+		{"javascript", "javascript://x", `scheme "javascript" is not allowed`},
+		{"javascript wildcard", "JavaScript://*", `scheme "javascript" is not allowed`},
+		{"data", "data:text/html;base64", `scheme "data" is not allowed`},
+		{"file", "file:///etc/passwd", `scheme "file" is not allowed`},
+		{"vbscript", "vbscript:msgbox", `scheme "vbscript" is not allowed`},
+		{"blob", "blob:https://x/uuid", `scheme "blob" is not allowed`},
+		{"about", "about:blank", `scheme "about" is not allowed`},
+		{"fragment", "warp://x/cb#frag", "must not contain a fragment"},
+		{"trailing bare #", "warp://x/cb#", "must not contain a fragment"},
+		{"userinfo", "warp://user@x/cb", "must not contain userinfo"},
+		{"opaque", "warp:foo", "opaque URI"},
+		{"empty scheme", "://x", "invalid URI"},
+		{"no scheme", "dev.warp.Warp-Stable/cb", "missing or invalid scheme"},
+		{"garbage", "warp://x/%zz", "invalid URI"},
+		{"513 chars", "warp://x/" + strings.Repeat("a", 504), "exceeds 512 characters"},
+	} {
+		t.Run("rejects "+bad.name, func(t *testing.T) {
+			setAllRequired(t)
+			t.Setenv("REDIRECT_URIS_EXTRA", "warp://ok/cb,"+bad.val)
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("Load() unexpectedly succeeded for %q", bad.val)
+			}
+			if !strings.HasPrefix(err.Error(), "REDIRECT_URIS_EXTRA: ") || !strings.Contains(err.Error(), bad.wantErr) {
+				t.Errorf("error = %q, want REDIRECT_URIS_EXTRA prefix and %q", err, bad.wantErr)
+			}
+		})
+	}
+}
+
+// TestRedirectAllowlist_NeverAllowsHTTP pins the defense-in-depth guard
+// in Check: http(s) keep their own rules even if a map entry leaks in.
+func TestRedirectAllowlist_NeverAllowsHTTP(t *testing.T) {
+	a := RedirectAllowlist{
+		exact:   map[string]bool{"https://x/cb": true, "http://x/cb": true},
+		schemes: map[string]bool{"https": true, "http": true},
+	}
+	for _, raw := range []string{"https://x/cb", "http://x/cb", "HTTPS://x/cb"} {
+		if a.Check(raw) == nil {
+			t.Errorf("Check(%q) = nil, want an error", raw)
+		}
+	}
+}
+
+// TestDocs_DeniedRedirectSchemesEnumerated keeps the denylist in the
+// REDIRECT_URIS_EXTRA rows equal to the one an operator would hit blind.
+func TestDocs_DeniedRedirectSchemesEnumerated(t *testing.T) {
+	for _, rel := range []string{filepath.Join("..", "docs", "configuration.md"), filepath.Join("..", "specs.md")} {
+		got := documentedDeniedSchemes(t, redirectURIsExtraRow(t, rel))
+		want := slices.Sorted(maps.Keys(deniedRedirectSchemes))
+		if !slices.Equal(got, want) {
+			t.Errorf("%s REDIRECT_URIS_EXTRA denied schemes = %v, want %v", rel, got, want)
+		}
+	}
+}
+
+// documentedDeniedSchemes returns the sorted backticked tokens of the
+// "denied schemes `a`, `b`, …" list in row.
+func documentedDeniedSchemes(t *testing.T, row string) []string {
+	t.Helper()
+	m := regexp.MustCompile("denied schemes ((?:`[^`]+`(?:, )?)+)").FindStringSubmatch(row)
+	if m == nil {
+		t.Fatalf("no \"denied schemes\" list in row: %s", row)
+	}
+	var out []string
+	for _, tok := range regexp.MustCompile("`([^`]+)`").FindAllStringSubmatch(m[1], -1) {
+		if !IsWebScheme(tok[1]) {
+			out = append(out, tok[1])
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// redirectURIsExtraRow returns the env-table row documenting
+// REDIRECT_URIS_EXTRA in the file at rel.
+func redirectURIsExtraRow(t *testing.T, rel string) string {
+	t.Helper()
+	body, err := os.ReadFile(rel)
+	if err != nil {
+		t.Fatalf("read %s: %v", rel, err)
+	}
+	for line := range strings.Lines(string(body)) {
+		if strings.HasPrefix(line, "| `REDIRECT_URIS_EXTRA` |") {
+			return line
+		}
+	}
+	t.Fatalf("%s has no REDIRECT_URIS_EXTRA table row", rel)
+	return ""
 }
