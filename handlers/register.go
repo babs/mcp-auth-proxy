@@ -253,13 +253,37 @@ func validateRedirectURI(w http.ResponseWriter, r *http.Request, raw string, ext
 		return false
 	}
 	// Non-http(s) schemes only via REDIRECT_URIS_EXTRA.
-	if !web && !extra.Allows(raw) {
-		writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri scheme must be http (loopback only), https, or a scheme allowlisted by the operator")
-		return false
+	if !web {
+		return checkCustomRedirect(w, r, extra.Check(raw))
 	}
 	if u.Scheme == "http" && !isLoopback(u) {
 		writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must use HTTPS for non-loopback addresses")
 		return false
 	}
 	return true
+}
+
+// checkCustomRedirect maps a RedirectAllowlist.Check result to a fixed
+// description (descriptions stay compile-time literals) and returns
+// whether the URI is accepted.
+func checkCustomRedirect(w http.ResponseWriter, r *http.Request, err error) bool {
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, config.ErrRedirectNotAllowlisted):
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must be http (loopback only), https, or a URI allowlisted by the operator")
+	case errors.Is(err, config.ErrRedirectNoHostOrPath):
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must include a host or a path")
+	case errors.Is(err, config.ErrRedirectForbiddenChar):
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must not contain unencoded spaces, non-ASCII characters, '\"', '<' or '>', or percent-encoded control characters")
+	case errors.Is(err, config.ErrRedirectQuerySemicolon):
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri query must not use ';' separators")
+	case errors.Is(err, config.ErrRedirectQueryEscape):
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri query contains an invalid percent-escape")
+	case errors.Is(err, config.ErrRedirectNonCanonical):
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must be in canonical form; percent-encode special characters")
+	default: // fail-safe for conditions validateRedirectURI checks before Check
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri is not allowed")
+	}
+	return false
 }

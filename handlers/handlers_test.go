@@ -63,17 +63,19 @@ func registerClient(t *testing.T, tm *token.Manager, redirectURIs []string) (enc
 	return registerClientWith(t, tm, RegisterConfig{ClientTTL: DefaultClientTTL}, redirectURIs)
 }
 
+// newRegisterRequest builds a /register JSON request for redirectURIs.
+func newRegisterRequest(redirectURIs []string) *http.Request {
+	b, _ := json.Marshal(map[string]any{"redirect_uris": redirectURIs, "client_name": "test-app"})
+	req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(string(b)))
+	req.Header.Set("Content-Type", "application/json")
+	return req
+}
+
 // registerClientWith is registerClient under an explicit RegisterConfig.
 func registerClientWith(t *testing.T, tm *token.Manager, regCfg RegisterConfig, redirectURIs []string) (encClientID, internalID string) {
 	t.Helper()
-	body := map[string]any{"redirect_uris": redirectURIs, "client_name": "test-app"}
-	b, _ := json.Marshal(body)
-
-	req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(string(b)))
-	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
-
-	Register(tm, zap.NewNop(), testBaseURL, regCfg)(rr, req)
+	Register(tm, zap.NewNop(), testBaseURL, regCfg)(rr, newRegisterRequest(redirectURIs))
 
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("registerClient: expected 201, got %d: %s", rr.Code, rr.Body.String())

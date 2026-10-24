@@ -24,7 +24,6 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 
-	"github.com/babs/mcp-auth-proxy/config"
 	"github.com/babs/mcp-auth-proxy/handlers"
 	"github.com/babs/mcp-auth-proxy/metrics"
 	"github.com/babs/mcp-auth-proxy/middleware"
@@ -1261,22 +1260,6 @@ func TestDocs_EveryEnvVarIsDocumented(t *testing.T) {
 	for _, name := range names {
 		if !documented[name] {
 			t.Errorf("%s is read by config.go but has no row in docs/configuration.md — an operator has no way to learn it exists", name)
-		}
-	}
-}
-
-// TestDocs_DeniedRedirectSchemesEnumerated keeps the REDIRECT_URIS_EXTRA
-// docs in step with the denylist an operator would otherwise hit blind.
-func TestDocs_DeniedRedirectSchemesEnumerated(t *testing.T) {
-	for _, rel := range []string{"docs/configuration.md", "specs.md"} {
-		body, err := os.ReadFile(rel)
-		if err != nil {
-			t.Fatalf("read %s: %v", rel, err)
-		}
-		for _, s := range config.DeniedRedirectSchemes() {
-			if !strings.Contains(string(body), "`"+s+"`") {
-				t.Errorf("%s does not list denied redirect scheme `%s`", rel, s)
-			}
 		}
 	}
 }

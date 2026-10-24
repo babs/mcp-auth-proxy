@@ -527,7 +527,7 @@ func TestRefreshToken_RejectsMissingFamilyOrTokenID(t *testing.T) {
 func TestRegister_RejectsNonHTTPScheme(t *testing.T) {
 	tm := newTestTokenManager(t)
 
-	const schemeErr = "redirect_uri scheme must be http (loopback only), https, or a scheme allowlisted by the operator"
+	const schemeErr = "redirect_uri must be http (loopback only), https, or a URI allowlisted by the operator"
 	badSchemes := map[string]string{
 		"ftp://127.0.0.1/cb":         schemeErr,
 		"ldap://127.0.0.1/cb":        schemeErr,

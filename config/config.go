@@ -3,7 +3,6 @@ package config
 import (
 	"errors"
 	"fmt"
-	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -745,18 +744,34 @@ func (a RedirectAllowlist) Entries() []string {
 	return slices.Clone(a.entries)
 }
 
-// Allows reports whether the allowlist accepts the redirect URI raw.
-// http(s) never match: they keep their own rules.
-func (a RedirectAllowlist) Allows(raw string) bool {
+// Errors Check returns; /register maps each to a fixed description.
+var (
+	ErrRedirectNotAllowlisted = errors.New("not a URI allowlisted by the operator")
+	ErrRedirectNoHostOrPath   = errors.New("must include a host or a path")
+	ErrRedirectForbiddenChar  = errors.New(`must not contain unencoded spaces, non-ASCII characters, '"', '<' or '>', or percent-encoded control characters`)
+	ErrRedirectQuerySemicolon = errors.New("query must not use ';' separators")
+	ErrRedirectQueryEscape    = errors.New("query contains an invalid percent-escape")
+	ErrRedirectNonCanonical   = errors.New("must be in canonical form; percent-encode special characters")
+)
+
+// Check returns nil when the allowlist accepts the redirect URI raw,
+// ErrRedirectNotAllowlisted when no entry covers it, or the shape error
+// for a URI under a `<scheme>://*` entry. http(s) never match: they keep
+// their own rules.
+func (a RedirectAllowlist) Check(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil || IsWebScheme(u.Scheme) {
-		return false
+		return ErrRedirectNotAllowlisted
 	}
-	norm, err := canonicalCustomRedirect(raw, u)
-	if err != nil {
-		return false
+	if !a.schemes[u.Scheme] {
+		// Exact entries are canonical, so a byte-equal raw passes every shape check.
+		if a.exact[u.Scheme+raw[len(u.Scheme):]] {
+			return nil
+		}
+		return ErrRedirectNotAllowlisted
 	}
-	return a.schemes[u.Scheme] || a.exact[norm]
+	_, err = canonicalCustomRedirect(raw, u)
+	return err
 }
 
 // MaxRedirectURILength caps a redirect URI at /register and an exact
@@ -774,6 +789,13 @@ var (
 		"moz-extension": true, "ms-settings": true, "ws": true, "wss": true,
 		"ms-msdt": true, "search-ms": true, "search": true, "ms-officecmd": true,
 		"ms-word": true, "ms-excel": true, "ms-powerpoint": true,
+		"ms-cxh": true, "ms-cxh-full": true, "ms-appinstaller": true, "its": true,
+		"ms-its": true, "mk": true, "hcp": true, "res": true, "shell": true, "smb": true,
+		"ms-access": true, "ms-visio": true, "ms-project": true, "ms-publisher": true,
+		"ms-spd": true, "ms-infopath": true, "onenote": true,
+		"microsoft-edge": true, "ie.http": true, "jnlp": true, "jnlps": true,
+		"ms-search": true, "ms-help": true, "ldap": true, "ms-quick-assist": true,
+		"ms-browser-extension": true, "x-apple.systempreferences": true,
 	}
 )
 
@@ -786,11 +808,6 @@ func IsWebScheme(scheme string) bool {
 // be a redirect target.
 func IsDeniedRedirectScheme(scheme string) bool {
 	return deniedRedirectSchemes[strings.ToLower(scheme)]
-}
-
-// DeniedRedirectSchemes returns the denied schemes, sorted.
-func DeniedRedirectSchemes() []string {
-	return slices.Sorted(maps.Keys(deniedRedirectSchemes))
 }
 
 func checkRedirectScheme(entry, scheme string) error {
@@ -814,31 +831,43 @@ func canonicalCustomRedirect(raw string, u *url.URL) (string, error) {
 	case u.User != nil:
 		return "", errors.New("must not contain userinfo")
 	case u.Host == "" && u.Path == "":
-		return "", errors.New("must have a host or a path")
+		return "", ErrRedirectNoHostOrPath
 	}
-	for i := range len(raw) {
-		if c := raw[i]; c < 0x21 || c == 0x7f || c == '"' || c == '<' || c == '>' {
-			return "", errors.New(`must not contain spaces, control characters, '"', '<' or '>'`)
-		}
+	if hasForbiddenRedirectByte(raw) {
+		return "", ErrRedirectForbiddenChar
 	}
-	if u.RawQuery != "" {
-		if _, err := url.ParseQuery(u.RawQuery); err != nil {
-			return "", fmt.Errorf("invalid query: %w", err)
-		}
+	if strings.Contains(u.RawQuery, ";") {
+		return "", ErrRedirectQuerySemicolon
+	}
+	if _, err := url.ParseQuery(u.RawQuery); err != nil {
+		return "", ErrRedirectQueryEscape
 	}
 	norm := u.Scheme + raw[len(u.Scheme):]
 	if u.String() != norm {
-		return "", errors.New("must be in canonical form (percent-encode special characters)")
+		return "", ErrRedirectNonCanonical
 	}
 	return norm, nil
 }
 
-// ParseRedirectAllowlist parses REDIRECT_URIS_EXTRA: comma-separated
-// exact URIs or `<scheme>://*`. Rejected: any other wildcard, http(s)
-// and denied schemes, fragment, userinfo, opaque form, neither host nor
-// path, spaces / control characters / '"' / '<' / '>', an unparsable
-// query, a form that does not survive a parse/serialize round trip, and
-// exact entries longer than MaxRedirectURILength. Duplicates are dropped.
+// hasForbiddenRedirectByte reports an unencoded space, non-ASCII byte,
+// '"', '<' or '>', or a percent-encoded control byte (%00-%1f, %7f).
+// url.Parse already rejects raw control bytes; IRIs must arrive percent-encoded.
+func hasForbiddenRedirectByte(raw string) bool {
+	for i := range len(raw) {
+		switch c := raw[i]; {
+		case c == ' ' || c > 0x7e || c == '"' || c == '<' || c == '>':
+			return true
+		case c == '%' && i+3 <= len(raw):
+			if v, err := strconv.ParseUint(raw[i+1:i+3], 16, 8); err == nil && (v < 0x20 || v == 0x7f) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ParseRedirectAllowlist parses REDIRECT_URIS_EXTRA; accepted forms and
+// rejections are documented in docs/configuration.md.
 func ParseRedirectAllowlist(raw string) (RedirectAllowlist, error) {
 	a := RedirectAllowlist{exact: map[string]bool{}, schemes: map[string]bool{}}
 	for _, e := range strings.Split(raw, ",") {

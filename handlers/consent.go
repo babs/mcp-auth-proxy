@@ -34,14 +34,14 @@ const consentTTL = 5 * time.Minute
 // DCR time but accepted as arbitrary printable bytes) cannot inject
 // markup or scripts.
 type consentPageData struct {
-	ClientName     string
-	ResourceName   string
-	RedirectHost   string
-	ResourceURI    string
-	ConsentToken   string
-	ApproveURL     string
-	HasClientName  bool
-	HasResourceURI bool
+	ClientName      string
+	ResourceName    string
+	RedirectDisplay string
+	ResourceURI     string
+	ConsentToken    string
+	ApproveURL      string
+	HasClientName   bool
+	HasResourceURI  bool
 	// ReplayNotice is set when this render replaces a rejected
 	// replayed submit — the user sees why they are being asked again.
 	ReplayNotice bool
@@ -78,7 +78,7 @@ var consentTmpl = template.Must(template.New("consent").Parse(`<!doctype html>
 
   <dl>
     <dt>Will redirect to</dt>
-    <dd>{{.RedirectHost}}</dd>
+    <dd>{{.RedirectDisplay}}</dd>
     {{if .HasResourceURI}}
     <dt>Resource</dt>
     <dd>{{.ResourceURI}}</dd>
@@ -154,10 +154,13 @@ var navInterstitialTmpl = template.Must(template.New("nav").Parse(`<!doctype htm
 func renderNavInterstitial(w http.ResponseWriter, r *http.Request, logger *zap.Logger, targetURL string) {
 	// The target URL embeds a single-use sealed session (approve) or
 	// the client's error envelope — renderHTMLPage marks it no-store.
-	u, err := url.Parse(targetURL)
-	if err != nil || config.IsDeniedRedirectScheme(u.Scheme) {
+	if reason, u, err := navTargetRefusal(targetURL); reason != "" {
 		metrics.PageRenderFailed.WithLabelValues("interstitial").Inc()
-		logger.Warn("nav_interstitial_denied_scheme", zap.Error(err))
+		fields := []zap.Field{zap.String("reason", reason), zap.Error(err)}
+		if u != nil {
+			fields = append(fields, zap.String("scheme", u.Scheme))
+		}
+		logger.Warn("nav_interstitial_denied_scheme", fields...)
 		writeOAuthError(w, r, http.StatusInternalServerError, "server_error", "internal error", codeInterstitialFailed)
 		return
 	}
@@ -166,6 +169,21 @@ func renderNavInterstitial(w http.ResponseWriter, r *http.Request, logger *zap.L
 		logger.Warn("nav_interstitial_execute_failed", zap.Error(err))
 		writeOAuthError(w, r, http.StatusInternalServerError, "server_error", "internal error", codeInterstitialFailed)
 	}
+}
+
+// navTargetRefusal returns why the interstitial must not navigate to
+// target ("" = allowed): unparsable, relative (no scheme), or a denied scheme.
+func navTargetRefusal(target string) (reason string, u *url.URL, err error) {
+	u, err = url.Parse(target)
+	switch {
+	case err != nil:
+		return "parse", nil, err
+	case u.Scheme == "":
+		return "empty_scheme", u, nil
+	case config.IsDeniedRedirectScheme(u.Scheme):
+		return "denied", u, nil
+	}
+	return "", u, nil
 }
 
 // consentNavError delivers redirectAuthzError's RFC 6749 §4.1.2.1
@@ -207,17 +225,16 @@ func renderConsent(w http.ResponseWriter, r *http.Request, tm *token.Manager, lo
 		return
 	}
 
-	host := redirectHost(consent.RedirectURI)
 	data := consentPageData{
-		ClientName:     consent.ClientName,
-		HasClientName:  consent.ClientName != "",
-		ResourceName:   resourceName,
-		ResourceURI:    consent.Resource,
-		HasResourceURI: consent.Resource != "" && resourceName == "",
-		RedirectHost:   host,
-		ConsentToken:   consentToken,
-		ApproveURL:     baseURL + "/consent",
-		ReplayNotice:   replayNotice,
+		ClientName:      consent.ClientName,
+		HasClientName:   consent.ClientName != "",
+		ResourceName:    resourceName,
+		ResourceURI:     consent.Resource,
+		HasResourceURI:  consent.Resource != "" && resourceName == "",
+		RedirectDisplay: redirectDisplay(consent.RedirectURI),
+		ConsentToken:    consentToken,
+		ApproveURL:      baseURL + "/consent",
+		ReplayNotice:    replayNotice,
 	}
 
 	// Consent page must not be cached: a back-button replay after a
@@ -239,19 +256,15 @@ func renderConsent(w http.ResponseWriter, r *http.Request, tm *token.Manager, lo
 	}
 }
 
-// redirectHost returns the host[:port] component of an http(s)
-// redirect URI for the consent page's "Will redirect to" line. The
-// full URI is not shown because the path/query are noise for the
-// user's trust decision — the registered host is what matters. Falls back to the
-// raw input on parse failure (the URI was already validated at DCR
-// time, so a parse failure here is an invariant breach worth
-// surfacing rather than hiding behind an empty string).
-func redirectHost(redirectURI string) string {
+// redirectDisplay is the consent page's "Will redirect to" text:
+// host[:port] for http(s), the registered URI without its query for a
+// custom scheme (raw on parse failure).
+func redirectDisplay(redirectURI string) string {
 	u, err := url.Parse(redirectURI)
 	if err != nil {
 		return redirectURI
 	}
-	if !config.IsWebScheme(u.Scheme) { // scheme names the receiving app; canonical raw keeps escapes, so no bidi/space spoofing
+	if !config.IsWebScheme(u.Scheme) { // raw keeps percent-escapes, so no bidi/space spoofing
 		uri, _, _ := strings.Cut(redirectURI, "?")
 		return uri
 	}

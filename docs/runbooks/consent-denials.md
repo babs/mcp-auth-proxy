@@ -48,7 +48,8 @@ stays clean.
 
 1. Pull the most recent `consent_denied` log lines. Group by
    `client_id` / `client_name`. If one ID dominates, check its
-   `redirect_uris`: is the host one your users would recognise?
+   `redirect_uris`: is the host (or, for a custom scheme, the app URI)
+   one your users would recognise?
    If not, escalate as a phishing-attempt signal — keep the
    consent page on, do not roll back.
 2. If denials are spread across many `client_id`s, suspect UX

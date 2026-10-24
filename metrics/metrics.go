@@ -95,14 +95,14 @@ var (
 	})
 
 	// PageRenderFailed counts proxy-rendered pages whose template failed
-	// to execute. Labelled by page, because the three fail differently:
-	// the error page falls back to the JSON body, while the consent page
-	// and the interstitial fall back to the client's redirect_uri
-	// envelope. Zero in a healthy deploy; any increment is a template
-	// regression that would otherwise be visible only as a log line.
+	// to execute, plus interstitial navigation targets it refused. Labelled
+	// by page, because the three fail differently: the error page falls back
+	// to the JSON body, the consent page to the client's redirect_uri
+	// envelope, the interstitial to a proxy-side 500. Zero in a healthy
+	// deploy; an increment would otherwise be visible only as a log line.
 	PageRenderFailed = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "mcp_auth_page_render_failed_total",
-		Help: "Proxy-rendered page template execute failures, by page.",
+		Help: "Proxy-rendered page template failures or refused navigation targets, by page.",
 	}, []string{"page"})
 
 	// GroupsClaimTruncated counts access tokens minted with a truncated
