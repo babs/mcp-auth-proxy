@@ -95,6 +95,7 @@ func main() {
 		// Scope names are not secrets; logging them lets oncall confirm
 		// which upstream audience the IdP is asked for.
 		zap.Strings("oidc_extra_scopes", cfg.OIDCExtraScopes),
+		zap.Strings("redirect_uris_extra", cfg.RedirectURIsExtra.Entries()),
 		zap.String("access_log_skip_re", accessLogSkipPattern(cfg.AccessLogSkipRE)),
 		// Surface the per-tool metrics toggle so an operator inspecting
 		// startup logs can confirm `MCP_TOOL_METRICS=true` actually took
@@ -327,7 +328,7 @@ func main() {
 	}
 
 	registerOAuthRoutes(r, oauthRoutes{
-		Register: handlers.Register(tm, logger, cfg.ProxyBaseURL, cfg.ClientRegistrationTTL),
+		Register: handlers.Register(tm, logger, cfg.ProxyBaseURL, handlers.RegisterConfig{ClientTTL: cfg.ClientRegistrationTTL, RedirectURIsExtra: cfg.RedirectURIsExtra}),
 		Authorize: handlers.Authorize(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, handlers.AuthorizeConfig{
 			PKCERequired:         cfg.PKCERequired,
 			ResourceURIs:         []string{cfg.ProxyBaseURL + cfg.UpstreamMCPMountPath},
@@ -335,6 +336,7 @@ func main() {
 			CompatAllowStateless: cfg.CompatAllowStateless,
 			RenderConsentPage:    cfg.RenderConsentPage,
 			ResourceName:         cfg.ResourceName,
+			RedirectURIsExtra:    cfg.RedirectURIsExtra,
 		}),
 		Consent: handlers.Consent(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, handlers.ConsentConfig{
 			ReplayStore:  replayStore,

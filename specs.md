@@ -129,7 +129,7 @@ All configuration is via environment variables.
 | `GROUPS_CLAIM` | Flat claim name in the OIDC id_token containing user groups | `groups` (default) |
 | `ALLOWED_GROUPS` | Comma-separated group allowlist. Empty = allow all authenticated users | `admin,mcp-users` |
 | `REVOKE_BEFORE` | RFC3339 timestamp — both access tokens AND refresh tokens with `iat` before this are rejected (bulk revocation). Empty = disabled | `2026-03-28T12:00:00Z` |
-| `PKCE_REQUIRED` | Require PKCE on /authorize (default `true`). Set `false` for Cursor, MCP Inspector, ChatGPT compat | `true` |
+| `PKCE_REQUIRED` | Require PKCE on /authorize (default `true`). Set `false` for Cursor, MCP Inspector, ChatGPT compat. Custom-scheme redirects (`REDIRECT_URIS_EXTRA`) require client S256 regardless | `true` |
 | `SHUTDOWN_TIMEOUT` | Graceful shutdown deadline. Raise above the longest expected SSE stream so rolling deploys do not cut MCP sessions mid-stream. Match `terminationGracePeriodSeconds` in K8s | `120s` (default) |
 | `REDIS_URL` | Enables single-use authorization codes and refresh rotation with reuse detection (OAuth 2.1 §6.1) across replicas. `rediss://` for TLS. On Redis failure the proxy fails closed (503) | `redis://redis:6379/0` |
 | `REDIS_REQUIRED` | Fail startup (`logger.Fatal`) when `REDIS_URL` is unset. Default `true` — stateless mode leaves authorization codes / refresh tokens replayable within their TTL (findings C3/C4). Set `false` only for dev or single-replica deployments that accept the trade-off | `true` (default) |
@@ -147,6 +147,7 @@ All configuration is via environment variables.
 | `UPSTREAM_AUTHORIZATION_HEADER` | When non-empty, sent verbatim as the `Authorization` header on every request to the upstream MCP backend (full value incl. scheme, e.g. `Bearer s3cr3t`). Treat as a secret — mount from a Secret, not a ConfigMap. Mutually exclusive with `UPSTREAM_FORWARD_IDP_TOKEN` | `Bearer xyz` |
 | `UPSTREAM_FORWARD_IDP_TOKEN` | `true` forwards the signed-in user's IdP access token to the upstream as `Authorization: Bearer`. Always runs with a replay store: `REDIS_URL`, required under `PROD_MODE` (startup fails without it). Outside `PROD_MODE`, with `REDIS_REQUIRED=false` and no `REDIS_URL`, the proxy uses an in-memory store and logs `replay_store_in_memory`: single instance only, state lost on restart. Mutually exclusive with `UPSTREAM_AUTHORIZATION_HEADER`. See [Upstream IdP token forwarding](#upstream-idp-token-forwarding-opt-in) | `false` (default) |
 | `OIDC_EXTRA_SCOPES` | Space-separated scopes appended to `openid email profile` on the IdP authorize request and, in forwarding mode, on every IdP refresh request. Operator-only: clients still cannot request scopes | empty (default) |
+| `REDIRECT_URIS_EXTRA` | Comma-separated custom-scheme redirect URIs `/register` accepts for native clients: exact URIs (no commas) or `<scheme>://*` (any non-opaque URI of that scheme). Re-checked at `/authorize`, which also requires S256 PKCE for these redirects whatever `PKCE_REQUIRED` says. Fail startup: `http`/`https`, other wildcards, fragment, userinfo, opaque, neither host nor path, a space / control character / `"` / `<` / `>`, an unparsable query, non-canonical form, and the schemes `javascript`, `data`, `file`, `vbscript`, `blob`, `about`, `intent`, `view-source`, `jar`, `filesystem`, `chrome`, `chrome-extension`, `moz-extension`, `ms-settings`, `ws`, `wss`, `ms-msdt`, `search-ms`, `search`, `ms-officecmd`, `ms-word`, `ms-excel`, `ms-powerpoint` | empty (default) |
 | `TOKEN_SIGNING_SECRETS_PREVIOUS` | Whitespace-separated retired signing secrets accepted on Open during a rolling rotation. New seals always use `TOKEN_SIGNING_SECRET` (primary); Open tries primary first, then each previous entry. Each entry must be ≥32 bytes | `<old1> <old2>` |
 | `LOG_LEVEL` | Zap log level (`debug` / `info` / `warn` / `error`) | `info` (default) |
 | `GROUPS_CLAIM` | Flat claim name in id_token that carries user group memberships | `groups` (default) |
@@ -272,7 +273,7 @@ PKCE-only proxy: no client secrets are validated. `scopes_supported` is an expli
 **Behavior:**
 - Validate that `redirect_uris` is present and non-empty
 - Reject `client_name` longer than 512 bytes so unauthenticated registrations cannot amplify into oversized logs or sealed `client_id` responses
-- OAuth 2.1 §2.3.1: each `redirect_uri` must use HTTPS, or HTTP when pointing at a loopback host. Loopback is recognized via `net.ParseIP().IsLoopback()` (covers the full 127/8 range, `::1`, `::ffff:127.0.0.1`, `::0.0.0.1`) plus the literal `localhost` / `localhost.`. Non-http(s) schemes (e.g. `ftp://`, `ldap://`, `file://`, custom app schemes) are rejected unconditionally even when the host is loopback
+- OAuth 2.1 §2.3.1: each `redirect_uri` must use HTTPS, or HTTP when pointing at a loopback host. Loopback is recognized via `net.ParseIP().IsLoopback()` (covers the full 127/8 range, `::1`, `::ffff:127.0.0.1`, `::0.0.0.1`) plus the literal `localhost` / `localhost.`. Non-http(s) schemes (e.g. `ftp://`, `ldap://`, custom app schemes) are rejected even when the host is loopback, unless listed in `REDIRECT_URIS_EXTRA` (exact URI or `<scheme>://*`; never `http`/`https`). A listed custom-scheme URI may be host-less (`com.example.app:/cb`, RFC 8252 §7.1) but needs a host or path and must survive a parse/serialize round trip; fragment, userinfo and opaque form stay rejected
 - Generate an internal UUID for the client
 - Encrypt the whole `{ id, redirect_uris, client_name, expires_at }` with AES-GCM → this is the returned `client_id`
 - TTL embedded in the encrypted blob: 7d default, configurable via `CLIENT_REGISTRATION_TTL` (Go duration, capped at 90d; `0` = never expires, sealing a zero `expires_at`). The 7d default matches `refreshTokenTTL` so a client holding a still-valid refresh token can always exchange it — a shorter TTL silently kills long-running MCP clients (which treat DCR as one-shot at startup) the moment their access token first expires. `0` is the opt-in escape hatch for clients that never re-run DCR on `invalid_client` (e.g. Azure APIM connectors); it trades away the reuse-window bound on an exfiltrated `client_id`.
@@ -294,7 +295,7 @@ Headers: `Cache-Control: no-store`, `Pragma: no-cache`.
 
 `client_id_expires_at` (an RFC 7591 extension field — the spec defines `client_secret_expires_at`, not `client_id_expires_at`) is the UNIX timestamp at which the sealed `client_id` stops opening (default `client_id_issued_at + 7d`, configurable via `CLIENT_REGISTRATION_TTL`). Clients that cache the handle should re-register before this time to avoid a 400 on `/authorize` and on `/token` refresh-token rotations. When `CLIENT_REGISTRATION_TTL=0`, `client_id_expires_at` is emitted as `0` ("never expires", mirroring RFC 7591 §3.2.1 `client_secret_expires_at`) and the expiry check is skipped on every validation path.
 
-Error responses use RFC 7591 §3.2.2 codes: `invalid_redirect_uri` for any redirect_uri-shape defect (missing, over-count, over-length, malformed, opaque, hostless, fragment-bearing, userinfo-bearing, or non-https-non-loopback); `invalid_client_metadata` for unsupported `token_endpoint_auth_method`, over-length `client_name`, or `client_name` containing control bytes (NUL/CR/LF/TAB) or the X-User-Groups delimiter `,` (the field is sealed into the returned `client_id` and emitted to logs; raw control bytes would smuggle past zap's JSON-escaping when downstream code unsealed and parsed it); `invalid_request` for structural problems: 400 with `"invalid JSON body"` for a malformed body, 413 with `"request body exceeds the 1 MB cap"` when the body crosses `MaxBytesReader`.
+Error responses use RFC 7591 §3.2.2 codes: `invalid_redirect_uri` for any redirect_uri-shape defect (missing, over-count, over-length, malformed, opaque, hostless http(s), fragment-bearing, userinfo-bearing, non-https-non-loopback, or a non-http(s) scheme not allowed by `REDIRECT_URIS_EXTRA`); `invalid_client_metadata` for unsupported `token_endpoint_auth_method`, over-length `client_name`, or `client_name` containing control bytes (NUL/CR/LF/TAB) or the X-User-Groups delimiter `,` (the field is sealed into the returned `client_id` and emitted to logs; raw control bytes would smuggle past zap's JSON-escaping when downstream code unsealed and parsed it); `invalid_request` for structural problems: 400 with `"invalid JSON body"` for a malformed body, 413 with `"request body exceeds the 1 MB cap"` when the body crosses `MaxBytesReader`.
 
 ---
 
@@ -304,7 +305,7 @@ Error responses use RFC 7591 §3.2.2 codes: `invalid_redirect_uri` for any redir
 - `response_type=code` (required, reject otherwise)
 - `client_id` (required, decrypt and validate not expired)
 - `redirect_uri` (required, must match a registered URI — exact match)
-- `code_challenge` (required if `PKCE_REQUIRED=true`, optional otherwise; 43-128 unreserved characters per RFC 7636)
+- `code_challenge` (required if `PKCE_REQUIRED=true` or the `redirect_uri` uses a non-http(s) scheme, optional otherwise; 43-128 unreserved characters per RFC 7636)
 - `code_challenge_method=S256` (required if `code_challenge` present)
 - `state` (required by default; strict mode rejects `/authorize` with 400 `invalid_request` when absent. Set `COMPAT_ALLOW_STATELESS=true` to keep the legacy server-synth behavior for Cursor / MCP Inspector — `mcp_auth_access_denied_total{reason="state_missing"}` is incremented either way for visibility)
 - `resource` (optional, RFC 8707 — accepted when it matches either `{PROXY_BASE_URL}` / `{PROXY_BASE_URL}/` or the configured mount resource `{PROXY_BASE_URL}<mount>`)
@@ -312,7 +313,7 @@ Error responses use RFC 7591 §3.2.2 codes: `invalid_redirect_uri` for any redir
 **Behavior:**
 1. Validate all params; reject repeated singleton params (`resource` may appear more than once per RFC 8707); every `resource` value must match an accepted resource URI
 2. Decrypt the `client_id` → verify not expired, `redirect_uri` matched
-3. **Consent fork.** The validated parameters are sealed into a `sealedConsent` blob (`PurposeConsent` AAD, audience-bound, 5-min TTL) and an HTML page is rendered showing the registered `client_name`, the parsed redirect host, and the resource. The user clicks Approve or Deny. The form POSTs to `/consent` (see below). Default behavior; setting `RENDER_CONSENT_PAGE=false` skips this step and runs the silent redirect at step 4 directly — only safe when every caller is non-interactive and known-trusted.
+3. **Consent fork.** The validated parameters are sealed into a `sealedConsent` blob (`PurposeConsent` AAD, audience-bound, 5-min TTL) and an HTML page is rendered showing the registered `client_name`, the redirect target (the host for http(s); for a custom scheme the registered URI without its query, still percent-escaped), and the resource. The user clicks Approve or Deny. The form POSTs to `/consent` (see below). Default behavior; setting `RENDER_CONSENT_PAGE=false` skips this step and runs the silent redirect at step 4 directly — only safe when every caller is non-interactive and known-trusted.
 4. Encrypt the session with AES-GCM (10min TTL):
    ```
    {
@@ -704,7 +705,7 @@ type OAuthError struct {
 | `callback_state_replay` | `/callback` replayed (requires Redis); metric: `mcp_auth_replay_detected_total{kind="callback_state"}` — not an `access_denied_total` reason | `invalid_request` |
 | `idp_exchange_throttled` | Outbound IdP exchange throttled (`IDP_EXCHANGE_RATE_PER_SEC`) — at `/callback`, and at `/token` in forwarding mode, where the code or refresh token stays usable for the retry (`invalid_grant` instead if it could not be given back) | `temporarily_unavailable` (or `invalid_grant` at `/token`) |
 | `refresh_concurrent_submit` | Racing refresh inside `REFRESH_RACE_GRACE_SEC` | `invalid_grant` |
-| `redirect_uri_missing` / `redirect_uri_mismatch` | `redirect_uri` absent or not registered (client input, `/authorize`) | `invalid_request` |
+| `redirect_uri_missing` / `redirect_uri_mismatch` | `redirect_uri` absent or not registered, or its custom scheme no longer allowed by `REDIRECT_URIS_EXTRA` (metric reason `redirect_uri_not_allowlisted`; the "reconnect" hint does not help there, the operator must restore the entry) (client input, `/authorize`) | `invalid_request` |
 | `redirect_uri_malformed` | An already-validated `redirect_uri` failed to re-parse at `/authorize`, `/consent` or `/callback`, leaving nowhere to deliver the §4.1.2.1 envelope — invariant violation, see the browser-facing rendering note | the original envelope's `error` (`server_error`, `access_denied`, `unsupported_response_type`, `invalid_target`, `invalid_request`, or the allowlisted IdP one) |
 | `consent_query_params_forbidden` / `consent_auth_header_present` / `consent_body_too_large` / `consent_form_malformed` / `consent_action_invalid` | `POST /consent` request-shape rejections | `invalid_request` |
 | `parameter_repeated` | A singleton query/form parameter was sent more than once (`/authorize`, `/consent`, `/callback`, `/token`) | `invalid_request` |
@@ -750,7 +751,9 @@ rejections a fresh flow re-forms (`consent_query_params_forbidden`, `consent_for
 `consent_action_invalid`, `parameter_repeated`, `consent_auth_header_present`,
 `consent_body_too_large`, `method_not_allowed`, `not_found`); *reconnect this service in your application* on the stale-registration codes
 (`client_registration_expired`, `client_id_unknown`, `client_audience_mismatch`,
-`redirect_uri_mismatch`), which a client-side re-registration clears (see the runbook);
+`redirect_uri_mismatch`), which a client-side re-registration clears (see the runbook) — except a
+custom-scheme client whose `REDIRECT_URIS_EXTRA` entry was removed, where reconnecting does not help
+and the operator must restore the entry;
 *verify your email address with your identity provider* on `email_not_verified`, the one denial the
 user clears without an operator; and *contact the administrator quoting the code* otherwise. The
 mapping is `codeHints` in `handlers/error_page.go`, and
@@ -806,7 +809,7 @@ See [`Dockerfile`](./Dockerfile). Static Go binary on `gcr.io/distroless/static-
 
 Operator-load-bearing invariants that are not surfaced by the env table or the endpoint reference. The "Configuration" table is the canonical knob list; the "Architecture" and "Endpoints" sections are the canonical flow descriptions.
 
-- **redirect_uri shape**: exact match (with the RFC 8252 §7.3 loopback-port relaxation at `/authorize`); `http://` allowed only to a loopback host (full 127/8 range, `::1`, `::ffff:127.0.0.1`, `::0.0.0.1`, `localhost`, `localhost.`); non-http(s) schemes rejected even on loopback; fragments and userinfo rejected; length capped at 512 chars; at most 5 entries per client registration. The port relaxation applies only to the registered ↔ `/authorize` match — at `/token` the client MUST echo the same `redirect_uri` value it sent to `/authorize` (RFC 6749 §4.1.3 byte-equality), which native apps already do because they bind their loopback port once and reuse it for the whole flow.
+- **redirect_uri shape**: exact match (with the RFC 8252 §7.3 loopback-port relaxation at `/authorize`); `http://` allowed only to a loopback host (full 127/8 range, `::1`, `::ffff:127.0.0.1`, `::0.0.0.1`, `localhost`, `localhost.`); non-http(s) schemes rejected even on loopback unless allowed by `REDIRECT_URIS_EXTRA` (custom schemes only; S256 mandatory; no loopback-port relaxation); fragments and userinfo rejected; length capped at 512 chars; at most 5 entries per client registration. The port relaxation applies only to the registered ↔ `/authorize` match — at `/token` the client MUST echo the same `redirect_uri` value it sent to `/authorize` (RFC 6749 §4.1.3 byte-equality), which native apps already do because they bind their loopback port once and reuse it for the whole flow.
 - **Structured logs**: zap JSON, `request_id` on every line. Inbound `X-Request-Id` is stripped before chi mints one (defeats client-controlled log forgery). Authenticated requests carry `sub` and `email`; JSON-RPC requests additionally carry `rpc_method`, `rpc_tool` (capped at 128 chars), `rpc_id` (capped at 64), all passed through a narrow allowlist (ASCII alphanumerics plus `._:/-+`). `MCP_LOG_BODY_MAX=0` suppresses the `rpc_*` fields; `ACCESS_LOG_SKIP_RE` drops whole lines for matching paths.
 - **Business metrics** (under `/metrics` on `METRICS_ADDR`):
   - `mcp_auth_tokens_issued_total{grant_type}`
@@ -841,7 +844,7 @@ The stateless design supports horizontal scaling without sticky sessions. Requir
 2. **`PROXY_BASE_URL`** — must be the public DNS name reached by clients, not a per-pod hostname. Audience binding enforces this — a pod with a wrong `PROXY_BASE_URL` will reject every token minted by its siblings.
 3. **`OIDC_*`** — same registration on the same IdP.
 4. **`UPSTREAM_MCP_URL`** — same in-cluster service URL.
-5. **`PKCE_REQUIRED`, `ALLOWED_GROUPS`, `GROUPS_CLAIM`, `REVOKE_BEFORE`, `REDIS_URL`, `REDIS_KEY_PREFIX`, `RATE_LIMIT_ENABLED`** — any asymmetry produces "works on some pods, not others" bugs. `REDIS_URL` + `REDIS_KEY_PREFIX` in particular must match across all replicas, otherwise single-use and reuse-detection guarantees only hold within each pod's local set of clients.
+5. **`PKCE_REQUIRED`, `ALLOWED_GROUPS`, `GROUPS_CLAIM`, `REVOKE_BEFORE`, `REDIRECT_URIS_EXTRA`, `REDIS_URL`, `REDIS_KEY_PREFIX`, `RATE_LIMIT_ENABLED`** — any asymmetry produces "works on some pods, not others" bugs. `REDIS_URL` + `REDIS_KEY_PREFIX` in particular must match across all replicas, otherwise single-use and reuse-detection guarantees only hold within each pod's local set of clients.
 
 Recommended Deployment shape:
 
@@ -913,6 +916,7 @@ The `manifests/` folder ships a turn-key demo: a Docker Compose stack (Keycloak 
 - `MCP_LOG_BODY_MAX` / `MCP_PER_SUBJECT_CONCURRENCY` not parseable as non-negative integers.
 - `SHUTDOWN_TIMEOUT` / `REVOKE_BEFORE` unparseable as duration / RFC3339.
 - `ACCESS_LOG_SKIP_RE` not compilable as a Go RE2 regexp.
+- `REDIRECT_URIS_EXTRA` entry that is not an exact custom-scheme URI or `<scheme>://*` (see the env table for the rejection classes).
 - `UPSTREAM_FORWARD_IDP_TOKEN=true` without `REDIS_URL` under `PROD_MODE`, or together with `UPSTREAM_AUTHORIZATION_HEADER`. Without a replay store, a stolen refresh token would mint a forwardable IdP token on every replay. Outside `PROD_MODE`, with `REDIS_REQUIRED=false`, the proxy falls back to an in-memory replay store (single instance only, log `replay_store_in_memory`).
 
 Non-fatal startup warnings:

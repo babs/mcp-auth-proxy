@@ -1,7 +1,9 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -216,6 +218,11 @@ type Config struct {
 	// deployments keep starting; a startup warning flags it for
 	// removal. env: CSP_FORM_ACTION_EXTRA, comma-separated.
 	CSPFormActionExtra []string
+	// RedirectURIsExtra lets /register accept custom-scheme redirect
+	// URIs (native MCP clients, RFC 8252 §7.1) beyond the built-in
+	// https / loopback-http rules. env: REDIRECT_URIS_EXTRA,
+	// comma-separated exact URIs or `<scheme>://*`.
+	RedirectURIsExtra RedirectAllowlist
 	// secretWeakWarning is non-empty when TOKEN_SIGNING_SECRET matches
 	// an obvious-weakness pattern (all-same byte, or short repeating
 	// period). Exposed via
@@ -592,6 +599,11 @@ func Load() (*Config, error) {
 		}
 	}
 
+	c.RedirectURIsExtra, err = ParseRedirectAllowlist(os.Getenv("REDIRECT_URIS_EXTRA"))
+	if err != nil {
+		return nil, fmt.Errorf("REDIRECT_URIS_EXTRA: %w", err)
+	}
+
 	c.PerSubjectConcurrency = 16
 	if v := os.Getenv("MCP_PER_SUBJECT_CONCURRENCY"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
@@ -718,6 +730,172 @@ func parseExtraScopes(raw string) ([]string, error) {
 		out = append(out, s)
 	}
 	return out, nil
+}
+
+// RedirectAllowlist holds operator-approved custom-scheme redirect
+// URIs: exact strings, plus schemes whose every URI is accepted.
+type RedirectAllowlist struct {
+	entries []string
+	exact   map[string]bool
+	schemes map[string]bool
+}
+
+// Entries returns the validated list as configured, for startup logging.
+func (a RedirectAllowlist) Entries() []string {
+	return slices.Clone(a.entries)
+}
+
+// Allows reports whether the allowlist accepts the redirect URI raw.
+// http(s) never match: they keep their own rules.
+func (a RedirectAllowlist) Allows(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || IsWebScheme(u.Scheme) {
+		return false
+	}
+	norm, err := canonicalCustomRedirect(raw, u)
+	if err != nil {
+		return false
+	}
+	return a.schemes[u.Scheme] || a.exact[norm]
+}
+
+// MaxRedirectURILength caps a redirect URI at /register and an exact
+// REDIRECT_URIS_EXTRA entry, so a listed entry is always registrable.
+const MaxRedirectURILength = 512
+
+var (
+	uriSchemeRE = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+.-]*$`)
+	// Schemes a browser executes, resolves locally or hands to a
+	// privileged handler instead of a native app.
+	deniedRedirectSchemes = map[string]bool{
+		"javascript": true, "data": true, "file": true, "vbscript": true,
+		"blob": true, "about": true, "intent": true, "view-source": true,
+		"jar": true, "filesystem": true, "chrome": true, "chrome-extension": true,
+		"moz-extension": true, "ms-settings": true, "ws": true, "wss": true,
+		"ms-msdt": true, "search-ms": true, "search": true, "ms-officecmd": true,
+		"ms-word": true, "ms-excel": true, "ms-powerpoint": true,
+	}
+)
+
+// IsWebScheme reports whether scheme (any case) is http or https.
+func IsWebScheme(scheme string) bool {
+	return strings.EqualFold(scheme, "http") || strings.EqualFold(scheme, "https")
+}
+
+// IsDeniedRedirectScheme reports whether scheme (any case) must never
+// be a redirect target.
+func IsDeniedRedirectScheme(scheme string) bool {
+	return deniedRedirectSchemes[strings.ToLower(scheme)]
+}
+
+// DeniedRedirectSchemes returns the denied schemes, sorted.
+func DeniedRedirectSchemes() []string {
+	return slices.Sorted(maps.Keys(deniedRedirectSchemes))
+}
+
+func checkRedirectScheme(entry, scheme string) error {
+	if IsWebScheme(scheme) || IsDeniedRedirectScheme(scheme) {
+		return fmt.Errorf("%q: scheme %q is not allowed", entry, scheme)
+	}
+	return nil
+}
+
+// canonicalCustomRedirect returns raw with its scheme lower-cased, or
+// an error when raw is not a well-formed custom-scheme redirect URI in
+// the exact form /callback re-emits.
+func canonicalCustomRedirect(raw string, u *url.URL) (string, error) {
+	switch {
+	case len(raw) > MaxRedirectURILength:
+		return "", fmt.Errorf("exceeds %d characters", MaxRedirectURILength)
+	case u.Opaque != "":
+		return "", errors.New("opaque URI (want <scheme>://... or <scheme>:/path)")
+	case strings.Contains(raw, "#"):
+		return "", errors.New("must not contain a fragment")
+	case u.User != nil:
+		return "", errors.New("must not contain userinfo")
+	case u.Host == "" && u.Path == "":
+		return "", errors.New("must have a host or a path")
+	}
+	for i := range len(raw) {
+		if c := raw[i]; c < 0x21 || c == 0x7f || c == '"' || c == '<' || c == '>' {
+			return "", errors.New(`must not contain spaces, control characters, '"', '<' or '>'`)
+		}
+	}
+	if u.RawQuery != "" {
+		if _, err := url.ParseQuery(u.RawQuery); err != nil {
+			return "", fmt.Errorf("invalid query: %w", err)
+		}
+	}
+	norm := u.Scheme + raw[len(u.Scheme):]
+	if u.String() != norm {
+		return "", errors.New("must be in canonical form (percent-encode special characters)")
+	}
+	return norm, nil
+}
+
+// ParseRedirectAllowlist parses REDIRECT_URIS_EXTRA: comma-separated
+// exact URIs or `<scheme>://*`. Rejected: any other wildcard, http(s)
+// and denied schemes, fragment, userinfo, opaque form, neither host nor
+// path, spaces / control characters / '"' / '<' / '>', an unparsable
+// query, a form that does not survive a parse/serialize round trip, and
+// exact entries longer than MaxRedirectURILength. Duplicates are dropped.
+func ParseRedirectAllowlist(raw string) (RedirectAllowlist, error) {
+	a := RedirectAllowlist{exact: map[string]bool{}, schemes: map[string]bool{}}
+	for _, e := range strings.Split(raw, ",") {
+		e = strings.TrimSpace(e)
+		if e == "" {
+			continue
+		}
+		if scheme, ok := strings.CutSuffix(e, "://*"); ok && !strings.Contains(scheme, "*") {
+			s, err := parseSchemeWildcard(e, scheme)
+			if err != nil {
+				return RedirectAllowlist{}, err
+			}
+			if !a.schemes[s] {
+				a.schemes[s] = true
+				a.entries = append(a.entries, s+"://*")
+			}
+			continue
+		}
+		x, err := parseExactRedirect(e)
+		if err != nil {
+			return RedirectAllowlist{}, err
+		}
+		if !a.exact[x] {
+			a.exact[x] = true
+			a.entries = append(a.entries, x)
+		}
+	}
+	return a, nil
+}
+
+func parseSchemeWildcard(entry, scheme string) (string, error) {
+	if !uriSchemeRE.MatchString(scheme) {
+		return "", fmt.Errorf("%q: missing or invalid scheme", entry)
+	}
+	scheme = strings.ToLower(scheme)
+	return scheme, checkRedirectScheme(entry, scheme)
+}
+
+func parseExactRedirect(e string) (string, error) {
+	if strings.Contains(e, "*") {
+		return "", fmt.Errorf("%q: wildcards are only supported as <scheme>://*", e)
+	}
+	u, err := url.Parse(e)
+	if err != nil {
+		return "", fmt.Errorf("%q: invalid URI: %w", e, err)
+	}
+	if u.Scheme == "" {
+		return "", fmt.Errorf("%q: missing or invalid scheme", e)
+	}
+	if err := checkRedirectScheme(e, u.Scheme); err != nil {
+		return "", err
+	}
+	norm, err := canonicalCustomRedirect(e, u)
+	if err != nil {
+		return "", fmt.Errorf("%q: %w", e, err)
+	}
+	return norm, nil
 }
 
 // weakSecretReason returns a non-empty human-readable reason when b

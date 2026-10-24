@@ -5,8 +5,10 @@ import (
 	"encoding/hex"
 	"net/http"
 	"net/url"
+	"slices"
 	"time"
 
+	"github.com/babs/mcp-auth-proxy/config"
 	"github.com/babs/mcp-auth-proxy/metrics"
 	"github.com/babs/mcp-auth-proxy/token"
 	"github.com/google/uuid"
@@ -55,6 +57,10 @@ type AuthorizeConfig struct {
 	// name via MCP_RESOURCE_NAME. Falls back to CanonicalResource
 	// when empty.
 	ResourceName string
+	// RedirectURIsExtra is re-checked here: removing an entry blocks new
+	// authorizations for clients registered under it (issued refresh
+	// tokens stay valid until expiry; set REVOKE_BEFORE to invalidate them).
+	RedirectURIsExtra config.RedirectAllowlist
 }
 
 // Authorize handles GET /authorize (OAuth 2.1 PKCE authorization request).
@@ -142,27 +148,8 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 			return
 		}
 
-		if redirectURI == "" {
-			recordClientDenial(logger, "redirect_uri_missing")
-			writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "redirect_uri is required", codeRedirectURIMissing)
-			return
-		}
-
-		// OAuth 2.1 §2.3.1 requires exact match (no prefix/subdomain).
-		// RFC 8252 §7.3 relaxes this for loopback redirects: the AS MUST
-		// allow any port so native apps using an ephemeral localhost
-		// port can authenticate without re-registering on every run.
-		// redirectURIMatches implements both.
-		validRedirect := false
-		for _, uri := range client.RedirectURIs {
-			if redirectURIMatches(redirectURI, uri) {
-				validRedirect = true
-				break
-			}
-		}
-		if !validRedirect {
-			recordClientDenial(logger, "redirect_uri_mismatch")
-			writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "redirect_uri does not match registered URIs", codeRedirectURIMismatch)
+		customScheme, ok := checkAuthorizeRedirect(w, r, logger, &client, redirectURI, authzCfg.RedirectURIsExtra)
+		if !ok {
 			return
 		}
 
@@ -201,7 +188,8 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 				redirectAuthzError(w, r, redirectURI, state, "invalid_request", "code_challenge must be 43-128 unreserved characters", baseURL)
 				return
 			}
-		} else if authzCfg.PKCERequired {
+		} else if authzCfg.PKCERequired || customScheme {
+			// Any local app can claim a custom scheme: S256 is mandatory there.
 			redirectAuthzError(w, r, redirectURI, state, "invalid_request", "code_challenge is required", baseURL)
 			return
 		}
@@ -385,4 +373,37 @@ func logUnknownOIDCParams(logger *zap.Logger, q url.Values) {
 			zap.String("category", category),
 		)
 	}
+}
+
+// checkAuthorizeRedirect validates redirect_uri against the client's
+// registration, rendering the error on the AS (the target is not yet
+// trusted). customScheme reports a non-http(s) redirect.
+func checkAuthorizeRedirect(w http.ResponseWriter, r *http.Request, logger *zap.Logger, client *sealedClient, redirectURI string, extra config.RedirectAllowlist) (customScheme, ok bool) {
+	if redirectURI == "" {
+		recordClientDenial(logger, "redirect_uri_missing")
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "redirect_uri is required", codeRedirectURIMissing)
+		return false, false
+	}
+
+	// OAuth 2.1 §2.3.1 requires exact match (no prefix/subdomain).
+	// RFC 8252 §7.3 relaxes this for loopback redirects: the AS MUST
+	// allow any port so native apps using an ephemeral localhost
+	// port can authenticate without re-registering on every run.
+	// redirectURIMatches implements both.
+	if !slices.ContainsFunc(client.RedirectURIs, func(uri string) bool { return redirectURIMatches(redirectURI, uri) }) {
+		recordClientDenial(logger, "redirect_uri_mismatch")
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "redirect_uri does not match registered URIs", codeRedirectURIMismatch)
+		return false, false
+	}
+
+	u, err := url.Parse(redirectURI)
+	if err == nil && config.IsWebScheme(u.Scheme) {
+		return false, true
+	}
+	if !extra.Allows(redirectURI) {
+		recordClientDenial(logger, "redirect_uri_not_allowlisted", zap.String("internal_id", client.ID))
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "redirect_uri scheme is not allowlisted by the operator", codeRedirectURIMismatch)
+		return false, false
+	}
+	return true, true
 }

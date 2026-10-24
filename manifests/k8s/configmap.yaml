@@ -129,6 +129,11 @@ data:
   # In forwarding mode, set the upstream's scope here.
   # OIDC_EXTRA_SCOPES: "api://<upstream-app>/<scope> offline_access"
 
+  # Comma-separated custom-scheme redirect URIs /register accepts for
+  # native clients: exact URIs (no commas) or <scheme>://* (any non-opaque
+  # URI of that scheme). /authorize enforces PKCE S256 for custom schemes.
+  # REDIRECT_URIS_EXTRA: "warp://*"
+
   # Access-log path filter (public listener only). Go RE2 regexp matched
   # against r.URL.Path; matches are dropped from the access log. Handler
   # response, Prometheus counters, and panic recovery are unaffected.

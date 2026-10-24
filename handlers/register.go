@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/babs/mcp-auth-proxy/config"
 	"github.com/babs/mcp-auth-proxy/metrics"
 	"github.com/babs/mcp-auth-proxy/token"
 	"github.com/google/uuid"
@@ -28,10 +29,10 @@ const (
 	// Cap DCR amplification: a client
 	// registration bloats the sealed client_id (and any logs/metrics
 	// referencing it) in proportion to the submitted redirect_uris. Five
-	// URIs of 512 chars each is well above any legitimate need.
-	maxRedirectURIs      = 5
-	maxRedirectURILength = 512
-	maxClientNameLength  = 512
+	// URIs of 512 chars each (config.MaxRedirectURILength) is well
+	// above any legitimate need.
+	maxRedirectURIs     = 5
+	maxClientNameLength = 512
 )
 
 type registerRequest struct {
@@ -61,13 +62,23 @@ type registerResponse struct {
 	TokenEndpointAuthMethod string `json:"token_endpoint_auth_method"`
 }
 
+// RegisterConfig holds the /register settings.
+type RegisterConfig struct {
+	// ClientTTL is the sealed client_id's lifetime; pass
+	// DefaultClientTTL to keep the standard 7-day envelope (aligns with
+	// refreshTokenTTL so a client holding a still-valid refresh can
+	// always exchange it). 0 = never expires.
+	ClientTTL time.Duration
+	// RedirectURIsExtra admits operator-listed custom-scheme redirect
+	// URIs (REDIRECT_URIS_EXTRA).
+	RedirectURIsExtra config.RedirectAllowlist
+}
+
 // Register handles POST /register (RFC 7591 Dynamic Client Registration).
 // Client record is encrypted into the client_id itself for stateless operation.
-// audience binds the client to a specific proxy deployment. clientTTL
-// is the sealed client_id's lifetime; pass DefaultClientTTL to keep
-// the standard 7-day envelope (aligns with refreshTokenTTL so a
-// client holding a still-valid refresh can always exchange it).
-func Register(tm *token.Manager, logger *zap.Logger, audience string, clientTTL time.Duration) http.HandlerFunc {
+// audience binds the client to a specific proxy deployment.
+func Register(tm *token.Manager, logger *zap.Logger, audience string, regCfg RegisterConfig) http.HandlerFunc {
+	clientTTL := regCfg.ClientTTL
 	return func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 
@@ -132,59 +143,8 @@ func Register(tm *token.Manager, logger *zap.Logger, audience string, clientTTL 
 			return
 		}
 
-		// OAuth 2.1 §2.3.1: non-loopback redirect URIs must use HTTPS.
-		// M5/M6: also reject oversize, fragment-bearing, and userinfo-bearing
-		// URIs. Fragment is forbidden by OAuth 2.1 §7.5; userinfo amplifies
-		// phishing (https://attacker:pass@legit.example/cb visually legit).
 		for _, raw := range req.RedirectURIs {
-			if len(raw) > maxRedirectURILength {
-				writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri exceeds maximum length")
-				return
-			}
-			u, err := url.Parse(raw)
-			if err != nil {
-				writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "malformed redirect_uri")
-				return
-			}
-			// Require an absolute URI with a real authority.
-			// url.Parse("https:foo")  → Scheme="https", Opaque="foo", Host=""
-			// url.Parse("https:///x") → Scheme="https", Host=""
-			// Neither is a valid OAuth redirect target per RFC 3986 §3.
-			// Without these checks the scheme switch below lets them
-			// through and the /callback redirect later emits a broken
-			// Location header to the browser.
-			if u.Opaque != "" {
-				writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must be an absolute URI with authority, not opaque")
-				return
-			}
-			if u.Host == "" {
-				writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must include a host")
-				return
-			}
-			// Also trip on a trailing bare "#" (url.Parse leaves Fragment
-			// empty for "https://x/cb#" even though the marker is present).
-			if u.Fragment != "" || strings.Contains(raw, "#") {
-				writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must not contain a fragment")
-				return
-			}
-			if u.User != nil {
-				writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must not contain userinfo")
-				return
-			}
-			// Only http(s) schemes are meaningful for a browser-driven
-			// OAuth callback. Anything else (custom app schemes, ftp, ldap,
-			// etc.) is almost certainly a mistake; rejecting them early
-			// avoids a confusing failure mode downstream.
-			switch u.Scheme {
-			case "https":
-				// always allowed
-			case "http":
-				if !isLoopback(u) {
-					writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must use HTTPS for non-loopback addresses")
-					return
-				}
-			default:
-				writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri scheme must be http (loopback only) or https")
+			if !validateRedirectURI(w, r, raw, regCfg.RedirectURIsExtra) {
 				return
 			}
 		}
@@ -251,4 +211,55 @@ func Register(tm *token.Manager, logger *zap.Logger, audience string, clientTTL 
 			TokenEndpointAuthMethod: authMethod,
 		})
 	}
+}
+
+// validateRedirectURI writes the RFC 7591 §3.2.2 error and returns
+// false when raw is not an acceptable redirect URI.
+//
+// OAuth 2.1 §2.3.1: non-loopback redirect URIs must use HTTPS.
+// Also reject oversize, fragment-bearing, and userinfo-bearing
+// URIs. Fragment is forbidden by OAuth 2.1 §7.5; userinfo amplifies
+// phishing (https://attacker:pass@legit.example/cb visually legit).
+func validateRedirectURI(w http.ResponseWriter, r *http.Request, raw string, extra config.RedirectAllowlist) bool {
+	if len(raw) > config.MaxRedirectURILength {
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri exceeds maximum length")
+		return false
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "malformed redirect_uri")
+		return false
+	}
+	// url.Parse("https:foo") → Opaque="foo"; url.Parse("https:///x") →
+	// Host="". Neither is a valid http(s) redirect target per RFC 3986
+	// §3, and /callback would emit a broken Location header for them.
+	if u.Opaque != "" {
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must not be opaque")
+		return false
+	}
+	web := config.IsWebScheme(u.Scheme)
+	if web && u.Host == "" {
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must include a host")
+		return false
+	}
+	// Also trip on a trailing bare "#" (url.Parse leaves Fragment
+	// empty for "https://x/cb#" even though the marker is present).
+	if u.Fragment != "" || strings.Contains(raw, "#") {
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must not contain a fragment")
+		return false
+	}
+	if u.User != nil {
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must not contain userinfo")
+		return false
+	}
+	// Non-http(s) schemes only via REDIRECT_URIS_EXTRA.
+	if !web && !extra.Allows(raw) {
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri scheme must be http (loopback only), https, or a scheme allowlisted by the operator")
+		return false
+	}
+	if u.Scheme == "http" && !isLoopback(u) {
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must use HTTPS for non-loopback addresses")
+		return false
+	}
+	return true
 }

@@ -188,6 +188,9 @@ type testProxyOptions struct {
 	// store so single-use claims and their release are exercised.
 	forwardIdPToken bool
 	extraScopes     []string
+	// redirectURIsExtra wires REDIRECT_URIS_EXTRA into /register and
+	// /authorize.
+	redirectURIsExtra config.RedirectAllowlist
 }
 
 func buildTestProxy(t *testing.T, oidcProvider *mockOIDCProvider, mcpServer *mockMCPServer, proxyBaseURL string, renderConsent bool, opts ...testProxyOptions) http.Handler {
@@ -247,7 +250,7 @@ func buildTestProxy(t *testing.T, oidcProvider *mockOIDCProvider, mcpServer *moc
 	// exercise the same router shape main builds (BrowserFacing markers
 	// included), or the two silently diverge.
 	registerOAuthRoutes(r, oauthRoutes{
-		Register: handlers.Register(tm, zap.NewNop(), proxyBaseURL, handlers.DefaultClientTTL),
+		Register: handlers.Register(tm, zap.NewNop(), proxyBaseURL, handlers.RegisterConfig{ClientTTL: handlers.DefaultClientTTL, RedirectURIsExtra: opt.redirectURIsExtra}),
 		Authorize: handlers.Authorize(tm, zap.NewNop(), proxyBaseURL, oauth2Cfg, handlers.AuthorizeConfig{
 			PKCERequired:      true,
 			CanonicalResource: proxyBaseURL + "/mcp",
@@ -255,6 +258,7 @@ func buildTestProxy(t *testing.T, oidcProvider *mockOIDCProvider, mcpServer *moc
 			// drive the direct-to-IdP path;
 			// TestE2E_ConsentFlowThroughProductionRouter runs it true.
 			RenderConsentPage: renderConsent,
+			RedirectURIsExtra: opt.redirectURIsExtra,
 		}),
 		Consent:       handlers.Consent(tm, zap.NewNop(), proxyBaseURL, oauth2Cfg, handlers.ConsentConfig{}),
 		Callback:      handlers.Callback(tm, zap.NewNop(), proxyBaseURL, oauth2Cfg, verifier, newCallbackConfig(cfg, replayStore, nil)),
@@ -619,8 +623,18 @@ func TestE2E_FullOAuthMCPFlow(t *testing.T) {
 // emits.
 func driveAuthToCallback(t *testing.T, client *http.Client, proxyURL string, oidcMock *mockOIDCProvider) *http.Response {
 	t.Helper()
+	resp, _ := driveAuthToCallbackURI(t, client, proxyURL, oidcMock, "https://claude.ai/api/mcp/auth_callback")
+	return resp
+}
 
-	redirectURI := "https://claude.ai/api/mcp/auth_callback"
+// e2eCodeVerifier is the PKCE verifier driveAuthToCallbackURI sends.
+const e2eCodeVerifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+
+// driveAuthToCallbackURI runs register → authorize → callback for
+// redirectURI and returns the /callback response and the client_id.
+func driveAuthToCallbackURI(t *testing.T, client *http.Client, proxyURL string, oidcMock *mockOIDCProvider, redirectURI string) (*http.Response, string) {
+	t.Helper()
+
 	body := fmt.Sprintf(`{"redirect_uris":["%s"],"client_name":"Claude"}`, redirectURI)
 
 	regReq, err := http.NewRequestWithContext(t.Context(), http.MethodPost, proxyURL+"/register", strings.NewReader(body))
@@ -639,10 +653,12 @@ func driveAuthToCallback(t *testing.T, client *http.Client, proxyURL string, oid
 	if err := regResp.Body.Close(); err != nil {
 		t.Fatalf("close /register body: %v", err)
 	}
-	clientID := reg["client_id"].(string)
+	clientID, ok := reg["client_id"].(string)
+	if !ok {
+		t.Fatalf("/register returned no client_id: %v", reg)
+	}
 
-	codeVerifier := "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
-	codeChallenge := handlers.ComputePKCEChallenge(codeVerifier)
+	codeChallenge := handlers.ComputePKCEChallenge(e2eCodeVerifier)
 
 	params := url.Values{
 		"response_type":         {"code"},
@@ -679,7 +695,72 @@ func driveAuthToCallback(t *testing.T, client *http.Client, proxyURL string, oid
 	if err != nil {
 		t.Fatalf("GET /callback: %v", err)
 	}
-	return cbResp
+	return cbResp, clientID
+}
+
+// TestE2E_CustomSchemeRedirect drives register → authorize → callback
+// through the real router with REDIRECT_URIS_EXTRA set, for a scheme
+// wildcard and a host-less exact entry.
+func TestE2E_CustomSchemeRedirect(t *testing.T) {
+	extra, err := config.ParseRedirectAllowlist("warp://*,com.example.app:/cb")
+	if err != nil {
+		t.Fatalf("ParseRedirectAllowlist: %v", err)
+	}
+	for _, redirectURI := range []string{"warp://dev.warp.Warp-Stable/mcp/callback", "com.example.app:/cb"} {
+		t.Run(redirectURI, func(t *testing.T) {
+			oidcMock := newMockOIDCProvider(t)
+			defer oidcMock.Close()
+			mcpMock := newMockMCPServer(t)
+			defer mcpMock.Close()
+			proxyServer := httptest.NewServer(buildTestProxy(t, oidcMock, mcpMock, "http://proxy.test", false, testProxyOptions{redirectURIsExtra: extra}))
+			defer proxyServer.Close()
+			client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+			resp, clientID := driveAuthToCallbackURI(t, client, proxyServer.URL, oidcMock, redirectURI)
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusFound {
+				b, _ := io.ReadAll(resp.Body)
+				t.Fatalf("callback: want 302, got %d: %s", resp.StatusCode, b)
+			}
+			loc := resp.Header.Get("Location")
+			if !strings.HasPrefix(loc, redirectURI+"?") {
+				t.Fatalf("Location = %q, want prefix %q", loc, redirectURI+"?")
+			}
+			u, err := url.Parse(loc)
+			if err != nil {
+				t.Fatalf("parse Location: %v", err)
+			}
+			q := u.Query()
+			if q.Get("code") == "" || q.Get("state") != "s" || q.Get("iss") != "http://proxy.test" {
+				t.Fatalf("Location query = %v, want code, state=s, iss=http://proxy.test", q)
+			}
+
+			form := url.Values{
+				"grant_type":    {"authorization_code"},
+				"code":          {q.Get("code")},
+				"redirect_uri":  {redirectURI},
+				"client_id":     {clientID},
+				"code_verifier": {e2eCodeVerifier},
+			}
+			tokReq, err := http.NewRequestWithContext(t.Context(), http.MethodPost, proxyServer.URL+"/token", strings.NewReader(form.Encode()))
+			if err != nil {
+				t.Fatalf("build /token: %v", err)
+			}
+			tokReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			tokResp, err := client.Do(tokReq)
+			if err != nil {
+				t.Fatalf("POST /token: %v", err)
+			}
+			defer tokResp.Body.Close()
+			var tok map[string]any
+			if err := json.NewDecoder(tokResp.Body).Decode(&tok); err != nil {
+				t.Fatalf("decode /token: %v", err)
+			}
+			if tokResp.StatusCode != http.StatusOK || tok["access_token"] == nil || tok["access_token"] == "" {
+				t.Errorf("/token = %d %v, want 200 with access_token", tokResp.StatusCode, tok)
+			}
+		})
+	}
 }
 
 // TestE2E_RejectsUnverifiedEmail verifies that when the IdP emits

@@ -283,7 +283,7 @@ func TestRegister_RejectsTooManyRedirectURIs(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(string(body)))
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
-	Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
+	Register(tm, zap.NewNop(), testBaseURL, RegisterConfig{ClientTTL: DefaultClientTTL})(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("M5 count cap: expected 400, got %d: %s", rr.Code, rr.Body.String())
@@ -304,7 +304,7 @@ func TestRegister_RejectsOversizeRedirectURI(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(string(body)))
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
-	Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
+	Register(tm, zap.NewNop(), testBaseURL, RegisterConfig{ClientTTL: DefaultClientTTL})(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("M5 length cap: expected 400, got %d: %s", rr.Code, rr.Body.String())
@@ -325,7 +325,7 @@ func TestRegister_RejectsOversizeClientName(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(string(body)))
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
-	Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
+	Register(tm, zap.NewNop(), testBaseURL, RegisterConfig{ClientTTL: DefaultClientTTL})(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("client_name cap: expected 400, got %d: %s", rr.Code, rr.Body.String())
@@ -350,7 +350,7 @@ func TestRegister_OversizedBodyReturns413(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
-	Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
+	Register(tm, zap.NewNop(), testBaseURL, RegisterConfig{ClientTTL: DefaultClientTTL})(rr, req)
 
 	if rr.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status = %d, want 413", rr.Code)
@@ -374,7 +374,7 @@ func TestRegister_MalformedBodyReturns400(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader("not-json"))
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
-	Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
+	Register(tm, zap.NewNop(), testBaseURL, RegisterConfig{ClientTTL: DefaultClientTTL})(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rr.Code)
@@ -416,7 +416,7 @@ func TestRegister_RejectsClientNameControlBytes(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(string(body)))
 			req.Header.Set("Content-Type", "application/json")
 			rr := httptest.NewRecorder()
-			Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
+			Register(tm, zap.NewNop(), testBaseURL, RegisterConfig{ClientTTL: DefaultClientTTL})(rr, req)
 
 			if rr.Code != http.StatusBadRequest {
 				t.Fatalf("status = %d, want 400", rr.Code)
@@ -447,7 +447,7 @@ func TestRegister_RejectsFragmentAndUserinfo(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(string(body)))
 			req.Header.Set("Content-Type", "application/json")
 			rr := httptest.NewRecorder()
-			Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
+			Register(tm, zap.NewNop(), testBaseURL, RegisterConfig{ClientTTL: DefaultClientTTL})(rr, req)
 
 			if rr.Code != http.StatusBadRequest {
 				t.Fatalf("M6 %s: expected 400, got %d: %s", tc.name, rr.Code, rr.Body.String())
@@ -527,22 +527,32 @@ func TestRefreshToken_RejectsMissingFamilyOrTokenID(t *testing.T) {
 func TestRegister_RejectsNonHTTPScheme(t *testing.T) {
 	tm := newTestTokenManager(t)
 
-	badSchemes := []string{
-		"ftp://127.0.0.1/cb",
-		"ldap://127.0.0.1/cb",
-		"file:///etc/passwd",
-		"customapp://127.0.0.1/cb",
-		"javascript:alert(1)",
+	const schemeErr = "redirect_uri scheme must be http (loopback only), https, or a scheme allowlisted by the operator"
+	badSchemes := map[string]string{
+		"ftp://127.0.0.1/cb":         schemeErr,
+		"ldap://127.0.0.1/cb":        schemeErr,
+		"file:///etc/passwd":         schemeErr,
+		"customapp://127.0.0.1/cb":   schemeErr,
+		"javascript://x/%0aalert(1)": schemeErr,
+		"data://x/y":                 schemeErr,
+		"javascript:alert(1)":        "redirect_uri must not be opaque",
 	}
-	for _, uri := range badSchemes {
+	for uri, wantDesc := range badSchemes {
 		t.Run(uri, func(t *testing.T) {
 			body, _ := json.Marshal(map[string]any{"redirect_uris": []string{uri}, "client_name": "bad"})
 			req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/register", strings.NewReader(string(body)))
 			req.Header.Set("Content-Type", "application/json")
 			rr := httptest.NewRecorder()
-			Register(tm, zap.NewNop(), testBaseURL, DefaultClientTTL)(rr, req)
+			Register(tm, zap.NewNop(), testBaseURL, RegisterConfig{ClientTTL: DefaultClientTTL})(rr, req)
 			if rr.Code != http.StatusBadRequest {
 				t.Fatalf("scheme %q: expected 400, got %d: %s", uri, rr.Code, rr.Body.String())
+			}
+			var oe OAuthError
+			if err := json.NewDecoder(rr.Body).Decode(&oe); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if oe.ErrorDescription != wantDesc {
+				t.Errorf("error_description = %q, want %q", oe.ErrorDescription, wantDesc)
 			}
 		})
 	}

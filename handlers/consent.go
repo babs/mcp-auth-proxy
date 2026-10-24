@@ -7,8 +7,10 @@ import (
 	"html/template"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
+	"github.com/babs/mcp-auth-proxy/config"
 	"github.com/babs/mcp-auth-proxy/metrics"
 	"github.com/babs/mcp-auth-proxy/replay"
 	"github.com/babs/mcp-auth-proxy/token"
@@ -152,7 +154,15 @@ var navInterstitialTmpl = template.Must(template.New("nav").Parse(`<!doctype htm
 func renderNavInterstitial(w http.ResponseWriter, r *http.Request, logger *zap.Logger, targetURL string) {
 	// The target URL embeds a single-use sealed session (approve) or
 	// the client's error envelope — renderHTMLPage marks it no-store.
-	if err := renderHTMLPage(w, "interstitial", http.StatusOK, navInterstitialCSP, navInterstitialTmpl, struct{ URL string }{targetURL}); err != nil {
+	u, err := url.Parse(targetURL)
+	if err != nil || config.IsDeniedRedirectScheme(u.Scheme) {
+		metrics.PageRenderFailed.WithLabelValues("interstitial").Inc()
+		logger.Warn("nav_interstitial_denied_scheme", zap.Error(err))
+		writeOAuthError(w, r, http.StatusInternalServerError, "server_error", "internal error", codeInterstitialFailed)
+		return
+	}
+	// html/template rewrites non-http(s) URLs to #ZgotmplZ; scheme denylist checked above.
+	if err := renderHTMLPage(w, "interstitial", http.StatusOK, navInterstitialCSP, navInterstitialTmpl, struct{ URL template.URL }{template.URL(targetURL)}); err != nil { //nolint:gosec // G203: scheme denylist checked above
 		logger.Warn("nav_interstitial_execute_failed", zap.Error(err))
 		writeOAuthError(w, r, http.StatusInternalServerError, "server_error", "internal error", codeInterstitialFailed)
 	}
@@ -229,16 +239,23 @@ func renderConsent(w http.ResponseWriter, r *http.Request, tm *token.Manager, lo
 	}
 }
 
-// redirectHost returns the host[:port] component of a redirect URI
-// for the consent page's "Will redirect to" line. The full URI is
-// not shown because the path/query are noise for the user's trust
-// decision — the registered host is what matters. Falls back to the
+// redirectHost returns the host[:port] component of an http(s)
+// redirect URI for the consent page's "Will redirect to" line. The
+// full URI is not shown because the path/query are noise for the
+// user's trust decision — the registered host is what matters. Falls back to the
 // raw input on parse failure (the URI was already validated at DCR
 // time, so a parse failure here is an invariant breach worth
 // surfacing rather than hiding behind an empty string).
 func redirectHost(redirectURI string) string {
 	u, err := url.Parse(redirectURI)
-	if err != nil || u.Host == "" {
+	if err != nil {
+		return redirectURI
+	}
+	if !config.IsWebScheme(u.Scheme) { // scheme names the receiving app; canonical raw keeps escapes, so no bidi/space spoofing
+		uri, _, _ := strings.Cut(redirectURI, "?")
+		return uri
+	}
+	if u.Host == "" {
 		return redirectURI
 	}
 	return u.Host
@@ -483,13 +500,8 @@ func Consent(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg *o
 			oauth2.S256ChallengeOption(upstreamVerifier),
 		)
 
-		// Counter + log + interstitial together — none of the three
-		// can fail (oauth2Cfg.AuthCodeURL is a string-builder, the
-		// interstitial render only logs on template error), so the
-		// order is observability-only. Keeping increment immediately
-		// before the render call keeps the funnel-counter semantics
-		// unambiguous if a future change introduces failure between
-		// these two lines.
+		// The approval is counted even if the interstitial then fails
+		// (template error or denied/unparsable target answers a 500).
 		//
 		// 200 interstitial, NOT a 302: see navInterstitialTmpl — a
 		// redirect here would re-enter Chromium's form-action chain

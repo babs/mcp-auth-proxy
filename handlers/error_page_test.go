@@ -342,7 +342,7 @@ func TestMachineEndpoints_NeverRenderHTML(t *testing.T) {
 				r.Header.Set("Content-Type", "application/json")
 				return r
 			},
-			serve: Register(tm, zap.NewNop(), testBaseURL, time.Hour),
+			serve: Register(tm, zap.NewNop(), testBaseURL, RegisterConfig{ClientTTL: time.Hour}),
 		},
 	}
 

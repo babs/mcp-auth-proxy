@@ -2258,3 +2258,137 @@ func TestGroupsCeilingFitsHeaderBudget(t *testing.T) {
 	}
 	t.Logf("derived ceiling %d B, derived MaxHeaderBytes %d B -> Authorization %d B, %d B spare", ceiling, maxHeaderBytes, line, maxHeaderBytes-line)
 }
+
+// TestLoad_RedirectURIsExtra pins the REDIRECT_URIS_EXTRA contract:
+// exact URIs or <scheme>://*, everything else fails startup with a
+// reason-specific error.
+func TestLoad_RedirectURIsExtra(t *testing.T) {
+	t.Run("unset yields empty allowlist", func(t *testing.T) {
+		setAllRequired(t)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(cfg.RedirectURIsExtra.Entries()) != 0 {
+			t.Errorf("Entries = %v, want empty", cfg.RedirectURIsExtra.Entries())
+		}
+		if cfg.RedirectURIsExtra.Allows("warp://x/cb") {
+			t.Error("empty allowlist allowed warp://x/cb")
+		}
+	})
+
+	t.Run("accepts exact, wildcard and host-less entries", func(t *testing.T) {
+		setAllRequired(t)
+		t.Setenv("REDIRECT_URIS_EXTRA", " warp://dev.warp.Warp-Stable/mcp/callback , , vscode://h/cb?windowId=1&x=a%20b , CuRsOr://* , com.example.app:/cb , Warp://h/cb , cursor://* , warp://h/cb , warp://x/"+strings.Repeat("a", 503))
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// Duplicates (after scheme lower-casing) are dropped; 512 chars is the inclusive cap.
+		want := []string{"warp://dev.warp.Warp-Stable/mcp/callback", "vscode://h/cb?windowId=1&x=a%20b", "cursor://*", "com.example.app:/cb", "warp://h/cb", "warp://x/" + strings.Repeat("a", 503)}
+		if !slices.Equal(cfg.RedirectURIsExtra.Entries(), want) {
+			t.Errorf("Entries = %v, want %v", cfg.RedirectURIsExtra.Entries(), want)
+		}
+		for raw, allowed := range map[string]bool{
+			"warp://dev.warp.Warp-Stable/mcp/callback": true,
+			"warp://dev.warp.Warp-Stable/mcp/other":    false,
+			"cursor://anything/at/all":                 true,
+			"CURSOR://anything":                        true,
+			"com.example.app:/cb":                      true,
+			"com.example.app:/other":                   false,
+			"https://dev.warp.Warp-Stable/cb":          false,
+			"warp://h/cb":                              true,
+			"WARP://h/cb":                              true,
+			"cursor://evil.com@x/cb":                   false,
+			"cursor://h/cb#f":                          false,
+			"cursor:foo":                               false,
+			"cursor://h/cb?q=a b":                      false,
+		} {
+			if got := cfg.RedirectURIsExtra.Allows(raw); got != allowed {
+				t.Errorf("Allows(%q) = %v, want %v", raw, got, allowed)
+			}
+		}
+	})
+
+	for _, bad := range []struct{ name, val, wantErr string }{
+		{"bare wildcard", "*", "wildcards are only supported"},
+		{"path wildcard", "warp://host/*", "wildcards are only supported"},
+		{"scheme wildcard", "*://x", "wildcards are only supported"},
+		{"opaque wildcard", "warp:*", "wildcards are only supported"},
+		{"double wildcard", "*://*", "wildcards are only supported"},
+		{"empty scheme wildcard", "://*", "missing or invalid scheme"},
+		{"https exact", "https://x/cb", `scheme "https" is not allowed`},
+		{"http uppercase exact", "HTTP://localhost/cb", `scheme "http" is not allowed`},
+		{"https wildcard", "HTTPS://*", `scheme "https" is not allowed`},
+		{"intent", "intent://x/cb", `scheme "intent" is not allowed`},
+		{"view-source wildcard", "view-source://*", `scheme "view-source" is not allowed`},
+		{"jar", "jar://x/cb", `scheme "jar" is not allowed`},
+		{"filesystem", "filesystem://x/cb", `scheme "filesystem" is not allowed`},
+		{"chrome", "chrome://settings/x", `scheme "chrome" is not allowed`},
+		{"chrome-extension wildcard", "chrome-extension://*", `scheme "chrome-extension" is not allowed`},
+		{"moz-extension", "moz-extension://x/cb", `scheme "moz-extension" is not allowed`},
+		{"ms-settings", "ms-settings://x/cb", `scheme "ms-settings" is not allowed`},
+		{"ws", "ws://x/cb", `scheme "ws" is not allowed`},
+		{"wss wildcard", "WSS://*", `scheme "wss" is not allowed`},
+		{"ms-msdt", "ms-msdt://x/cb", `scheme "ms-msdt" is not allowed`},
+		{"search-ms wildcard", "search-ms://*", `scheme "search-ms" is not allowed`},
+		{"search", "search://x/cb", `scheme "search" is not allowed`},
+		{"ms-officecmd", "ms-officecmd://x/cb", `scheme "ms-officecmd" is not allowed`},
+		{"ms-word", "MS-WORD://x/cb", `scheme "ms-word" is not allowed`},
+		{"ms-excel wildcard", "ms-excel://*", `scheme "ms-excel" is not allowed`},
+		{"ms-powerpoint", "ms-powerpoint://x/cb", `scheme "ms-powerpoint" is not allowed`},
+		{"quote in host", `warp://a"b/cb`, "must not contain spaces"},
+		{"markup in host", "warp://a<script>/cb", "must not contain spaces"},
+		{"space in query", "warp://h/cb?q=a b", "must not contain spaces"},
+		{"control byte", "warp://h/c\x7fb", "invalid control character"},
+		{"bad escape in query", "warp://h/cb?x=%zz", "invalid query"},
+		{"no host no path", "myapp://", "must have a host or a path"},
+		{"bare scheme", "myapp:", "must have a host or a path"},
+		{"space in path", "warp://x/c b", "must not contain spaces"},
+		{"quote in path", `warp://x/c"b`, "must not contain spaces"},
+		{"lt in path", "warp://x/c<b", "must not contain spaces"},
+		{"gt in path", "warp://x/c>b", "must not contain spaces"},
+		{"non-canonical raw unicode", "warp://x/caf\u00e9", "must be in canonical form"},
+		{"javascript", "javascript://x", `scheme "javascript" is not allowed`},
+		{"javascript wildcard", "JavaScript://*", `scheme "javascript" is not allowed`},
+		{"data", "data:text/html;base64", `scheme "data" is not allowed`},
+		{"file", "file:///etc/passwd", `scheme "file" is not allowed`},
+		{"vbscript", "vbscript:msgbox", `scheme "vbscript" is not allowed`},
+		{"blob", "blob:https://x/uuid", `scheme "blob" is not allowed`},
+		{"about", "about:blank", `scheme "about" is not allowed`},
+		{"fragment", "warp://x/cb#frag", "must not contain a fragment"},
+		{"trailing bare #", "warp://x/cb#", "must not contain a fragment"},
+		{"userinfo", "warp://user@x/cb", "must not contain userinfo"},
+		{"opaque", "warp:foo", "opaque URI"},
+		{"empty scheme", "://x", "invalid URI"},
+		{"no scheme", "dev.warp.Warp-Stable/cb", "missing or invalid scheme"},
+		{"garbage", "warp://x/%zz", "invalid URI"},
+		{"513 chars", "warp://x/" + strings.Repeat("a", 504), "exceeds 512 characters"},
+	} {
+		t.Run("rejects "+bad.name, func(t *testing.T) {
+			setAllRequired(t)
+			t.Setenv("REDIRECT_URIS_EXTRA", "warp://ok/cb,"+bad.val)
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("Load() unexpectedly succeeded for %q", bad.val)
+			}
+			if !strings.HasPrefix(err.Error(), "REDIRECT_URIS_EXTRA: ") || !strings.Contains(err.Error(), bad.wantErr) {
+				t.Errorf("error = %q, want REDIRECT_URIS_EXTRA prefix and %q", err, bad.wantErr)
+			}
+		})
+	}
+}
+
+// TestRedirectAllowlist_NeverAllowsHTTP pins the defense-in-depth guard
+// in Allows: http(s) keep their own rules even if a map entry leaks in.
+func TestRedirectAllowlist_NeverAllowsHTTP(t *testing.T) {
+	a := RedirectAllowlist{
+		exact:   map[string]bool{"https://x/cb": true, "http://x/cb": true},
+		schemes: map[string]bool{"https": true, "http": true},
+	}
+	for _, raw := range []string{"https://x/cb", "http://x/cb", "HTTPS://x/cb"} {
+		if a.Allows(raw) {
+			t.Errorf("Allows(%q) = true, want false", raw)
+		}
+	}
+}
