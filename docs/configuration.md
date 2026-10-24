@@ -228,13 +228,16 @@ with no `error_code`.
     misconfiguration, not an attack signal).
   - `redirect_uri_not_allowlisted` — `/authorize` custom-scheme
     `redirect_uri` registered under a `REDIRECT_URIS_EXTRA` entry the
-    operator has since removed.
+    operator has since removed; logged as
+    `access_denied_redirect_uri_not_allowlisted` (`internal_id`, `error`,
+    `scheme`).
 - `mcp_auth_page_render_failed_total{page}` — template failures or
   refused navigation targets, by page (`error` / `consent` /
   `interstitial`). The error page falls back to the JSON body; the
   consent page falls back to the client's `redirect_uri` envelope; the
-  interstitial answers a proxy-side 500 `server_error`. Zero in a
-  healthy deploy.
+  interstitial answers a proxy-side 500 `server_error`; a refused
+  interstitial target is logged as `nav_interstitial_refused` (`reason`,
+  plus `scheme` when the target parses). Zero in a healthy deploy.
 - `mcp_auth_groups_claim_truncated_total` — access tokens minted with a
   truncated `groups` claim (`GROUPS_CLAIM_MAX_BYTES`, see Limits). Authorization-visible: the
   claim is forwarded upstream as `X-User-Groups`, so a truncated user

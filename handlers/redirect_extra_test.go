@@ -99,6 +99,11 @@ func TestRegister_RedirectURIsExtra(t *testing.T) {
 		{"encoded US rejected", "myapp://*", "myapp://h/cb?x=%1f", charErr},
 		{"encoded space accepted", "myapp://*", "myapp://h/a%20b", ""},
 		{"encoded slash accepted", "myapp://*", "myapp://h/a%2Fb", ""},
+		{"encoded percent before 0d accepted", "myapp://*", "myapp://h/%250d", ""},
+		{"trailing percent rejected", "warp://*", "warp://h/cb?x=%", escapeErr},
+		{"truncated escape rejected", "warp://*", "warp://h/cb?x=%0", escapeErr},
+		{"double percent rejected", "warp://*", "warp://h/cb?x=%%", escapeErr},
+		{"encoded CR in query rejected", "warp://*", "warp://h/cb?x=%0D", charErr},
 		{"pipe in path rejected", "warp://*", "warp://h/a|b", canonicalErr},
 		{"semicolon query rejected", "warp://*", "warp://h/cb?a=1;b=2", semicolonErr},
 		{"bad escape in query rejected", "warp://*", "warp://h/cb?a=%zz", escapeErr},
@@ -323,10 +328,14 @@ func TestRenderNavInterstitial_DeniedSchemes(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "/consent", nil)
 			rr := httptest.NewRecorder()
 			renderNavInterstitial(rr, req, zap.New(core), target)
-			if n := logs.FilterMessageSnippet("nav_interstitial_").Len(); n != 1 {
-				t.Fatalf("want 1 nav_interstitial_* log, got %d", n)
+			refused := logs.FilterMessage("nav_interstitial_refused").All()
+			if len(refused) != 1 || logs.Len() != 1 {
+				t.Fatalf("want exactly 1 nav_interstitial_refused log, got %d of %d", len(refused), logs.Len())
 			}
-			fields := logs.FilterMessage("nav_interstitial_denied_scheme").All()[0].ContextMap()
+			fields := refused[0].ContextMap()
+			if _, ok := fields["error"]; ok {
+				t.Errorf("log carries the target-quoting parse error: %v", fields)
+			}
 			if fields["reason"] != tc.reason || fields["scheme"] != tc.scheme {
 				t.Errorf("log fields = %v, want reason=%q scheme=%v", fields, tc.reason, tc.scheme)
 			}

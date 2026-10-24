@@ -154,13 +154,14 @@ var navInterstitialTmpl = template.Must(template.New("nav").Parse(`<!doctype htm
 func renderNavInterstitial(w http.ResponseWriter, r *http.Request, logger *zap.Logger, targetURL string) {
 	// The target URL embeds a single-use sealed session (approve) or
 	// the client's error envelope — renderHTMLPage marks it no-store.
-	if reason, u, err := navTargetRefusal(targetURL); reason != "" {
+	if reason, u := navTargetRefusal(targetURL); reason != "" {
 		metrics.PageRenderFailed.WithLabelValues("interstitial").Inc()
-		fields := []zap.Field{zap.String("reason", reason), zap.Error(err)}
+		// No parse error: it quotes the full target, code and state included.
+		fields := []zap.Field{zap.String("reason", reason)}
 		if u != nil {
 			fields = append(fields, zap.String("scheme", u.Scheme))
 		}
-		logger.Warn("nav_interstitial_denied_scheme", fields...)
+		logger.Warn("nav_interstitial_refused", fields...)
 		writeOAuthError(w, r, http.StatusInternalServerError, "server_error", "internal error", codeInterstitialFailed)
 		return
 	}
@@ -173,17 +174,17 @@ func renderNavInterstitial(w http.ResponseWriter, r *http.Request, logger *zap.L
 
 // navTargetRefusal returns why the interstitial must not navigate to
 // target ("" = allowed): unparsable, relative (no scheme), or a denied scheme.
-func navTargetRefusal(target string) (reason string, u *url.URL, err error) {
-	u, err = url.Parse(target)
+func navTargetRefusal(target string) (reason string, u *url.URL) {
+	u, err := url.Parse(target)
 	switch {
 	case err != nil:
-		return "parse", nil, err
+		return "parse", nil
 	case u.Scheme == "":
-		return "empty_scheme", u, nil
+		return "empty_scheme", u
 	case config.IsDeniedRedirectScheme(u.Scheme):
-		return "denied", u, nil
+		return "denied", u
 	}
-	return "", u, nil
+	return "", u
 }
 
 // consentNavError delivers redirectAuthzError's RFC 6749 §4.1.2.1

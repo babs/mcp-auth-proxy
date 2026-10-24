@@ -745,6 +745,7 @@ func (a RedirectAllowlist) Entries() []string {
 }
 
 // Errors Check returns; /register maps each to a fixed description.
+// Adding one: add a case in handlers.checkCustomRedirect and its test.
 var (
 	ErrRedirectNotAllowlisted = errors.New("not a URI allowlisted by the operator")
 	ErrRedirectNoHostOrPath   = errors.New("must include a host or a path")
@@ -765,7 +766,7 @@ func (a RedirectAllowlist) Check(raw string) error {
 	}
 	if !a.schemes[u.Scheme] {
 		// Exact entries are canonical, so a byte-equal raw passes every shape check.
-		if a.exact[u.Scheme+raw[len(u.Scheme):]] {
+		if a.exact[lowerScheme(raw, u)] {
 			return nil
 		}
 		return ErrRedirectNotAllowlisted
@@ -842,12 +843,15 @@ func canonicalCustomRedirect(raw string, u *url.URL) (string, error) {
 	if _, err := url.ParseQuery(u.RawQuery); err != nil {
 		return "", ErrRedirectQueryEscape
 	}
-	norm := u.Scheme + raw[len(u.Scheme):]
+	norm := lowerScheme(raw, u)
 	if u.String() != norm {
 		return "", ErrRedirectNonCanonical
 	}
 	return norm, nil
 }
+
+// lowerScheme returns raw with the scheme u.Scheme parsed from it lower-cased.
+func lowerScheme(raw string, u *url.URL) string { return u.Scheme + raw[len(u.Scheme):] }
 
 // hasForbiddenRedirectByte reports an unencoded space, non-ASCII byte,
 // '"', '<' or '>', or a percent-encoded control byte (%00-%1f, %7f).

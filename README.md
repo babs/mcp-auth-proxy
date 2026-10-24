@@ -237,10 +237,13 @@ revocation rollout notes, and the K8s deployment shape.
 | MCP mount + sub-paths | Reverse-proxied to `UPSTREAM_MCP_URL` after Bearer check |
 | `GET /metrics` (port 9090) | Prometheus metrics |
 
-`/register` accepts `https` and loopback `http` redirect URIs. Native clients with a custom scheme
-(Warp: `warp://dev.warp.Warp-Stable/mcp/callback`, matched byte-exactly except the scheme's case) need `REDIRECT_URIS_EXTRA`: exact URIs or
-`<scheme>://*`, e.g. `REDIRECT_URIS_EXTRA=warp://*`. Any local app can claim a custom scheme, so
-`/authorize` requires S256 PKCE for these redirects whatever `PKCE_REQUIRED` says.
+`/register` accepts `https` and loopback `http` redirect URIs. Native
+clients with a custom scheme (Warp:
+`warp://dev.warp.Warp-Stable/mcp/callback`, matched byte-exactly except
+the scheme's case) need `REDIRECT_URIS_EXTRA`: exact URIs or
+`<scheme>://*`, e.g. `REDIRECT_URIS_EXTRA=warp://*`. Any local app can
+claim a custom scheme, so `/authorize` requires S256 PKCE for these
+redirects whatever `PKCE_REQUIRED` says.
 
 Per-endpoint contract details (params, error shapes, replay-claim
 ordering) live in [`specs.md`](./specs.md).
