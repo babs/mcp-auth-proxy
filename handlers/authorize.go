@@ -148,11 +148,10 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 			return
 		}
 
-		if !checkAuthorizeRedirect(w, r, logger, &client, redirectURI, authzCfg.RedirectURIsExtra) {
+		customScheme, ok := checkAuthorizeRedirect(w, r, logger, &client, redirectURI, authzCfg.RedirectURIsExtra)
+		if !ok {
 			return
 		}
-		ru, err := url.Parse(redirectURI)
-		customScheme := err != nil || !config.IsWebScheme(ru.Scheme)
 
 		// === Phase 2: redirect-uri is trusted. RFC 6749 §4.1.2.1 ===
 		// requires §4.1.2.1 redirect-style errors from here on. The
@@ -378,12 +377,12 @@ func logUnknownOIDCParams(logger *zap.Logger, q url.Values) {
 
 // checkAuthorizeRedirect validates redirect_uri against the client's
 // registration, rendering the error on the AS (the target is not yet
-// trusted).
-func checkAuthorizeRedirect(w http.ResponseWriter, r *http.Request, logger *zap.Logger, client *sealedClient, redirectURI string, extra config.RedirectAllowlist) bool {
+// trusted). customScheme is meaningful only when ok.
+func checkAuthorizeRedirect(w http.ResponseWriter, r *http.Request, logger *zap.Logger, client *sealedClient, redirectURI string, extra config.RedirectAllowlist) (customScheme, ok bool) {
 	if redirectURI == "" {
 		recordClientDenial(logger, "redirect_uri_missing")
 		writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "redirect_uri is required", codeRedirectURIMissing)
-		return false
+		return false, false
 	}
 
 	// OAuth 2.1 §2.3.1 requires exact match (no prefix/subdomain).
@@ -394,12 +393,12 @@ func checkAuthorizeRedirect(w http.ResponseWriter, r *http.Request, logger *zap.
 	if !slices.ContainsFunc(client.RedirectURIs, func(uri string) bool { return redirectURIMatches(redirectURI, uri) }) {
 		recordClientDenial(logger, "redirect_uri_mismatch")
 		writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "redirect_uri does not match registered URIs", codeRedirectURIMismatch)
-		return false
+		return false, false
 	}
 
 	u, err := url.Parse(redirectURI)
 	if err == nil && config.IsWebScheme(u.Scheme) {
-		return true
+		return false, true
 	}
 	if checkErr := extra.Check(redirectURI); checkErr != nil {
 		fields := []zap.Field{zap.String("internal_id", client.ID), zap.Error(checkErr)}
@@ -408,7 +407,8 @@ func checkAuthorizeRedirect(w http.ResponseWriter, r *http.Request, logger *zap.
 		}
 		recordClientDenial(logger, "redirect_uri_not_allowlisted", fields...)
 		writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "redirect_uri is not allowlisted by the operator", codeRedirectURIMismatch)
-		return false
+		return false, false
 	}
-	return true
+	// Check rejects unparsable URIs, so reaching here means a parsed custom scheme.
+	return true, true
 }
