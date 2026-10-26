@@ -191,6 +191,9 @@ type testProxyOptions struct {
 	// redirectURIsExtra wires REDIRECT_URIS_EXTRA into /register and
 	// /authorize.
 	redirectURIsExtra config.RedirectAllowlist
+	// redirectURIsAllowlist wires REDIRECT_URIS_ALLOWLIST into /register,
+	// /authorize and /token.
+	redirectURIsAllowlist config.WebRedirectAllowlist
 }
 
 func buildTestProxy(t *testing.T, oidcProvider *mockOIDCProvider, mcpServer *mockMCPServer, proxyBaseURL string, renderConsent bool, opts ...testProxyOptions) http.Handler {
@@ -215,6 +218,14 @@ func buildTestProxy(t *testing.T, oidcProvider *mockOIDCProvider, mcpServer *moc
 		GroupsClaim:             "groups",
 		OIDCExtraScopes:         opt.extraScopes,
 		UpstreamForwardIdPToken: opt.forwardIdPToken,
+		ClientRegistrationTTL:   handlers.DefaultClientTTL,
+		PKCERequired:            true,
+		// Production defaults this true. Most cases run it false to
+		// drive the direct-to-IdP path;
+		// TestE2E_ConsentFlowThroughProductionRouter runs it true.
+		RenderConsentPage:     renderConsent,
+		RedirectURIsExtra:     opt.redirectURIsExtra,
+		RedirectURIsAllowlist: opt.redirectURIsAllowlist,
 	}
 	oauth2Cfg := newOAuth2Config(cfg, provider.Endpoint())
 
@@ -250,16 +261,8 @@ func buildTestProxy(t *testing.T, oidcProvider *mockOIDCProvider, mcpServer *moc
 	// exercise the same router shape main builds (BrowserFacing markers
 	// included), or the two silently diverge.
 	registerOAuthRoutes(r, oauthRoutes{
-		Register: handlers.Register(tm, zap.NewNop(), proxyBaseURL, handlers.RegisterConfig{ClientTTL: handlers.DefaultClientTTL, RedirectURIsExtra: opt.redirectURIsExtra}),
-		Authorize: handlers.Authorize(tm, zap.NewNop(), proxyBaseURL, oauth2Cfg, handlers.AuthorizeConfig{
-			PKCERequired:      true,
-			CanonicalResource: proxyBaseURL + "/mcp",
-			// Production defaults this true. Most cases run it false to
-			// drive the direct-to-IdP path;
-			// TestE2E_ConsentFlowThroughProductionRouter runs it true.
-			RenderConsentPage: renderConsent,
-			RedirectURIsExtra: opt.redirectURIsExtra,
-		}),
+		Register:      handlers.Register(tm, zap.NewNop(), proxyBaseURL, newRegisterConfig(cfg)),
+		Authorize:     handlers.Authorize(tm, zap.NewNop(), proxyBaseURL, oauth2Cfg, newAuthorizeConfig(cfg)),
 		Consent:       handlers.Consent(tm, zap.NewNop(), proxyBaseURL, oauth2Cfg, handlers.ConsentConfig{}),
 		Callback:      handlers.Callback(tm, zap.NewNop(), proxyBaseURL, oauth2Cfg, verifier, newCallbackConfig(cfg, replayStore, nil)),
 		Token:         handlers.Token(tm, zap.NewNop(), proxyBaseURL, time.Time{}, replayStore, newTokenConfig(cfg, idpRefresher, nil, verifier.Verify)),
@@ -761,6 +764,115 @@ func TestE2E_CustomSchemeRedirect(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestE2E_RedirectURIsAllowlist drives REDIRECT_URIS_ALLOWLIST through
+// the production router: an unlisted client is refused at /register, a
+// listed one completes register → authorize → callback → token → refresh,
+// and a session through a URI a narrower list no longer admits is refused
+// at refresh and at /authorize by a deployment sharing the signing secret.
+func TestE2E_RedirectURIsAllowlist(t *testing.T) {
+	const listed, delisted = "https://agents.example.com/oauth/callback", "https://second.example.com/cb"
+	parse := func(raw string) config.WebRedirectAllowlist {
+		a, err := config.ParseWebRedirectAllowlist(raw)
+		if err != nil {
+			t.Fatalf("ParseWebRedirectAllowlist: %v", err)
+		}
+		return a
+	}
+	oidcMock := newMockOIDCProvider(t)
+	defer oidcMock.Close()
+	mcpMock := newMockMCPServer(t)
+	defer mcpMock.Close()
+	wide := httptest.NewServer(buildTestProxy(t, oidcMock, mcpMock, "http://proxy.test", false, testProxyOptions{redirectURIsAllowlist: parse(listed + "," + delisted)}))
+	defer wide.Close()
+	narrow := httptest.NewServer(buildTestProxy(t, oidcMock, mcpMock, "http://proxy.test", false, testProxyOptions{redirectURIsAllowlist: parse(listed)}))
+	defer narrow.Close()
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+	do := func(t *testing.T, req *http.Request) (int, map[string]any) {
+		t.Helper()
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", req.Method, req.URL.Path, err)
+		}
+		defer resp.Body.Close()
+		body := map[string]any{}
+		_ = json.NewDecoder(resp.Body).Decode(&body)
+		if loc := resp.Header.Get("Location"); loc != "" {
+			body["location"] = loc
+		}
+		return resp.StatusCode, body
+	}
+	postForm := func(t *testing.T, base string, form url.Values) (int, map[string]any) {
+		t.Helper()
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, base+"/token", strings.NewReader(form.Encode()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		return do(t, req)
+	}
+	// session runs the browser flow on base for redirectURI and redeems
+	// the code; it returns the client_id and the refresh token.
+	session := func(t *testing.T, base, redirectURI string) (string, string) {
+		t.Helper()
+		resp, clientID := driveAuthToCallbackURI(t, client, base, oidcMock, redirectURI)
+		defer resp.Body.Close()
+		loc, err := url.Parse(resp.Header.Get("Location"))
+		if err != nil || resp.StatusCode != http.StatusFound || !strings.HasPrefix(loc.String(), redirectURI+"?") {
+			t.Fatalf("callback: want 302 to %s, got %d %q", redirectURI, resp.StatusCode, resp.Header.Get("Location"))
+		}
+		status, tok := postForm(t, base, url.Values{
+			"grant_type": {"authorization_code"}, "code": {loc.Query().Get("code")}, "redirect_uri": {redirectURI},
+			"client_id": {clientID}, "code_verifier": {e2eCodeVerifier},
+		})
+		refresh, _ := tok["refresh_token"].(string)
+		if status != http.StatusOK || refresh == "" {
+			t.Fatalf("/token code grant = %d %v, want 200 with a refresh_token", status, tok)
+		}
+		return clientID, refresh
+	}
+	refreshOn := func(t *testing.T, base, clientID, refresh string) (int, map[string]any) {
+		t.Helper()
+		return postForm(t, base, url.Values{"grant_type": {"refresh_token"}, "refresh_token": {refresh}, "client_id": {clientID}})
+	}
+
+	t.Run("unlisted client refused at register", func(t *testing.T) {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, narrow.URL+"/register", strings.NewReader(`{"redirect_uris":["https://other.example.com/cb"],"client_name":"other"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if status, body := do(t, req); status != http.StatusBadRequest || body["error"] != "invalid_redirect_uri" {
+			t.Fatalf("/register = %d %v, want 400 invalid_redirect_uri", status, body)
+		}
+	})
+
+	t.Run("listed client completes the flow and refreshes", func(t *testing.T) {
+		clientID, refresh := session(t, narrow.URL, listed)
+		if status, body := refreshOn(t, narrow.URL, clientID, refresh); status != http.StatusOK || body["access_token"] == nil {
+			t.Fatalf("refresh = %d %v, want 200 with an access_token", status, body)
+		}
+	})
+
+	t.Run("session through a de-listed URI is refused", func(t *testing.T) {
+		clientID, refresh := session(t, wide.URL, delisted)
+		if status, body := refreshOn(t, narrow.URL, clientID, refresh); status != http.StatusBadRequest || body["error"] != "invalid_grant" || body["error_code"] != "redirect_uri_mismatch" {
+			t.Fatalf("refresh on the narrowed deployment = %d %v, want 400 invalid_grant redirect_uri_mismatch", status, body)
+		}
+		params := url.Values{
+			"response_type": {"code"}, "client_id": {clientID}, "redirect_uri": {delisted}, "state": {"s"},
+			"code_challenge": {handlers.ComputePKCEChallenge(e2eCodeVerifier)}, "code_challenge_method": {"S256"},
+		}
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, narrow.URL+"/authorize?"+params.Encode(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status, body := do(t, req); status != http.StatusBadRequest || body["location"] != nil || body["error_code"] != "redirect_uri_mismatch" {
+			t.Fatalf("/authorize on the narrowed deployment = %d %v, want 400 on the AS", status, body)
+		}
+	})
 }
 
 // TestE2E_RejectsUnverifiedEmail verifies that when the IdP emits
