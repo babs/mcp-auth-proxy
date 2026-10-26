@@ -15,7 +15,7 @@ the implementation are updated together.
 | OAuth 2.1 draft-13 | Authorization code grant, public clients, PKCE-first behavior, refresh token rotation with Redis-backed reuse detection | `handlers/authorize.go`, `handlers/token.go`, `e2e_test.go` |
 | RFC 8414 | Authorization server metadata at `/.well-known/oauth-authorization-server` and per-mount compatibility path | `handlers/discovery.go`, `discovery_routes_test.go` |
 | RFC 9728 | Protected resource metadata and `WWW-Authenticate` `resource_metadata` challenge | `handlers/resource_metadata.go`, `middleware/auth.go` |
-| RFC 7591 | Dynamic client registration with public-client-only `token_endpoint_auth_method=none` | `handlers/register.go`, `handlers/handlers_test.go` |
+| RFC 7591 | Dynamic client registration with public-client-only `token_endpoint_auth_method=none`; optional operator policy on `http(s)` redirect URIs via `REDIRECT_URIS_ALLOWLIST` (§2 server may reject requested metadata, §3.2.2 `invalid_redirect_uri`) | `handlers/register.go`, `handlers/handlers_test.go`, `handlers/redirect_allowlist_test.go` |
 | RFC 7636 | S256 PKCE, verifier/challenge length and charset validation | `handlers/authorize.go`, `handlers/token.go` |
 | RFC 8252 | Loopback any-port (§7.3); custom-scheme redirects via `REDIRECT_URIS_EXTRA`, S256 mandatory (§7.1) | `handlers/register.go`, `handlers/authorize.go`, `handlers/redirect_extra_test.go` |
 | RFC 8707 | `resource` validation on `/authorize` and `/token`; resource binding sealed into issued tokens | `handlers/authorize.go`, `handlers/token.go`, `middleware/auth.go` |

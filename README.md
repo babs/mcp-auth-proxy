@@ -245,6 +245,14 @@ the scheme's case) need `REDIRECT_URIS_EXTRA`: exact URIs or
 claim a custom scheme, so `/authorize` requires S256 PKCE for these
 redirects whatever `PKCE_REQUIRED` says.
 
+To dedicate a deployment to known clients, `REDIRECT_URIS_ALLOWLIST`
+narrows the `https` and loopback `http` redirect URIs `/register`
+accepts to the listed ones, e.g.
+`REDIRECT_URIS_ALLOWLIST=https://agents.example.com/oauth/callback`.
+`/authorize` and `/token` re-check it, so narrowing the list also ends,
+within the 1h access-token lifetime, the sessions obtained through a URI
+it no longer admits.
+
 Per-endpoint contract details (params, error shapes, replay-claim
 ordering) live in [`specs.md`](./specs.md).
 

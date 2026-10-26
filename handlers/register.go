@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
@@ -72,6 +71,9 @@ type RegisterConfig struct {
 	// RedirectURIsExtra admits operator-listed custom-scheme redirect
 	// URIs (REDIRECT_URIS_EXTRA).
 	RedirectURIsExtra config.RedirectAllowlist
+	// RedirectURIsAllowlist, when set, limits http(s) redirect URIs to
+	// the operator's list (REDIRECT_URIS_ALLOWLIST).
+	RedirectURIsAllowlist config.WebRedirectAllowlist
 }
 
 // Register handles POST /register (RFC 7591 Dynamic Client Registration).
@@ -144,7 +146,7 @@ func Register(tm *token.Manager, logger *zap.Logger, audience string, regCfg Reg
 		}
 
 		for _, raw := range req.RedirectURIs {
-			if !validateRedirectURI(w, r, raw, regCfg.RedirectURIsExtra) {
+			if !validateRedirectURI(w, r, logger, raw, regCfg) {
 				return
 			}
 		}
@@ -214,53 +216,51 @@ func Register(tm *token.Manager, logger *zap.Logger, audience string, regCfg Reg
 }
 
 // validateRedirectURI writes the RFC 7591 §3.2.2 error and returns
-// false when raw is not an acceptable redirect URI.
-//
-// OAuth 2.1 §2.3.1: non-loopback redirect URIs must use HTTPS.
-// Also reject oversize, fragment-bearing, and userinfo-bearing
-// URIs. Fragment is forbidden by OAuth 2.1 §7.5; userinfo amplifies
-// phishing (https://attacker:pass@legit.example/cb visually legit).
-func validateRedirectURI(w http.ResponseWriter, r *http.Request, raw string, extra config.RedirectAllowlist) bool {
-	if len(raw) > config.MaxRedirectURILength {
-		writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri exceeds maximum length")
-		return false
-	}
-	u, err := url.Parse(raw)
+// false when raw is not an acceptable redirect URI. Operator lists then
+// narrow (REDIRECT_URIS_ALLOWLIST, http(s)) or widen (REDIRECT_URIS_EXTRA,
+// custom schemes) the set; RFC 7591 §2 lets the server reject requested
+// metadata.
+func validateRedirectURI(w http.ResponseWriter, r *http.Request, logger *zap.Logger, raw string, regCfg RegisterConfig) bool {
+	u, err := config.CheckRedirectShape(raw)
 	if err != nil {
-		writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "malformed redirect_uri")
-		return false
-	}
-	// url.Parse("https:foo") → Opaque="foo"; url.Parse("https:///x") →
-	// Host="". Neither is a valid http(s) redirect target per RFC 3986
-	// §3, and /callback would emit a broken Location header for them.
-	if u.Opaque != "" {
-		writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must not be opaque")
-		return false
-	}
-	web := config.IsWebScheme(u.Scheme)
-	if web && u.Host == "" {
-		writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must include a host")
-		return false
-	}
-	// Also trip on a trailing bare "#" (url.Parse leaves Fragment
-	// empty for "https://x/cb#" even though the marker is present).
-	if u.Fragment != "" || strings.Contains(raw, "#") {
-		writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must not contain a fragment")
-		return false
-	}
-	if u.User != nil {
-		writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must not contain userinfo")
+		writeRedirectShapeError(w, r, err)
 		return false
 	}
 	// Non-http(s) schemes only via REDIRECT_URIS_EXTRA.
-	if !web {
-		return checkCustomRedirect(w, r, extra.Check(raw))
+	if !config.IsWebScheme(u.Scheme) {
+		return checkCustomRedirect(w, r, regCfg.RedirectURIsExtra.Check(raw))
 	}
-	if u.Scheme == "http" && !isLoopback(u) {
-		writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must use HTTPS for non-loopback addresses")
+	if !webRedirectAllowed(raw, regCfg.RedirectURIsAllowlist) {
+		// No query, and printable ASCII only: the client chose these bytes.
+		logger.Warn("register_redirect_uri_not_allowlisted", zap.String("scheme", u.Scheme),
+			zap.String("host", sanitizeErrorDescription(u.Host)), zap.String("path", sanitizeErrorDescription(u.EscapedPath())))
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri is not allowlisted by the operator")
 		return false
 	}
 	return true
+}
+
+// writeRedirectShapeError maps a config.CheckRedirectShape error to a
+// fixed description (descriptions stay compile-time literals).
+func writeRedirectShapeError(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, config.ErrRedirectTooLong):
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri exceeds maximum length")
+	case errors.Is(err, config.ErrRedirectOpaque):
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must not be opaque")
+	case errors.Is(err, config.ErrRedirectNoHost):
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must include a host")
+	case errors.Is(err, config.ErrRedirectFragment):
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must not contain a fragment")
+	case errors.Is(err, config.ErrRedirectUserinfo):
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must not contain userinfo")
+	case errors.Is(err, config.ErrRedirectHTTPNotLoopback):
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must use HTTPS for non-loopback addresses")
+	case errors.Is(err, config.ErrRedirectMalformed):
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "malformed redirect_uri")
+	default: // fail-safe for a sentinel added without its case
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri is not allowed")
+	}
 }
 
 // checkCustomRedirect maps a RedirectAllowlist.Check result to a fixed

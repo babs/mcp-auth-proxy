@@ -166,3 +166,47 @@ func TestNewReplayStore(t *testing.T) {
 		}
 	})
 }
+
+// TestRedirectPolicyWiring pins what main builds for /register,
+// /authorize and /token. Each field fails open when dropped: an
+// unlisted client registers, a client the list no longer admits keeps
+// authorizing or refreshing, PKCE or the consent page silently turn off.
+func TestRedirectPolicyWiring(t *testing.T) {
+	allow, err := config.ParseWebRedirectAllowlist("https://app.example.com/cb,http://127.0.0.1/cb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	extra, err := config.ParseRedirectAllowlist("warp://*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{
+		ProxyBaseURL:          "https://proxy.example.com",
+		UpstreamMCPMountPath:  "/mcp",
+		ClientRegistrationTTL: time.Hour,
+		PKCERequired:          true,
+		CompatAllowStateless:  true,
+		RenderConsentPage:     true,
+		ResourceName:          "Example MCP",
+		RedirectURIsExtra:     extra,
+		RedirectURIsAllowlist: allow,
+	}
+
+	rc := newRegisterConfig(cfg)
+	if rc.ClientTTL != time.Hour ||
+		!slices.Equal(rc.RedirectURIsAllowlist.Entries(), allow.Entries()) ||
+		!slices.Equal(rc.RedirectURIsExtra.Entries(), extra.Entries()) {
+		t.Errorf("register config = %+v", rc)
+	}
+	ac := newAuthorizeConfig(cfg)
+	if !ac.PKCERequired || !ac.CompatAllowStateless || !ac.RenderConsentPage || ac.ResourceName != "Example MCP" ||
+		ac.CanonicalResource != "https://proxy.example.com/mcp" ||
+		!slices.Equal(ac.ResourceURIs, []string{"https://proxy.example.com/mcp"}) ||
+		!slices.Equal(ac.RedirectURIsAllowlist.Entries(), allow.Entries()) ||
+		!slices.Equal(ac.RedirectURIsExtra.Entries(), extra.Entries()) {
+		t.Errorf("authorize config = %+v", ac)
+	}
+	if tc := newTokenConfig(cfg, nil, nil, nil); !slices.Equal(tc.RedirectURIsAllowlist.Entries(), allow.Entries()) {
+		t.Errorf("token config allowlist = %v, want %v", tc.RedirectURIsAllowlist.Entries(), allow.Entries())
+	}
+}
