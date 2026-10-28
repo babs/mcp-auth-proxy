@@ -308,9 +308,11 @@ func TestToken_CIMDClientBinding(t *testing.T) {
 	})
 }
 
-// In forwarding mode a CIMD refresh token carries the longest client_id
-// and redirect URI the proxy accepts plus the IdP refresh token: it
-// either seals under the cap or fails closed through the existing path.
+// In forwarding mode a CIMD refresh token carries the longest host the
+// proxy accepts (only the host is bounded; the document's 5 KiB cap
+// bounds the rest of the client_id), the longest redirect URI, and the
+// IdP refresh token: it either seals under the cap or fails closed
+// through the existing path.
 func TestToken_CIMDForwardingSealCap(t *testing.T) {
 	label := strings.Repeat("a", 63)
 	clientID := "https://" + strings.Join([]string{label, label, label, strings.Repeat("a", 61)}, ".") + "/client.json"

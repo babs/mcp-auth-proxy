@@ -17,6 +17,7 @@ This proxy MUST conform to the following specifications:
 | [OAuth 2.1 (draft-ietf-oauth-v2-1-13)](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1-13) | Authorization code + PKCE flow, token handling, security requirements. Draft-13 is the version pinned by MCP Authorization 2026-07-28; the IETF OAuth WG has since published `draft-15` — deltas tracked separately and not yet adopted here |
 | [RFC 8414 — OAuth 2.0 Authorization Server Metadata](https://datatracker.ietf.org/doc/html/rfc8414) | `GET /.well-known/oauth-authorization-server` discovery endpoint |
 | [RFC 7591 — OAuth 2.0 Dynamic Client Registration](https://datatracker.ietf.org/doc/html/rfc7591) | `POST /register` — automatic client registration for MCP clients |
+| [Client ID Metadata Documents (draft-ietf-oauth-client-id-metadata-document-02)](https://www.ietf.org/archive/id/draft-ietf-oauth-client-id-metadata-document-02.html) | An `https://` URL as `client_id`: `/authorize` fetches the document at that URL for `client_name` and `redirect_uris`; `client_id_metadata_document_supported: true` in AS metadata; `CIMD_ENABLED=false` opts out |
 | [RFC 9728 — OAuth 2.0 Protected Resource Metadata](https://datatracker.ietf.org/doc/html/rfc9728) | `GET /.well-known/oauth-protected-resource` — MCP clients discover the AS through this endpoint; `WWW-Authenticate` header on 401 responses MUST include `resource_metadata` URL |
 | [RFC 8707 — Resource Indicators for OAuth 2.0](https://www.rfc-editor.org/rfc/rfc8707.html) | `resource` parameter accepted in `/authorize` and `/token` requests |
 | [RFC 7636 — PKCE](https://datatracker.ietf.org/doc/html/rfc7636) | `code_verifier` must be 43-128 characters, `code_challenge_method` must be `S256` |
@@ -131,6 +132,7 @@ All configuration is via environment variables.
 | `ALLOWED_GROUPS` | Comma-separated group allowlist. Empty = allow all authenticated users | `admin,mcp-users` |
 | `REVOKE_BEFORE` | RFC3339 timestamp — both access tokens AND refresh tokens with `iat` before this are rejected (bulk revocation). Empty = disabled | `2026-03-28T12:00:00Z` |
 | `PKCE_REQUIRED` | Require PKCE on /authorize (default `true`). Set `false` for Cursor, MCP Inspector, ChatGPT compat. Custom-scheme redirects (`REDIRECT_URIS_EXTRA`) require client S256 regardless | `true` |
+| `CIMD_ENABLED` | Accept an `https://` URL as `client_id` (Client ID Metadata Documents; default `true`, any value other than `false` (case-insensitive) keeps it on). When `false`, a URL `client_id` is an unknown client at `/authorize` and `/token` (`client_id_unknown`, denial reason `client_id_invalid`, log field `kind=cimd_disabled`), nothing is fetched, and `client_id_metadata_document_supported` is absent from the AS metadata. Not a `PROD_MODE` violation either way | `true` |
 | `SHUTDOWN_TIMEOUT` | Graceful shutdown deadline. Raise above the longest expected SSE stream so rolling deploys do not cut MCP sessions mid-stream. Match `terminationGracePeriodSeconds` in K8s | `120s` (default) |
 | `REDIS_URL` | Enables single-use authorization codes and refresh rotation with reuse detection (OAuth 2.1 §6.1) across replicas. `rediss://` for TLS. On Redis failure the proxy fails closed (503) | `redis://redis:6379/0` |
 | `REDIS_REQUIRED` | Fail startup (`logger.Fatal`) when `REDIS_URL` is unset. Default `true` — stateless mode leaves authorization codes / refresh tokens replayable within their TTL (findings C3/C4). Set `false` only for dev or single-replica deployments that accept the trade-off | `true` (default) |
@@ -174,6 +176,7 @@ mcp-auth-proxy/
 │   ├── resource_metadata.go   # GET /.well-known/oauth-protected-resource (RFC 9728)
 │   ├── discovery.go           # GET /.well-known/oauth-authorization-server (RFC 8414)
 │   ├── register.go            # POST /register  (RFC 7591 DCR)
+│   ├── cimd.go                # Client ID Metadata Document resolver (URL rules, guarded fetch, document rules)
 │   ├── authorize.go           # GET /authorize  (+ resource param, RFC 8707)
 │   ├── callback.go            # GET /callback  (OIDC IdP return)
 │   └── token.go               # POST /token    (+ resource param, RFC 8707)
@@ -253,11 +256,12 @@ Response 200 JSON:
   "grant_types_supported": ["authorization_code", "refresh_token"],
   "code_challenge_methods_supported": ["S256"],
   "token_endpoint_auth_methods_supported": ["none"],
-  "scopes_supported": []
+  "scopes_supported": [],
+  "client_id_metadata_document_supported": true
 }
 ```
 
-PKCE-only proxy: no client secrets are validated. `scopes_supported` is an explicit empty array — the proxy carries no scope model (see PRM note above). No authentication required on this endpoint.
+PKCE-only proxy: no client secrets are validated. `scopes_supported` is an explicit empty array — the proxy carries no scope model (see PRM note above). `client_id_metadata_document_supported` is present only while `CIMD_ENABLED=true` (absent, not `false`, otherwise). No authentication required on this endpoint.
 
 ---
 
@@ -305,7 +309,7 @@ Error responses use RFC 7591 §3.2.2 codes: `invalid_redirect_uri` for any redir
 
 **Query params:**
 - `response_type=code` (required, reject otherwise)
-- `client_id` (required, decrypt and validate not expired)
+- `client_id` (required; a sealed `/register` id, decrypted and validated not expired, or an `https://` Client ID Metadata Document URL, resolved as described below)
 - `redirect_uri` (required, must match a registered URI — exact match)
 - `code_challenge` (required if `PKCE_REQUIRED=true` or the `redirect_uri` uses a non-http(s) scheme, optional otherwise; 43-128 unreserved characters per RFC 7636)
 - `code_challenge_method=S256` (required if `code_challenge` present)
@@ -314,7 +318,7 @@ Error responses use RFC 7591 §3.2.2 codes: `invalid_redirect_uri` for any redir
 
 **Behavior:**
 1. Validate all params; reject repeated singleton params (`resource` may appear more than once per RFC 8707); every `resource` value must match an accepted resource URI
-2. Decrypt the `client_id` → verify not expired, `redirect_uri` matched
+2. Resolve the `client_id` (decrypt, or fetch the metadata document) → verify not expired, `redirect_uri` matched
 3. **Consent fork.** The validated parameters are sealed into a `sealedConsent` blob (`PurposeConsent` AAD, audience-bound, 5-min TTL) and an HTML page is rendered showing the registered `client_name`, the redirect target (the host for http(s); for a custom scheme the registered URI without its query, still percent-escaped), and the resource. The user clicks Approve or Deny. The form POSTs to `/consent` (see below). Default behavior; setting `RENDER_CONSENT_PAGE=false` skips this step and runs the silent redirect at step 4 directly — only safe when every caller is non-interactive and known-trusted.
 4. Encrypt the session with AES-GCM (10min TTL):
    ```
@@ -337,6 +341,14 @@ Error responses use RFC 7591 §3.2.2 codes: `invalid_redirect_uri` for any redir
      &response_mode=query
    ```
 7. Redirect 302 to the IdP
+
+**Client ID Metadata Documents** (draft-ietf-oauth-client-id-metadata-document-02, MCP Authorization 2026-07-28). A `client_id` starting with `https://` is resolved from the document at that URL, which supplies `client_name` and `redirect_uris`; the URL string is the client identity verbatim (no normalisation, a document whose `client_id` differs by one byte is a different, invalid, client). Sealed ids are base64url, so the shape is unambiguous.
+
+- URL rules (`error_code: client_metadata_invalid`): `https` only; non-empty path (`/` accepted); no `.` or `..` segment in the decoded path; no query, fragment or userinfo; host is a name, not an IP literal; authority (host plus optional port) at most 259 chars, a 253-char name and `:65535`; the port stays part of the identity.
+- Fetch rules: dedicated client, 5 s timeout, no redirect followed (any 3xx fails), status must be 200, `Content-Type` `application/json` or `application/*+json`, body capped at 5 KiB, response headers at 16 KiB, TLS 1.2+ against system roots, no proxy from the environment, at most 16 fetches in flight per instance (the next fails fast). The resolved address is judged at dial time against the IANA special-purpose registries (RFC 6890 and successors: loopback, RFC 1918, link-local, CGNAT `100.64/10`, documentation and benchmark ranges, multicast, reserved, ULA, ...), with IPv4 embedded in IPv6 (mapped, NAT64 `64:ff9b::/96` and `64:ff9b:1::/48`, 6to4 `2002::/16`) judged on the embedded address. None of this is configurable.
+- Document rules (`error_code: client_metadata_invalid`): `client_id` byte-equal to the URL; `redirect_uris` non-empty, at most 5, each passing exactly the `POST /register` checks (shape, `REDIRECT_URIS_EXTRA`, `REDIRECT_URIS_ALLOWLIST`); `token_endpoint_auth_method` absent or `none` (`private_key_jwt` is refused with `private_key_jwt not supported, use none`; other methods, a non-null `client_secret` or `client_secret_expires_at` member, `grant_types` without `authorization_code`, a `client_name` over 512 chars or containing `,` or one of NUL, TAB, LF, VT, FF, CR, and trailing JSON data are refused as invalid).
+- Failures answer on the AS, 400 `invalid_client`: `client_metadata_unavailable` (fetch error, blocked address, over the size cap, capacity exhausted; the error page hints at a retry) or `client_metadata_invalid` (URL invalid, document invalid, auth method unsupported; the error page points at the client's publisher). Each resolution increments `mcp_auth_cimd_fetch_total{result}`; a failure also counts in `mcp_auth_access_denied_total{reason="cimd_<result>"}` and logs one `cimd_resolve_failed` WARN (`client_id_host`, `reason`, `error`, all sanitised; never the body or the full URL). A success logs nothing.
+- The document is re-read on every `/authorize`; nothing is cached and nothing is fetched at `/token` (see below). `CIMD_ENABLED=false` treats a URL `client_id` as an unknown client without a fetch.
 
 ---
 
@@ -416,8 +428,8 @@ grant_type=refresh_token
 **Behavior — authorization_code:**
 1. Reject repeated singleton params (`resource` may appear more than once per RFC 8707); every `resource` value must match an accepted resource URI; validate `code_verifier` shape (43-128 unreserved characters, RFC 7636 §4.1)
 2. Decrypt the code, verify not expired
-3. Decrypt the `client_id`, verify not expired
-4. Verify `client_id` (internal UUID) and `redirect_uri` match the code. The code's `redirect_uri` must still be admitted by the operator's lists (`REDIRECT_URIS_ALLOWLIST` for `http(s)` when set, `REDIRECT_URIS_EXTRA` for custom schemes), else `invalid_grant` + `error_code: redirect_uri_mismatch` (before the claim below, so the code is not burned)
+3. Decrypt the `client_id`, verify not expired. A Client ID Metadata Document `client_id` is not fetched here: the URL string is the identity, and the sealed code already pins it and the redirect URI
+4. Verify `client_id` (internal UUID, or the URL string) and `redirect_uri` match the code. The code's `redirect_uri` must still be admitted by the operator's lists (`REDIRECT_URIS_ALLOWLIST` for `http(s)` when set, `REDIRECT_URIS_EXTRA` for custom schemes), else `invalid_grant` + `error_code: redirect_uri_mismatch` (before the claim below, so the code is not burned)
 5. Validate PKCE: base64url-encoded `SHA256(code_verifier)` == stored `code_challenge` (constant-time comparison)
 6. If `REDIS_URL` is configured, atomically claim the code's `token_id` via `SET NX`. A second attempt is rejected with `invalid_grant` + `error_code: code_replay`; Redis failures fail closed with 503
 7. Forwarding mode only: redeem the IdP refresh token at the IdP (see [Upstream IdP token forwarding](#upstream-idp-token-forwarding-opt-in))
@@ -427,14 +439,14 @@ grant_type=refresh_token
 1. Decrypt the refresh token, verify its `audience` matches `PROXY_BASE_URL`
 2. If `REVOKE_BEFORE` is configured, reject if refresh `iat` < cutoff (bulk revocation applies to refresh tokens too, not only access tokens)
 3. Verify the refresh is not expired
-4. Decrypt the `client_id`, verify audience + not expired + UUID matches the refresh. The registered URI at the refresh's `RedirectURIIndex` (the one the session's code was issued for) must still be admitted by the operator's lists (`REDIRECT_URIS_ALLOWLIST` for `http(s)` when set, `REDIRECT_URIS_EXTRA` for custom schemes); a refresh without that index (a session started before the field existed, or rotated by an older release) needs every registered URI admitted. Else `invalid_grant` + `error_code: redirect_uri_mismatch` (before any claim, so nothing is burned)
+4. Decrypt the `client_id`, verify audience + not expired + UUID matches the refresh (a Client ID Metadata Document `client_id` is not fetched: the URL string must match the refresh). The registered URI at the refresh's `RedirectURIIndex` (the one the session's code was issued for) must still be admitted by the operator's lists (`REDIRECT_URIS_ALLOWLIST` for `http(s)` when set, `REDIRECT_URIS_EXTRA` for custom schemes); a refresh without that index (a session started before the field existed, or rotated by an older release) needs every registered URI admitted. A Client ID Metadata Document session has no registered list at `/token`, so its refresh carries the URI itself (`ru`) and that URI is re-checked; a CIMD refresh without it is refused. Else `invalid_grant` + `error_code: redirect_uri_mismatch` (before any claim, so nothing is burned)
 5. If `REDIS_URL` is configured:
    a. Reject if `refresh_family_revoked:<fam>` is set (prior reuse killed the family)
    b. Atomically claim `refresh:<tid>` via `SET NX`, recording the claim's set time. If the key is already claimed AND the prior claim landed within `REFRESH_RACE_GRACE_SEC` (default 2s, max 10s, set 0 to disable): treat as a benign concurrent submit — return 429 `invalid_grant` with `error_code: refresh_concurrent_submit` + `Retry-After: 2`. The family is NOT revoked; the legitimate peer's rotation already succeeded, the racing client retries with the new refresh once it lands. If the prior claim is past the grace window: reuse detected — mark the family revoked for 7 days, reject with `error_code: refresh_reuse_detected`. Any subsequent sibling refresh also gets rejected in step 5a
 
    **Note on the 429 status:** RFC 6749 §5.2 defines `/token` errors as 400 / 401. Returning 429 here is a deliberate deviation — most OAuth client libraries treat 429 + `Retry-After` as "back off and retry", which is exactly the desired behavior for a racing peer (the legit rotation already succeeded; the racing client should retry with the new refresh from shared storage). The `error_code=refresh_concurrent_submit` field disambiguates from generic rate limiting for clients that look at the body. A 400 `invalid_grant` was considered but rejected: it would force every client library to add a custom retry path keyed off `error_code` instead of using its existing 429 handling.
 6. Forwarding mode only: redeem the IdP refresh token at the IdP (see [Upstream IdP token forwarding](#upstream-idp-token-forwarding-opt-in))
-7. Issue new access + refresh tokens. The new refresh inherits `RedirectURIIndex` and `Resource`, and the original `fam` (so reuse detection spans the lineage) and gets a fresh `tid`. `iat` is set to `now` so it survives the next `REVOKE_BEFORE` application
+7. Issue new access + refresh tokens. The new refresh inherits `RedirectURIIndex` (or `RedirectURI` for a Client ID Metadata Document client) and `Resource`, and the original `fam` (so reuse detection spans the lineage) and gets a fresh `tid`. `iat` is set to `now` so it survives the next `REVOKE_BEFORE` application
 
 **Response 200 JSON:**
 ```json
@@ -493,6 +505,7 @@ type sealedRefresh struct {
     ClientID  string
     Audience  string
     RedirectURIIndex int // 1-based position of the registered redirect_uri the code was issued for, constant across rotations (omitempty); redirect-list re-check at /token
+    RedirectURI string   // `ru`: the redirect URI itself for a Client ID Metadata Document client, which has no registered list at /token (omitempty, empty for sealed DCR clients); inherited across rotations
     IssuedAt  time.Time // used by REVOKE_BEFORE bulk revocation
     ExpiresAt time.Time
     IdPRefreshToken string // forwarding mode only (omitempty); see below
@@ -929,3 +942,5 @@ Non-fatal startup warnings:
 
 - `token_signing_secret_weak` fires when the secret matches an obvious-weakness pattern (all-same byte, repeating period < length, or fewer than 8 distinct byte values) — signals a human-typed / patterned secret whose effective entropy is well below its length.
 - `token_seal_rotation_threshold` fires once after 2^28 successful seals per Manager, suggesting `TOKEN_SIGNING_SECRET` rotation before AES-GCM nonce-collision bounds matter (L6).
+
+One `startup_config` INFO line per process start records the runtime posture as booleans (`prod_mode`, `pkce_required`, `cimd_enabled`, `redis_required`, `rate_limit_enabled`, `compat_allow_stateless`, `render_consent_page`, ...) and the set-ness of sensitive values, never the values.

@@ -106,7 +106,7 @@ control.
 |---|---|---|
 | `PROD_MODE` | `true` | Fails startup if any compatibility flag that weakens a security control is set (`PKCE_REQUIRED=false`, `COMPAT_ALLOW_STATELESS=true`, `REDIS_REQUIRED=false`, `RATE_LIMIT_ENABLED=false`, `REDIS_URL` empty, `OIDC_ALLOW_INSECURE_HTTP=true`, a weak `TOKEN_SIGNING_SECRET`, or legacy `TRUST_PROXY_HEADERS=true` without `TRUSTED_PROXY_CIDRS`). Set `false` explicitly only for dev / single-replica work that needs one of the relaxation toggles. |
 | `PKCE_REQUIRED` | `true` | Set `false` for legacy clients that omit PKCE (Cursor, MCP Inspector, ChatGPT). Rejected by `PROD_MODE`. Custom-scheme redirects (`REDIRECT_URIS_EXTRA`) require client S256 regardless. |
-| `CIMD_ENABLED` | `true` | Accept an `https` URL as `client_id` (Client ID Metadata Documents, MCP Authorization 2026-07-28): `/authorize` fetches the document at that URL for `client_name` and `redirect_uris`, and the AS metadata advertises `client_id_metadata_document_supported`. Set `false` to treat such a `client_id` as unknown without fetching. Not a `PROD_MODE` violation either way. |
+| `CIMD_ENABLED` | `true` | Accept an `https` URL as `client_id` (Client ID Metadata Documents, MCP Authorization 2026-07-28): `/authorize` fetches the document at that URL for `client_name` and `redirect_uris`, and the AS metadata advertises `client_id_metadata_document_supported`. Set `false` to treat such a `client_id` as unknown without fetching, at `/authorize` and at `/token` (live CIMD sessions end). Not a `PROD_MODE` violation either way. |
 | `COMPAT_ALLOW_STATELESS` | `false` | Synthesize a server-side `state` on `/authorize` when the client omits it. Strict mode refuses the request; counter `mcp_auth_access_denied_total{reason="state_missing"}` fires either way. Rejected by `PROD_MODE`. |
 | `RENDER_CONSENT_PAGE` | `true` | Render an explicit proxy-side consent page on `/authorize` so the user sees who's asking and where they'll be redirected before the IdP login. Closes the silent-token-issuance path where a malicious DCR client + an active IdP session = tokens issued without any user interaction. Plain HTML, no JavaScript. Set `false` to fall back to the legacy silent-redirect — only when every caller is non-interactive and known-trusted. |
 | `CSP_FORM_ACTION_EXTRA` | (empty) | **Deprecated, ignored.** `POST /consent` is now answered with a same-origin navigation interstitial (200 + meta refresh) instead of a 302, which terminates Chromium's form-action redirect-chain enforcement at the proxy — the consent page's `form-action` is `'self'`-only and no IdP / client origin needs to be enumerated. Still parsed and validated so existing deployments keep starting; a `csp_form_action_extra_deprecated` startup warning fires when set. Remove it from your deployment. |
@@ -216,7 +216,9 @@ with no `error_code`.
     `client_id`. (`/token` folds a missing `client_id` into its generic
     `invalid_request` "missing required parameters", unmetered.)
   - `client_id_invalid` — `/authorize` or `/token` could not decode
-    the sealed `client_id` (tampered, truncated, or wrong key). Both
+    the sealed `client_id` (tampered, truncated, or wrong key), or
+    received a URL `client_id` while `CIMD_ENABLED=false` (log field
+    `kind=cimd_disabled`). Both
     this and `client_typ_mismatch` surface on the wire as
     `error_code=client_id_unknown` — deliberate: distinct codes would
     tell an unauthenticated caller which of the two happened. The
@@ -231,6 +233,16 @@ with no `error_code`.
     `CLIENT_REGISTRATION_TTL`. Sustained counts = a client that
     never re-runs DCR; see
     [`runbooks/client-registration-expired.md`](./runbooks/client-registration-expired.md).
+  - `cimd_<result>`: a URL `client_id` whose Client ID Metadata
+    Document did not resolve at `/authorize`; `<result>` is the
+    `mcp_auth_cimd_fetch_total` label (`url_invalid`, `ssrf_blocked`,
+    `fetch_error`, `too_large`, `doc_invalid`,
+    `auth_method_unsupported`). On the wire `error_code` is
+    `client_metadata_unavailable` (`fetch_error`, `ssrf_blocked`,
+    `too_large`: check the client's metadata host; the
+    `cimd_resolve_failed` WARN names it) or `client_metadata_invalid`
+    (`url_invalid`, `doc_invalid`, `auth_method_unsupported`: the
+    client's publisher must fix the document).
   - `redirect_uri_missing` / `redirect_uri_mismatch` — `/authorize`
     `redirect_uri` absent or not among the registered URIs (client
     misconfiguration, not an attack signal).

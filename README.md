@@ -126,6 +126,7 @@ this in front, point it at your existing IdP, done.
 | [RFC 8414](https://datatracker.ietf.org/doc/html/rfc8414) | `/.well-known/oauth-authorization-server` |
 | [RFC 9728](https://datatracker.ietf.org/doc/html/rfc9728) | `/.well-known/oauth-protected-resource` + `WWW-Authenticate` |
 | [RFC 7591](https://datatracker.ietf.org/doc/html/rfc7591) | Dynamic Client Registration on `POST /register` |
+| [draft-ietf-oauth-client-id-metadata-document-02](https://www.ietf.org/archive/id/draft-ietf-oauth-client-id-metadata-document-02.html) | Client ID Metadata Documents: URL `client_id`s resolved at `/authorize` |
 | [RFC 7636](https://datatracker.ietf.org/doc/html/rfc7636) | PKCE S256, 43-128 char verifier |
 | [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707.html) | `resource` indicator on `/authorize` and `/token` |
 | [RFC 9207](https://datatracker.ietf.org/doc/html/rfc9207) | `iss` on every authorization response, success and error |
@@ -158,7 +159,7 @@ production posture.
 | **`TOKEN_SIGNING_SECRET`** | ≥ 32 bytes, AES-GCM key; byte-identical across replicas. **Generate with `manifests/scripts/generate-signing-secret.sh`** (64-char base64). The startup validator rejects three weak-secret shapes: all-same-byte, short-repeating-period, and tiny alphabet (< 8 distinct values). Under `PROD_MODE=true` weak secrets fail fast. Rotation procedure (with `TOKEN_SIGNING_SECRETS_PREVIOUS` for zero-downtime rollover) in [`docs/runbooks/key-rotation.md`](./docs/runbooks/key-rotation.md) |
 
 Optional knobs (rate limits, replay store tuning, header trust,
-observability, dev/compat) are documented in
+observability, `CIMD_ENABLED`, dev/compat) are documented in
 [`docs/configuration.md`](./docs/configuration.md).
 
 ### Production posture
@@ -172,6 +173,14 @@ shipped defaults give you, with no extra effort:
   is dev-only.
 - **PKCE required** — `PKCE_REQUIRED=true`. Clients without PKCE
   (Cursor, MCP Inspector) need an explicit operator override.
+- **Client ID Metadata Documents on** (`CIMD_ENABLED=true`). An
+  `https://` `client_id` is fetched at `/authorize` behind a fixed
+  boundary: the resolved address is checked against the IANA
+  special-purpose registries (RFC 6890 and successors), no redirects, 5 KiB body, 5 s, 16 fetches in
+  flight per replica. `CIMD_ENABLED=false` refuses URL `client_id`s as
+  unknown clients and fetches nothing. Details in
+  [`specs.md`](./specs.md#get-authorize) and
+  [`docs/threat-model.md`](./docs/threat-model.md).
 - **Consent page on** — `RENDER_CONSENT_PAGE=true`. Closes the
   silent-token-issuance phishing path.
 - **Per-IP rate limiting on** — every pre-auth endpoint plus the
@@ -229,7 +238,7 @@ revocation rollout notes, and the K8s deployment shape.
 | `GET /.well-known/oauth-protected-resource<mount>` | RFC 9728 §3.1 per-resource variant |
 | `GET /.well-known/oauth-authorization-server` | RFC 8414 AS metadata |
 | `POST /register` | RFC 7591 dynamic client registration |
-| `GET  /authorize` | PKCE authorization endpoint (renders consent page by default) |
+| `GET  /authorize` | PKCE authorization endpoint (renders consent page by default); `client_id` is a sealed `/register` id or an `https://` Client ID Metadata Document URL |
 | `POST /consent` | Consent-page Approve / Deny submission |
 | `GET  /callback` | OIDC callback from the IdP |
 | `POST /token` | `authorization_code` + `refresh_token` grants |
