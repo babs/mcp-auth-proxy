@@ -68,6 +68,11 @@ const (
 	codeRedirectURIMissing        = "redirect_uri_missing"
 	codeRedirectURIMismatch       = "redirect_uri_mismatch"
 	codeRedirectURIMalformed      = "redirect_uri_malformed"
+	// Client ID Metadata Document resolution (an https URL client_id):
+	// the document could not be fetched, or it is not a usable client.
+	codeClientMetadataUnavailable    = "client_metadata_unavailable"
+	codeClientMetadataInvalid        = "client_metadata_invalid"
+	codeClientMetadataHostNotAllowed = "client_metadata_host_not_allowed"
 
 	// /callback session and IdP leg.
 	codeSessionUnknown          = "session_unknown"
@@ -255,12 +260,18 @@ type sealedConsent struct {
 	// one is dead once redeemed). Empty on tokens sealed before this
 	// field existed — /consent then falls through to the prior
 	// stateless behavior for that token.
-	JTI           string `json:"jti,omitempty"`
-	ClientID      string `json:"cid"`
-	ClientName    string `json:"cn,omitempty"`
-	RedirectURI   string `json:"ru"`
-	OriginalState string `json:"os"`
-	CodeChallenge string `json:"cc,omitempty"`
+	JTI        string `json:"jti,omitempty"`
+	ClientID   string `json:"cid"`
+	ClientName string `json:"cn,omitempty"`
+	// ClientHost is the client_id URL host (port kept) of a Client ID
+	// Metadata Document client, shown next to the name; empty for DCR.
+	ClientHost string `json:"ch,omitempty"`
+	// LoopbackRedirect is true when the requested redirect_uri is loopback:
+	// the page then warns that any local program could be the requester.
+	LoopbackRedirect bool   `json:"lb,omitempty"`
+	RedirectURI      string `json:"ru"`
+	OriginalState    string `json:"os"`
+	CodeChallenge    string `json:"cc,omitempty"`
 	// SvrChallengeRequested is true when /authorize is operating
 	// under PKCE_REQUIRED=false AND the client omitted
 	// code_challenge — POST /consent then mints the server-side
@@ -305,8 +316,13 @@ type sealedRefresh struct {
 	// session used. An index, not the URI, so a long redirect URI cannot
 	// make the refresh token outgrow its code (both share one open()
 	// size cap). 0 on refresh tokens sealed before this field existed.
-	RedirectURIIndex int       `json:"rui,omitempty"`
-	IssuedAt         time.Time `json:"iat"`
+	RedirectURIIndex int `json:"rui,omitempty"`
+	// RedirectURI is the URI itself for a Client ID Metadata Document
+	// client, which has no registered list to index at /token (the
+	// document is fetched only at /authorize); inherited across rotations
+	// like RedirectURIIndex. Empty for sealed (DCR) clients.
+	RedirectURI string    `json:"ru,omitempty"`
+	IssuedAt    time.Time `json:"iat"`
 	// FamilyIssuedAt is the IssuedAt of the FIRST refresh in this
 	// rotation lineage (the one minted at code redemption) and is
 	// inherited verbatim by every rotated descendant. REVOKE_BEFORE
@@ -448,7 +464,26 @@ func clientExpired(c *sealedClient) bool {
 // Factoring this out removes the near-identical 20-line block from
 // each grant handler; error shapes are preserved verbatim so the
 // existing test matrix against both paths keeps exercising them.
-func openAndValidateClient(w http.ResponseWriter, r *http.Request, tm *token.Manager, logger *zap.Logger, clientIDStr, audience string) *sealedClient {
+//
+// A Client ID Metadata Document client_id (cfg.CIMDEnabled) is returned
+// without a fetch: the sealed code or refresh already pins the URL and
+// the redirect URI, so the grant handlers' string comparisons bind it.
+func openAndValidateClient(w http.ResponseWriter, r *http.Request, tm *token.Manager, logger *zap.Logger, clientIDStr, audience string, cfg TokenConfig) *sealedClient {
+	if isCIMDClientID(clientIDStr) {
+		if !cfg.CIMDEnabled {
+			recordClientDenial(logger, "client_id_invalid", zap.String("kind", "cimd_disabled"))
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "invalid client_id", codeClientIDUnknown)
+			return nil
+		}
+		// The host policy must reach sessions already issued, like the
+		// redirect-list re-check: /authorize ran under the list of its day.
+		if u, err := url.Parse(clientIDStr); err != nil || !cfg.CIMDAllowedHosts.Allows(u.Hostname()) {
+			recordClientDenial(logger, "cimd_host_not_allowed", zap.String("client_id_host", sanitizeErrorDescription(cimdClientHost(clientIDStr))))
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_client", "client_id host is not allowed by the operator", codeClientMetadataHostNotAllowed)
+			return nil
+		}
+		return &sealedClient{ID: clientIDStr, Typ: token.PurposeClient, Audience: audience}
+	}
 	var client sealedClient
 	if err := tm.OpenJSON(clientIDStr, &client, token.PurposeClient); err != nil {
 		recordClientDenial(logger, "client_id_invalid", zap.Error(err))
@@ -630,4 +665,32 @@ func registeredRedirectCheck(uri string, extra config.RedirectAllowlist, allow c
 // is exempt from the HTTPS requirement per OAuth 2.1 §2.3.1.
 func isLoopback(u *url.URL) bool {
 	return config.IsLoopbackHost(u.Hostname())
+}
+
+// loopbackRedirect reports whether the requested redirect URI is
+// loopback: the consent page then cannot tell the user which local
+// program is asking (MCP Authorization, Localhost Redirect URI Risks).
+func loopbackRedirect(raw string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && isLoopback(u)
+}
+
+// clientNameForbidden reports a client_name the proxy refuses: control
+// bytes, `,` (the X-User-Groups delimiter), and Unicode bidi controls,
+// which would reorder the consent-page text after the name, host included.
+func clientNameForbidden(name string) bool {
+	return strings.ContainsAny(name, ",\r\n\t\x00\x0b\x0c\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
+}
+
+// cimdClientHost returns the host (port kept) of a Client ID Metadata
+// Document client_id, "" for a sealed DCR id.
+func cimdClientHost(clientID string) string {
+	if !isCIMDClientID(clientID) {
+		return ""
+	}
+	u, err := url.Parse(clientID)
+	if err != nil {
+		return ""
+	}
+	return u.Host
 }

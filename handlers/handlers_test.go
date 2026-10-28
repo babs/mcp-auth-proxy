@@ -201,7 +201,7 @@ func TestWriteOAuthError_IncludesOptionalErrorCode(t *testing.T) {
 
 func TestDiscovery(t *testing.T) {
 	baseURL := testBaseURL
-	handler := Discovery(baseURL)
+	handler := Discovery(baseURL, true)
 
 	req := httptest.NewRequest(http.MethodGet, "/.well-known/oauth-authorization-server", nil)
 	rr := httptest.NewRecorder()
@@ -243,6 +243,20 @@ func TestDiscovery(t *testing.T) {
 	// or strict clients will skip the check.
 	if got, ok := meta["authorization_response_iss_parameter_supported"].(bool); !ok || !got {
 		t.Errorf("authorization_response_iss_parameter_supported: want true, got %v", meta["authorization_response_iss_parameter_supported"])
+	}
+
+	// MAP-002-AC1
+	if got, ok := meta["client_id_metadata_document_supported"].(bool); !ok || !got {
+		t.Errorf("client_id_metadata_document_supported: want true, got %v", meta["client_id_metadata_document_supported"])
+	}
+	rr = httptest.NewRecorder()
+	Discovery(baseURL, false)(rr, req)
+	meta = map[string]any{}
+	if err := json.NewDecoder(rr.Body).Decode(&meta); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if v, present := meta["client_id_metadata_document_supported"]; present {
+		t.Errorf("client_id_metadata_document_supported = %v with CIMD disabled, want the key absent", v)
 	}
 }
 
@@ -349,7 +363,7 @@ func TestRegister_NeverExpires(t *testing.T) {
 	// The expiry guard must let a zero-ExpiresAt client through even
 	// though time.Now() is "after" the zero time.
 	vr := httptest.NewRecorder()
-	if got := openAndValidateClient(vr, httptest.NewRequest(http.MethodPost, "/token", nil), tm, zap.NewNop(), resp.ClientID, testBaseURL); got == nil {
+	if got := openAndValidateClient(vr, httptest.NewRequest(http.MethodPost, "/token", nil), tm, zap.NewNop(), resp.ClientID, testBaseURL, TokenConfig{}); got == nil {
 		t.Fatalf("non-expiring client_id rejected: %d %s", vr.Code, vr.Body.String())
 	}
 }
@@ -398,7 +412,7 @@ func TestOpenAndValidateClient_RejectionMetrics(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			before := testutil.ToFloat64(metrics.AccessDenied.WithLabelValues(tc.reason))
 			rr := httptest.NewRecorder()
-			if got := openAndValidateClient(rr, httptest.NewRequest(http.MethodPost, "/token", nil), tm, zap.NewNop(), tc.clientID, testBaseURL); got != nil {
+			if got := openAndValidateClient(rr, httptest.NewRequest(http.MethodPost, "/token", nil), tm, zap.NewNop(), tc.clientID, testBaseURL, TokenConfig{}); got != nil {
 				t.Fatal("expected rejection (nil), got a client")
 			}
 			if rr.Code != http.StatusBadRequest {

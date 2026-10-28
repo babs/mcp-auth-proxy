@@ -47,6 +47,8 @@ data:
   METRICS_ADDR: ":9090"
   LOG_LEVEL: "info"
   PKCE_REQUIRED: "true"
+  # CIMD_ENABLED: "false"   # refuse https URL client_ids (Client ID Metadata Documents), no fetch
+  # CIMD_ALLOWED_HOSTS: "*.example.com"   # hosts a URL client_id may name; a glob does not match the apex
   RATE_LIMIT_ENABLED: "true"
   # Graceful shutdown — must be STRICTLY LESS than
   # terminationGracePeriodSeconds in the Deployment (we add ~5s inFlight

@@ -32,7 +32,7 @@ A useful report typically contains:
   are ideal; screenshots are acceptable.
 - The configuration that triggers the issue — env vars, IdP type,
   whether Redis is enabled, `PROD_MODE`, `RENDER_CONSENT_PAGE`,
-  `PKCE_REQUIRED`, `TRUSTED_PROXY_CIDRS`, etc.
+  `PKCE_REQUIRED`, `CIMD_ENABLED`, `TRUSTED_PROXY_CIDRS`, etc.
 - Expected vs. observed behavior, and the security impact you
   believe this enables (e.g. token theft, account takeover, SSRF,
   bypass of `ALLOWED_GROUPS`).

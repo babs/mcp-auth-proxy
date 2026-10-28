@@ -3,7 +3,9 @@ package handlers
 import "net/http"
 
 // Discovery returns the OAuth 2.0 Authorization Server Metadata.
-func Discovery(baseURL string) http.HandlerFunc {
+// cimdEnabled advertises Client ID Metadata Document support; when
+// false the key is absent, not false.
+func Discovery(baseURL string, cimdEnabled bool) http.HandlerFunc {
 	meta := map[string]any{
 		"issuer":                           baseURL,
 		"authorization_endpoint":           baseURL + "/authorize",
@@ -35,6 +37,10 @@ func Discovery(baseURL string) http.HandlerFunc {
 		// on this metadata flag — if it's missing, they ignore `iss`
 		// and the defense is silently disabled. We always emit it.
 		"authorization_response_iss_parameter_supported": true,
+	}
+	if cimdEnabled {
+		// MCP Authorization 2026-07-28 / draft-ietf-oauth-client-id-metadata-document-02 §5.
+		meta["client_id_metadata_document_supported"] = true
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {

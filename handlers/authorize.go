@@ -65,6 +65,9 @@ type AuthorizeConfig struct {
 	// RedirectURIsExtra is for custom schemes: setting or narrowing it
 	// blocks new authorizations for clients registered before the change.
 	RedirectURIsAllowlist config.WebRedirectAllowlist
+	// CIMD resolves https URL client_ids (Client ID Metadata Documents);
+	// nil refuses them as unknown clients without a fetch.
+	CIMD *CIMDResolver
 }
 
 // Authorize handles GET /authorize (OAuth 2.1 PKCE authorization request).
@@ -126,7 +129,20 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 		}
 
 		var client sealedClient
-		if err := tm.OpenJSON(clientIDStr, &client, token.PurposeClient); err != nil {
+		if isCIMDClientID(clientIDStr) {
+			if authzCfg.CIMD == nil {
+				recordClientDenial(logger, "client_id_invalid", zap.String("kind", "cimd_disabled"))
+				writeOAuthError(w, r, http.StatusBadRequest, "invalid_client", "unknown client_id", codeClientIDUnknown)
+				return
+			}
+			c, ce := authzCfg.CIMD.Resolve(r.Context(), clientIDStr, baseURL)
+			if ce != nil {
+				recordClientDenial(logger, "cimd_"+string(ce.Result))
+				writeCIMDError(w, r, ce.Result)
+				return
+			}
+			client = *c
+		} else if err := tm.OpenJSON(clientIDStr, &client, token.PurposeClient); err != nil {
 			recordClientDenial(logger, "client_id_invalid", zap.Error(err))
 			writeOAuthError(w, r, http.StatusBadRequest, "invalid_client", "unknown client_id", codeClientIDUnknown)
 			return
@@ -247,6 +263,8 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 				JTI:                   uuid.New().String(),
 				ClientID:              client.ID,
 				ClientName:            client.ClientName,
+				ClientHost:            cimdClientHost(client.ID),
+				LoopbackRedirect:      loopbackRedirect(redirectURI),
 				RedirectURI:           redirectURI,
 				OriginalState:         state,
 				CodeChallenge:         codeChallenge,
@@ -324,6 +342,29 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 
 		logger.Debug("idp_redirect", zap.String("internal_client_id", client.ID))
 		http.Redirect(w, r, authURL, http.StatusFound)
+	}
+}
+
+// writeCIMDError answers a failed Client ID Metadata Document
+// resolution on the AS. One description per result class, restated as
+// literals: writeOAuthError admits only compile-time descriptions, and
+// the per-cause detail is in the cimd_resolve_failed log.
+func writeCIMDError(w http.ResponseWriter, r *http.Request, result cimdResult) {
+	switch result {
+	case cimdURLInvalid:
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_client", "client_id must be an https URL with a path and no query, fragment or userinfo", codeClientMetadataInvalid)
+	case cimdHostNotAllowed:
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_client", "client_id host is not allowed by the operator", codeClientMetadataHostNotAllowed)
+	case cimdDocInvalid:
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_client", "client metadata document is invalid", codeClientMetadataInvalid)
+	case cimdAuthMethodUnsupported:
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_client", "private_key_jwt not supported, use none", codeClientMetadataInvalid)
+	case cimdSSRFBlocked:
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_client", "client_id host resolves to a non-public address", codeClientMetadataUnavailable)
+	case cimdTooLarge:
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_client", "client metadata document exceeds the size cap", codeClientMetadataUnavailable)
+	default:
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_client", "client metadata document could not be fetched", codeClientMetadataUnavailable)
 	}
 }
 

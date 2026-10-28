@@ -663,6 +663,33 @@ func TestLoad_PKCERequired_False(t *testing.T) {
 	}
 }
 
+// Only the literal false disables, like PKCE_REQUIRED; unlike it, the
+// toggle is not a PROD_MODE violation either way.
+func TestLoad_CIMDEnabled(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want bool
+	}{
+		{"", true},
+		{"false", false},
+		{"FALSE", false},
+		{"0", true},
+		{"true", true},
+	} {
+		t.Run("CIMD_ENABLED="+tc.raw, func(t *testing.T) {
+			setAllRequired(t)
+			t.Setenv("CIMD_ENABLED", tc.raw)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cfg.CIMDEnabled != tc.want {
+				t.Errorf("CIMDEnabled = %v, want %v", cfg.CIMDEnabled, tc.want)
+			}
+		})
+	}
+}
+
 func TestLoad_ShutdownTimeout_Default(t *testing.T) {
 	setAllRequired(t)
 	cfg, err := Load()
@@ -2601,4 +2628,79 @@ func redirectURIsExtraRow(t *testing.T, rel string) string {
 	}
 	t.Fatalf("%s has no REDIRECT_URIS_EXTRA table row", rel)
 	return ""
+}
+
+// MAP-002-AC7
+func TestLoad_CIMDAllowedHosts(t *testing.T) {
+	t.Run("accepts hostnames and suffix globs", func(t *testing.T) {
+		setAllRequired(t)
+		t.Setenv("CIMD_ALLOWED_HOSTS", " app.example.com , , *.Example.com ,APP.Other.example,")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// Lower-cased, trimmed, blank items skipped; globs listed after exacts.
+		want := []string{"app.example.com", "app.other.example", "*.example.com"}
+		if !slices.Equal(cfg.CIMDAllowedHosts.Entries(), want) {
+			t.Errorf("Entries = %v, want %v", cfg.CIMDAllowedHosts.Entries(), want)
+		}
+	})
+
+	for _, bad := range []struct{ name, val, wantErr string }{
+		{"scheme", "https://x", "a hostname, not a URL"},
+		{"path", "x/y", "a hostname, not a URL"},
+		{"port", "x:443", "a hostname, without a port"},
+		{"bare wildcard", "*", "a wildcard is allowed only as a leading `*.`"},
+		{"wildcard without a name", "*.", "empty label"},
+		{"wildcard glued to a label", "*x.com", "a wildcard is allowed only as a leading `*.`"},
+		{"wildcard inside", "a.*.com", "a wildcard is allowed only as a leading `*.`"},
+		{"leading dot", ".example.com", "empty label"},
+		{"space", "exa mple.com", `invalid character ' '`},
+		{"64-char label", "*." + strings.Repeat("a", 64) + ".com", "label longer than 63 characters"},
+		{"leading hyphen", "-x.example.com", "label starts or ends with a hyphen"},
+		{"trailing hyphen", "x-.example.com", "label starts or ends with a hyphen"},
+	} {
+		t.Run("rejects "+bad.name, func(t *testing.T) {
+			setAllRequired(t)
+			t.Setenv("CIMD_ALLOWED_HOSTS", "ok.example,"+bad.val)
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("Load() unexpectedly succeeded for %q", bad.val)
+			}
+			if !strings.HasPrefix(err.Error(), "CIMD_ALLOWED_HOSTS: ") || !strings.Contains(err.Error(), bad.wantErr) {
+				t.Errorf("error = %q, want CIMD_ALLOWED_HOSTS prefix and %q", err, bad.wantErr)
+			}
+		})
+	}
+}
+
+// MAP-002-AC7: an empty list admits every host; an exact entry is
+// case-insensitive; a glob needs at least one label before the suffix
+// and never matches the apex.
+func TestCIMDHostAllowlist_Allows(t *testing.T) {
+	var empty CIMDHostAllowlist
+	if !empty.Allows("anything.example") {
+		t.Error("empty list refused a host")
+	}
+	a, err := ParseCIMDHostAllowlist("app.example.com,*.example.org")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for host, want := range map[string]bool{
+		"app.example.com":      true,
+		"APP.Example.com":      true,
+		"example.com":          false,
+		"x.app.example.com":    false,
+		"app.example.org":      true,
+		"a.b.example.org":      true,
+		"A.B.Example.ORG":      true,
+		"example.org":          false,
+		"notexample.org":       false,
+		"app.example.org.evil": false,
+		"":                     false,
+	} {
+		if got := a.Allows(host); got != want {
+			t.Errorf("Allows(%q) = %v, want %v", host, got, want)
+		}
+	}
 }

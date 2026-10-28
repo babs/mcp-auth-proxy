@@ -5,7 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"strings"
+	"net/url"
 	"time"
 
 	"github.com/babs/mcp-auth-proxy/config"
@@ -132,15 +132,15 @@ func Register(tm *token.Manager, logger *zap.Logger, audience string, regCfg Reg
 			writeOAuthError(w, r, http.StatusBadRequest, "invalid_client_metadata", "client_name exceeds maximum length")
 			return
 		}
-		// Reject control bytes (NUL / CR / LF / TAB / etc.) and the
-		// X-User-Groups delimiter `,`. zap escapes the access-log
+		// Reject control bytes (NUL / CR / LF / TAB / etc.), bidi
+		// controls and the X-User-Groups delimiter `,`. zap escapes the access-log
 		// line so log injection is neutralized at the transport, but
 		// the sealed client_id carries the raw bytes — anything
 		// downstream that unseals and parses ClientName would
 		// inherit them. Mirrors the group-name filter at
 		// callback.go (M12). RFC 7591 §2 permits operator-side
 		// rejection of metadata; §3.2.2 prescribes the error code.
-		if strings.ContainsAny(req.ClientName, ",\r\n\t\x00\x0b\x0c") {
+		if clientNameForbidden(req.ClientName) {
 			writeOAuthError(w, r, http.StatusBadRequest, "invalid_client_metadata", "client_name must not contain control bytes or commas")
 			return
 		}
@@ -215,22 +215,40 @@ func Register(tm *token.Manager, logger *zap.Logger, audience string, regCfg Reg
 	}
 }
 
-// validateRedirectURI writes the RFC 7591 §3.2.2 error and returns
-// false when raw is not an acceptable redirect URI. Operator lists then
-// narrow (REDIRECT_URIS_ALLOWLIST, http(s)) or widen (REDIRECT_URIS_EXTRA,
+// checkRegisterRedirectURI applies the redirect URI rules /register
+// enforces: shape first, then the operator lists, which narrow
+// (REDIRECT_URIS_ALLOWLIST, http(s)) or widen (REDIRECT_URIS_EXTRA,
 // custom schemes) the set; RFC 7591 §2 lets the server reject requested
-// metadata.
-func validateRedirectURI(w http.ResponseWriter, r *http.Request, logger *zap.Logger, raw string, regCfg RegisterConfig) bool {
+// metadata. u is nil exactly when the shape check failed, so callers can
+// tell the error families apart without a sentinel list. Shared with the
+// CIMD resolver so a metadata document cannot register a redirect URI
+// /register would refuse.
+func checkRegisterRedirectURI(raw string, extra config.RedirectAllowlist, allow config.WebRedirectAllowlist) (*url.URL, error) {
 	u, err := config.CheckRedirectShape(raw)
 	if err != nil {
-		writeRedirectShapeError(w, r, err)
-		return false
+		return nil, err
 	}
 	// Non-http(s) schemes only via REDIRECT_URIS_EXTRA.
 	if !config.IsWebScheme(u.Scheme) {
-		return checkCustomRedirect(w, r, regCfg.RedirectURIsExtra.Check(raw))
+		return u, extra.Check(raw)
 	}
-	if !webRedirectAllowed(raw, regCfg.RedirectURIsAllowlist) {
+	if !webRedirectAllowed(raw, allow) {
+		return u, errNotInWebAllowlist
+	}
+	return u, nil
+}
+
+// validateRedirectURI writes the RFC 7591 §3.2.2 error and returns
+// false when raw is not an acceptable redirect URI.
+func validateRedirectURI(w http.ResponseWriter, r *http.Request, logger *zap.Logger, raw string, regCfg RegisterConfig) bool {
+	u, err := checkRegisterRedirectURI(raw, regCfg.RedirectURIsExtra, regCfg.RedirectURIsAllowlist)
+	switch {
+	case u == nil:
+		writeRedirectShapeError(w, r, err)
+		return false
+	case !config.IsWebScheme(u.Scheme):
+		return checkCustomRedirect(w, r, err)
+	case err != nil:
 		// No query, and printable ASCII only: the client chose these bytes.
 		logger.Warn("register_redirect_uri_not_allowlisted", zap.String("scheme", u.Scheme),
 			zap.String("host", sanitizeErrorDescription(u.Host)), zap.String("path", sanitizeErrorDescription(u.EscapedPath())))

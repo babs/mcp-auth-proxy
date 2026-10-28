@@ -18,7 +18,7 @@ func TestRegisterDiscoveryRoutes(t *testing.T) {
 	baseURL := "https://proxy.example.test"
 
 	r := chi.NewRouter()
-	registerDiscoveryRoutes(r, baseURL, "/mcp", "", nil)
+	registerDiscoveryRoutes(r, baseURL, "/mcp", "", nil, false)
 	// Simulate the production auth-gated catch-all. If any discovery
 	// path falls through to this, the assertion on the status will
 	// flag it (it writes 401 instead of the expected value).
@@ -76,7 +76,7 @@ func TestRegisterDiscoveryRoutes_CustomMount(t *testing.T) {
 	baseURL := "https://proxy.example.test"
 	mount := "/api/v1/mcp"
 	r := chi.NewRouter()
-	registerDiscoveryRoutes(r, baseURL, mount, "", nil)
+	registerDiscoveryRoutes(r, baseURL, mount, "", nil, false)
 	r.Group(func(r chi.Router) {
 		r.Use(func(next http.Handler) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -133,7 +133,7 @@ func TestRegisterDiscoveryRoutes_CustomMount(t *testing.T) {
 // path answered as JSON — because the point is that they agree.
 func TestNotFound_OneBodyEverywhere(t *testing.T) {
 	r := chi.NewRouter()
-	registerDiscoveryRoutes(r, "https://proxy.example.test", "/mcp", "", nil)
+	registerDiscoveryRoutes(r, "https://proxy.example.test", "/mcp", "", nil, false)
 	installNotFound(r)
 
 	for _, path := range []string{
@@ -176,7 +176,7 @@ func TestNotFound_OneBodyEverywhere(t *testing.T) {
 func TestRegisterDiscoveryRoutes_ResourceFields(t *testing.T) {
 	baseURL := "https://proxy.example.test"
 	r := chi.NewRouter()
-	registerDiscoveryRoutes(r, baseURL, "/mcp", "", nil)
+	registerDiscoveryRoutes(r, baseURL, "/mcp", "", nil, false)
 
 	cases := []struct {
 		path         string
@@ -219,7 +219,7 @@ func TestRegisterDiscoveryRoutes_LimiterApplied(t *testing.T) {
 		})
 	}
 	r := chi.NewRouter()
-	registerDiscoveryRoutes(r, "https://proxy.example.test", "/mcp", "", limiter)
+	registerDiscoveryRoutes(r, "https://proxy.example.test", "/mcp", "", limiter, false)
 
 	paths := []string{
 		"/.well-known/oauth-protected-resource",
