@@ -65,6 +65,10 @@ type TokenConfig struct {
 	// sessions whose redirect URI it no longer admits.
 	RedirectURIsExtra     config.RedirectAllowlist
 	RedirectURIsAllowlist config.WebRedirectAllowlist
+	// CIMDEnabled admits https URL client_ids (Client ID Metadata
+	// Documents). A bool, not the resolver: /token never fetches, the
+	// sealed code or refresh already pins the URL.
+	CIMDEnabled bool
 }
 
 // idpClaimReleaseTimeout bounds the release of a single-use claim after
@@ -208,7 +212,7 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 		return
 	}
 
-	client := openAndValidateClient(w, r, tm, logger, clientIDStr, audience)
+	client := openAndValidateClient(w, r, tm, logger, clientIDStr, audience, cfg.CIMDEnabled)
 	if client == nil {
 		return
 	}
@@ -364,6 +368,7 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 		// life of the family.
 		Resource:         code.Resource,
 		RedirectURIIndex: slices.IndexFunc(client.RedirectURIs, func(uri string) bool { return redirectURIMatches(code.RedirectURI, uri) }) + 1,
+		RedirectURI:      cimdRefreshRedirectURI(client.ID, code.RedirectURI),
 		IssuedAt:         now,
 		// FamilyIssuedAt is set ONCE here at code redemption and
 		// inherited unchanged by every rotation. REVOKE_BEFORE is
@@ -464,7 +469,7 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 		return
 	}
 
-	client := openAndValidateClient(w, r, tm, logger, clientIDStr, audience)
+	client := openAndValidateClient(w, r, tm, logger, clientIDStr, audience, cfg.CIMDEnabled)
 	if client == nil {
 		return
 	}
@@ -618,6 +623,7 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 		Audience:         audience,
 		Resource:         refresh.Resource,
 		RedirectURIIndex: refresh.RedirectURIIndex,
+		RedirectURI:      refresh.RedirectURI,
 		IssuedAt:         now,
 		FamilyIssuedAt:   familyIssuedAt,
 		ExpiresAt:        now.Add(refreshTokenTTL),
@@ -709,12 +715,25 @@ func sealRefreshToken(tm *token.Manager, forward bool, sr sealedRefresh) (string
 	return sealed, err
 }
 
+// errCIMDRefreshNoRedirect is the cause when a Client ID Metadata
+// Document session's refresh token carries no redirect URI.
+var errCIMDRefreshNoRedirect = errors.New("refresh token carries no redirect URI")
+
 // refreshRedirectCheck judges the registered redirect URI the session's
 // code was issued for. A refresh token without that index (sealed before
 // it existed, or rotated by such a release) passes only if every
 // registered URI is still admitted: one listed sibling must not keep
 // alive a session obtained through an unlisted URI.
 func refreshRedirectCheck(refresh *sealedRefresh, client *sealedClient, cfg TokenConfig) error {
+	if refresh.RedirectURI != "" {
+		return registeredRedirectCheck(refresh.RedirectURI, cfg.RedirectURIsExtra, cfg.RedirectURIsAllowlist)
+	}
+	// A CIMD client has no registered list at /token, so the fallbacks
+	// below would pass vacuously: the URI is sealed at redemption, and
+	// its absence is a defect to refuse, not a legacy token to admit.
+	if isCIMDClientID(client.ID) {
+		return errCIMDRefreshNoRedirect
+	}
 	if i := refresh.RedirectURIIndex; i >= 1 && i <= len(client.RedirectURIs) {
 		return registeredRedirectCheck(client.RedirectURIs[i-1], cfg.RedirectURIsExtra, cfg.RedirectURIsAllowlist)
 	}
@@ -724,6 +743,16 @@ func refreshRedirectCheck(refresh *sealedRefresh, client *sealedClient, cfg Toke
 		}
 	}
 	return nil
+}
+
+// cimdRefreshRedirectURI is the redirect URI a refresh token must carry:
+// only for a Client ID Metadata Document client, whose registered list
+// is not at hand at /token; DCR clients keep the smaller index.
+func cimdRefreshRedirectURI(clientID, redirectURI string) string {
+	if isCIMDClientID(clientID) {
+		return redirectURI
+	}
+	return ""
 }
 
 // denyGrantNotAllowlisted refuses a grant the operator's redirect lists

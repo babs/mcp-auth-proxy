@@ -217,6 +217,7 @@ const (
 	hintRestart          = "Go back to the application and start again."
 	hintReconnect        = "Reconnect this service in your application; if that does not help, contact the administrator of this service and quote the code below."
 	hintContact          = "You can close this window. If you believe this is a mistake, contact the administrator of this service and quote the code below."
+	hintClientPublisher  = "The application you are connecting from is misconfigured. Contact its publisher, or the administrator of this service and quote the code below."
 	hintVerifyEmail      = "Verify your email address with your identity provider, then go back to the application and try again; if it is already verified, contact the administrator of this service and quote the code below."
 )
 
@@ -269,6 +270,11 @@ var codeHints = map[string]string{
 	// client_id. Re-registering fixes the benign case; the rogue-URI
 	// case reaches an operator through the denial metric, not the page.
 	codeRedirectURIMismatch: hintReconnect,
+	// The client's metadata host did not answer usably: nothing on this
+	// side to fix, and the next attempt may well succeed.
+	codeClientMetadataUnavailable: hintTransientRestart,
+	// The document itself is wrong, which only its publisher can fix.
+	codeClientMetadataInvalid: hintClientPublisher,
 	// The callback state is claimed BEFORE the upstream exchange
 	// (callback.go), so reloading an idp_exchange_failed URL can only
 	// yield callback_state_replay: wait, then restart the flow.

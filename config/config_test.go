@@ -663,6 +663,33 @@ func TestLoad_PKCERequired_False(t *testing.T) {
 	}
 }
 
+// Only the literal false disables, like PKCE_REQUIRED; unlike it, the
+// toggle is not a PROD_MODE violation either way.
+func TestLoad_CIMDEnabled(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want bool
+	}{
+		{"", true},
+		{"false", false},
+		{"FALSE", false},
+		{"0", true},
+		{"true", true},
+	} {
+		t.Run("CIMD_ENABLED="+tc.raw, func(t *testing.T) {
+			setAllRequired(t)
+			t.Setenv("CIMD_ENABLED", tc.raw)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cfg.CIMDEnabled != tc.want {
+				t.Errorf("CIMDEnabled = %v, want %v", cfg.CIMDEnabled, tc.want)
+			}
+		})
+	}
+}
+
 func TestLoad_ShutdownTimeout_Default(t *testing.T) {
 	setAllRequired(t)
 	cfg, err := Load()

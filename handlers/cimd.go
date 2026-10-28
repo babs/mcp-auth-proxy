@@ -74,20 +74,13 @@ func (e *cimdError) Error() string {
 
 func (e *cimdError) Unwrap() error { return e.Err }
 
-// errCIMDBlockedAddress marks a dial refused by cimdDialGuard; it travels
+// errCIMDBlockedAddress marks a dial refused by the dial guard; it travels
 // through net.OpError and url.Error, so errors.Is finds it after Do.
 var (
 	errCIMDBlockedAddress = errors.New("client_id host resolved to a special-purpose address")
 	errCIMDRedirect       = errors.New("client metadata document redirected")
 	errCIMDCapacity       = errors.New("client metadata fetch capacity exhausted")
 )
-
-// Built from the constant so the description cannot drift from the cap.
-var cimdTooLargeDesc = fmt.Sprintf("client metadata document exceeds the %d KiB cap", cimdMaxBodyBytes/1024)
-
-// cimdDialGuard judges the resolved dial address. Package-level so tests
-// can admit loopback (httptest servers); production never changes it.
-var cimdDialGuard = cimdRejectSpecialPurpose
 
 // cimdSpecialPurpose lists the IANA special-purpose registries (RFC 6890
 // and successors) CIMD draft -02 §8.6 forbids fetching from. Globally
@@ -219,16 +212,39 @@ type cimdDocument struct {
 	ClientSecretExpiresAt   json.RawMessage `json:"client_secret_expires_at"`
 }
 
-// cimdResolver fetches and validates Client ID Metadata Documents.
-type cimdResolver struct {
+// CIMDResolver fetches and validates Client ID Metadata Documents.
+type CIMDResolver struct {
 	client        *http.Client
 	logger        *zap.Logger
 	redirectExtra config.RedirectAllowlist
 	redirectAllow config.WebRedirectAllowlist
+	guard         func(netip.Addr) error
 	sem           chan struct{}
 }
 
-func newCIMDResolver(logger *zap.Logger, extra config.RedirectAllowlist, allow config.WebRedirectAllowlist) *cimdResolver {
+// CIMDResolverOptions are test-only knobs, scoped to one resolver like
+// proxy.Config.ResponseHeaderTimeoutOverride so a test cannot leak them
+// into another; production callers pass the zero value.
+type CIMDResolverOptions struct {
+	// DialGuardOverride replaces cimdRejectSpecialPurpose (httptest servers
+	// listen on loopback).
+	DialGuardOverride func(netip.Addr) error
+	// TLSClientConfigOverride replaces the transport's TLS config (an
+	// httptest certificate is self-signed and names example.com).
+	TLSClientConfigOverride *tls.Config
+}
+
+func NewCIMDResolver(logger *zap.Logger, extra config.RedirectAllowlist, allow config.WebRedirectAllowlist, opts CIMDResolverOptions) *CIMDResolver {
+	r := &CIMDResolver{
+		logger:        logger,
+		redirectExtra: extra,
+		redirectAllow: allow,
+		guard:         cimdRejectSpecialPurpose,
+		sem:           make(chan struct{}, cimdMaxInFlight),
+	}
+	if opts.DialGuardOverride != nil {
+		r.guard = opts.DialGuardOverride
+	}
 	dialer := &net.Dialer{
 		Timeout: cimdFetchTimeout,
 		// Control runs after DNS resolution with the concrete address, so
@@ -238,7 +254,7 @@ func newCIMDResolver(logger *zap.Logger, extra config.RedirectAllowlist, allow c
 			if err != nil {
 				return fmt.Errorf("%w: unparsable dial address", errCIMDBlockedAddress)
 			}
-			return cimdDialGuard(ap.Addr())
+			return r.guard(ap.Addr())
 		},
 	}
 	tr := http.DefaultTransport.(*http.Transport).Clone()
@@ -246,28 +262,27 @@ func newCIMDResolver(logger *zap.Logger, extra config.RedirectAllowlist, allow c
 	tr.Proxy = nil
 	tr.DialContext = dialer.DialContext
 	tr.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	if opts.TLSClientConfigOverride != nil {
+		tr.TLSClientConfig = opts.TLSClientConfigOverride
+	}
 	// Transport default is 10 MiB; a hostile host must not make the fetcher buffer that before the body cap applies.
 	tr.MaxResponseHeaderBytes = 16 << 10
-	return &cimdResolver{
-		client: &http.Client{
-			Transport: tr,
-			Timeout:   cimdFetchTimeout,
-			// A redirect would let the guarded host hand the fetch to any other.
-			CheckRedirect: func(*http.Request, []*http.Request) error { return errCIMDRedirect },
-		},
-		logger:        logger,
-		redirectExtra: extra,
-		redirectAllow: allow,
-		sem:           make(chan struct{}, cimdMaxInFlight),
+	r.client = &http.Client{
+		Transport: tr,
+		Timeout:   cimdFetchTimeout,
+		// A redirect would let the guarded host hand the fetch to any other.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return errCIMDRedirect },
 	}
+	return r
 }
 
 // Resolve validates the client_id URL, fetches and validates the
 // document, and returns the in-memory client: ID is the client_id URL
 // verbatim, ExpiresAt zero (the document is the registration; it is
-// re-read on every use). On failure the error is a *cimdError.
-// metrics.CIMDFetch is incremented exactly once per call.
-func (r *cimdResolver) Resolve(ctx context.Context, clientID, audience string) (*sealedClient, error) {
+// re-read on every use). The failure is typed so the caller maps its
+// Result without an assertion; metrics.CIMDFetch is incremented exactly
+// once per call.
+func (r *CIMDResolver) Resolve(ctx context.Context, clientID, audience string) (*sealedClient, *cimdError) {
 	var host string
 	doc, ce := r.resolve(ctx, clientID, &host)
 	if ce != nil {
@@ -292,7 +307,7 @@ func (r *cimdResolver) Resolve(ctx context.Context, clientID, audience string) (
 
 // resolve sets *host as soon as the URL parses so the failure log can
 // name it on every later step.
-func (r *cimdResolver) resolve(ctx context.Context, clientID string, host *string) (*cimdDocument, *cimdError) {
+func (r *CIMDResolver) resolve(ctx context.Context, clientID string, host *string) (*cimdDocument, *cimdError) {
 	u, ce := validateCIMDClientID(clientID)
 	if ce != nil {
 		return nil, ce
@@ -305,7 +320,7 @@ func (r *cimdResolver) resolve(ctx context.Context, clientID string, host *strin
 	return parseCIMDDocument(body, clientID, r.redirectExtra, r.redirectAllow)
 }
 
-func (r *cimdResolver) fetch(ctx context.Context, u *url.URL) ([]byte, *cimdError) {
+func (r *CIMDResolver) fetch(ctx context.Context, u *url.URL) ([]byte, *cimdError) {
 	fetchErr := func(desc string, err error) ([]byte, *cimdError) {
 		return nil, &cimdError{Result: cimdFetchError, Desc: desc, Err: err}
 	}
@@ -316,13 +331,13 @@ func (r *cimdResolver) fetch(ctx context.Context, u *url.URL) ([]byte, *cimdErro
 	default:
 		return fetchErr("client metadata fetch capacity exhausted", errCIMDCapacity)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil) //nolint:gosec // G704: fetching the caller-named URL is the feature; validateCIMDClientID bounds it and the dial guard judges the resolved address
 	if err != nil {
 		return fetchErr("client metadata document could not be fetched", err)
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "mcp-auth-proxy")
-	resp, err := r.client.Do(req)
+	resp, err := r.client.Do(req) //nolint:gosec // G704: same guarded fetch as the request above
 	if err != nil {
 		// url.Error's message carries the full URL; keep only the cause.
 		var ue *url.Error
@@ -347,7 +362,7 @@ func (r *cimdResolver) fetch(ctx context.Context, u *url.URL) ([]byte, *cimdErro
 		return fetchErr("client metadata document could not be fetched", err)
 	}
 	if len(body) > cimdMaxBodyBytes {
-		return nil, &cimdError{Result: cimdTooLarge, Desc: cimdTooLargeDesc}
+		return nil, &cimdError{Result: cimdTooLarge, Desc: "client metadata document exceeds the size cap"}
 	}
 	return body, nil
 }

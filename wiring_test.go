@@ -72,7 +72,10 @@ func TestForwardingWiring(t *testing.T) {
 	verified := false
 	verify := func(context.Context, string) (*oidc.IDToken, error) { verified = true; return nil, nil }
 
-	tc := newTokenConfig(cfg, refresher, limiter, verify)
+	tc := newTokenConfig(cfg, refresher, limiter, verify, nil)
+	if tc.CIMDEnabled {
+		t.Error("token config enables CIMD without a resolver")
+	}
 	if _, _ = tc.VerifyIDToken(t.Context(), ""); !verified {
 		t.Error("token config does not carry the verifier it was given")
 	}
@@ -198,7 +201,14 @@ func TestRedirectPolicyWiring(t *testing.T) {
 		!slices.Equal(rc.RedirectURIsExtra.Entries(), extra.Entries()) {
 		t.Errorf("register config = %+v", rc)
 	}
-	ac := newAuthorizeConfig(cfg)
+	cimd := newCIMDResolver(&config.Config{CIMDEnabled: true}, zap.NewNop())
+	if cimd == nil || newCIMDResolver(&config.Config{}, zap.NewNop()) != nil {
+		t.Fatal("newCIMDResolver must follow CIMDEnabled")
+	}
+	ac := newAuthorizeConfig(cfg, cimd)
+	if ac.CIMD != cimd {
+		t.Error("authorize config does not carry the resolver it was given")
+	}
 	if !ac.PKCERequired || !ac.CompatAllowStateless || !ac.RenderConsentPage || ac.ResourceName != "Example MCP" ||
 		ac.CanonicalResource != "https://proxy.example.com/mcp" ||
 		!slices.Equal(ac.ResourceURIs, []string{"https://proxy.example.com/mcp"}) ||
@@ -206,7 +216,7 @@ func TestRedirectPolicyWiring(t *testing.T) {
 		!slices.Equal(ac.RedirectURIsExtra.Entries(), extra.Entries()) {
 		t.Errorf("authorize config = %+v", ac)
 	}
-	if tc := newTokenConfig(cfg, nil, nil, nil); !slices.Equal(tc.RedirectURIsAllowlist.Entries(), allow.Entries()) ||
+	if tc := newTokenConfig(cfg, nil, nil, nil, cimd); !tc.CIMDEnabled || !slices.Equal(tc.RedirectURIsAllowlist.Entries(), allow.Entries()) ||
 		!slices.Equal(tc.RedirectURIsExtra.Entries(), extra.Entries()) {
 		t.Errorf("token config lists = %v / %v, want %v / %v", tc.RedirectURIsAllowlist.Entries(), tc.RedirectURIsExtra.Entries(), allow.Entries(), extra.Entries())
 	}

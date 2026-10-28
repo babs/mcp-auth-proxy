@@ -718,6 +718,8 @@ type OAuthError struct {
 | `code_seal_failed` / `interstitial_render_failed` | Internal failure minting a code or rendering the interstitial | `server_error` |
 | `client_id_missing` | `client_id` absent (`/authorize` only — `/token` folds it into an unmetered generic `invalid_request`) | `invalid_request` |
 | `client_id_unknown` | `client_id` did not decrypt, **or** decrypted with the wrong purpose tag. One code for both on purpose: distinct codes would tell an unauthenticated caller which of the two happened, i.e. whether a blob they hold is a genuine token of this proxy. The metric labels stay distinct (`client_id_invalid`, `client_typ_mismatch`) | `invalid_client` / `invalid_grant` |
+| `client_metadata_unavailable` | Client ID Metadata Document (`https` URL `client_id`) could not be fetched: host unreachable or non-public, non-200, wrong content type, or over the size cap (metric reasons `cimd_fetch_error`, `cimd_ssrf_blocked`, `cimd_too_large`) | `invalid_client` |
+| `client_metadata_invalid` | `client_id` URL malformed, or the document is not a usable public client (metric reasons `cimd_url_invalid`, `cimd_doc_invalid`, `cimd_auth_method_unsupported`) | `invalid_client` |
 | `client_audience_mismatch` / `client_registration_expired` | Client registered for another `PROXY_BASE_URL`, or past its TTL; each matches the metric label of the same name | `invalid_client` |
 | `replay_store_unavailable` | Redis unreachable; handler fails closed | `server_error` |
 | `id_token_verification_failed` | go-oidc rejected the IdP id_token; at `/token` in forwarding mode, the id_token returned on refresh fails verification, has unparsable claims, or names a different `sub` (`invalid_grant`) | `server_error` (or `invalid_grant`) |

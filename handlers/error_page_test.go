@@ -1036,6 +1036,10 @@ func TestErrorPageHint(t *testing.T) {
 		// Client misconfiguration the user can't clear by restarting.
 		{http.StatusBadRequest, codeClientIDMissing, hintContact},
 		{http.StatusBadRequest, codeRedirectURIMissing, hintContact},
+		// Client ID Metadata Documents: a host that did not answer may
+		// next time; a wrong document only its publisher can fix.
+		{http.StatusBadRequest, codeClientMetadataUnavailable, hintTransientRestart},
+		{http.StatusBadRequest, codeClientMetadataInvalid, hintClientPublisher},
 	}
 
 	for _, tc := range cases {

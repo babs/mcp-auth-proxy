@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"errors"
@@ -9,7 +10,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -89,7 +89,7 @@ func TestValidateCIMDClientID_HostLength(t *testing.T) {
 }
 
 func TestNewCIMDResolver_Transport(t *testing.T) {
-	tr := newCIMDResolver(zap.NewNop(), config.RedirectAllowlist{}, config.WebRedirectAllowlist{}).client.Transport.(*http.Transport)
+	tr := NewCIMDResolver(zap.NewNop(), config.RedirectAllowlist{}, config.WebRedirectAllowlist{}, CIMDResolverOptions{}).client.Transport.(*http.Transport)
 	if tr.Proxy != nil {
 		t.Error("Proxy set: the dial guard would see the proxy, not the destination")
 	}
@@ -153,36 +153,32 @@ func cimdURL(t *testing.T, srv *httptest.Server, path string) string {
 	return "https://localhost:" + port + path
 }
 
-// newTestCIMDResolver trusts the httptest certificate; the dialer and its
-// guard stay as built. The certificate names example.com, not localhost,
-// so verification runs against that name while the dial still goes to
-// the resolved loopback address.
-func newTestCIMDResolver(t *testing.T, srv *httptest.Server, allow string) *cimdResolver {
-	t.Helper()
-	r := newCIMDResolver(zap.NewNop(), config.RedirectAllowlist{}, mustWebAllowlist(t, allow))
+// trustTestServer trusts the httptest certificate. It names example.com,
+// not localhost, so verification runs against that name while the dial
+// still goes to the resolved loopback address.
+func trustTestServer(srv *httptest.Server) *tls.Config {
 	pool := x509.NewCertPool()
 	pool.AddCert(srv.Certificate())
-	tc := r.client.Transport.(*http.Transport).TLSClientConfig
-	tc.RootCAs = pool
-	tc.ServerName = "example.com"
-	return r
+	return &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool, ServerName: "example.com"}
 }
 
-func allowLoopbackDial(t *testing.T) {
+func allowLoopbackDial(netip.Addr) error { return nil }
+
+// newTestCIMDResolver admits the loopback dial; the production guard is
+// exercised by TestCIMDResolve_DefaultGuardBlocksLoopback.
+func newTestCIMDResolver(t *testing.T, srv *httptest.Server, allow string) *CIMDResolver {
 	t.Helper()
-	prev := cimdDialGuard
-	cimdDialGuard = func(netip.Addr) error { return nil }
-	t.Cleanup(func() { cimdDialGuard = prev })
+	return NewCIMDResolver(zap.NewNop(), config.RedirectAllowlist{}, mustWebAllowlist(t, allow),
+		CIMDResolverOptions{DialGuardOverride: allowLoopbackDial, TLSClientConfigOverride: trustTestServer(srv)})
 }
 
-func assertCIMDResult(t *testing.T, err error, want cimdResult, before, beforeTotal float64) *cimdError {
+func assertCIMDResult(t *testing.T, ce *cimdError, want cimdResult, before, beforeTotal float64) *cimdError {
 	t.Helper()
-	var ce *cimdError
-	if !errors.As(err, &ce) {
-		t.Fatalf("want *cimdError, got %#v", err)
+	if ce == nil {
+		t.Fatalf("want *cimdError{%s}, got nil", want)
 	}
 	if ce.Result != want {
-		t.Fatalf("result = %q, want %q (%v)", ce.Result, want, err)
+		t.Fatalf("result = %q, want %q (%v)", ce.Result, want, ce)
 	}
 	if got := testutil.ToFloat64(metrics.CIMDFetch.WithLabelValues(string(want))) - before; got != 1 {
 		t.Errorf("cimd_fetch{%s} delta = %v, want 1", want, got)
@@ -190,11 +186,11 @@ func assertCIMDResult(t *testing.T, err error, want cimdResult, before, beforeTo
 	if got := cimdFetchTotal() - beforeTotal; got != 1 {
 		t.Errorf("cimd_fetch total delta = %v, want 1", got)
 	}
-	if strings.Contains(err.Error(), "client.json") {
-		t.Errorf("error echoes the client_id URL: %v", err)
+	if strings.Contains(ce.Error(), "client.json") {
+		t.Errorf("error echoes the client_id URL: %v", ce)
 	}
-	if strings.Contains(err.Error(), cimdBodyMarker) {
-		t.Errorf("error echoes document content: %v", err)
+	if strings.Contains(ce.Error(), cimdBodyMarker) {
+		t.Errorf("error echoes document content: %v", ce)
 	}
 	return ce
 }
@@ -204,16 +200,16 @@ func TestCIMDResolve_DefaultGuardBlocksLoopback(t *testing.T) {
 	var hits atomic.Int32
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { hits.Add(1) }))
 	defer srv.Close()
-	r := newTestCIMDResolver(t, srv, "")
+	r := NewCIMDResolver(zap.NewNop(), config.RedirectAllowlist{}, config.WebRedirectAllowlist{}, CIMDResolverOptions{TLSClientConfigOverride: trustTestServer(srv)})
 	before, beforeTotal := testutil.ToFloat64(metrics.CIMDFetch.WithLabelValues(string(cimdSSRFBlocked))), cimdFetchTotal()
 
-	client, err := r.Resolve(context.Background(), cimdURL(t, srv, "/client.json"), "https://proxy.example")
+	client, ce := r.Resolve(context.Background(), cimdURL(t, srv, "/client.json"), "https://proxy.example")
 	if client != nil {
 		t.Fatalf("want nil client, got %+v", client)
 	}
-	assertCIMDResult(t, err, cimdSSRFBlocked, before, beforeTotal)
-	if !errors.Is(err, errCIMDBlockedAddress) {
-		t.Errorf("want errCIMDBlockedAddress through the chain, got %v", err)
+	assertCIMDResult(t, ce, cimdSSRFBlocked, before, beforeTotal)
+	if !errors.Is(ce, errCIMDBlockedAddress) {
+		t.Errorf("want errCIMDBlockedAddress through the chain, got %v", ce)
 	}
 	if n := hits.Load(); n != 0 {
 		t.Fatalf("server received %d requests, want 0: the guard must run before the connection", n)
@@ -222,7 +218,6 @@ func TestCIMDResolve_DefaultGuardBlocksLoopback(t *testing.T) {
 
 // MAP-002-AC3
 func TestCIMDResolve(t *testing.T) {
-	allowLoopbackDial(t)
 	const audience = "https://proxy.example"
 	validDoc := func(id string) string {
 		return `{"client_id":` + jsonStr(id) + `,"client_name":"Example","redirect_uris":["https://app.example/cb","http://127.0.0.1:8080/cb"],"token_endpoint_auth_method":"none","grant_types":["authorization_code","refresh_token"],"unknown_member":1}`
@@ -292,7 +287,7 @@ func TestCIMDResolve(t *testing.T) {
 		{name: "client_name comma", body: func(id string) string {
 			return `{"client_id":` + jsonStr(id) + `,"redirect_uris":["https://app.example/cb"],"client_name":"a,b"}`
 		}, want: cimdDocInvalid},
-		{name: "body one byte over the cap", wantDescHas: strconv.Itoa(cimdMaxBodyBytes/1024) + " KiB", body: func(id string) string {
+		{name: "body one byte over the cap", wantDescHas: "exceeds the size cap", body: func(id string) string {
 			head := `{"client_id":` + jsonStr(id) + `,"redirect_uris":["https://app.example/cb"],"client_name":"`
 			tail := `"}`
 			return head + strings.Repeat("a", cimdMaxBodyBytes+1-len(head)-len(tail)) + tail
@@ -301,7 +296,7 @@ func TestCIMDResolve(t *testing.T) {
 			head := `{"client_id":` + jsonStr(id) + `,"redirect_uris":["https://app.example/cb"],"client_name":"`
 			tail := `"}`
 			return head + strings.Repeat("a", cimdMaxBodyBytes-len(head)-len(tail)) + tail
-		}, want: cimdDocInvalid}, // 5 KiB name fails the length rule, not the size cap
+		}, want: cimdDocInvalid}, // a name filling the cap fails the length rule, not the size cap
 		{name: "20 KiB response header", body: validDoc, headerPad: 20 << 10, want: cimdFetchError},
 		{name: "text/html", body: validDoc, contentType: "text/html; charset=utf-8", want: cimdFetchError},
 		{name: "application/problem+json accepted", body: validDoc, contentType: "application/problem+json", want: cimdOK},
@@ -348,7 +343,7 @@ func TestCIMDResolve(t *testing.T) {
 			r := newTestCIMDResolver(t, srv, tc.allow)
 			before, beforeTotal := testutil.ToFloat64(metrics.CIMDFetch.WithLabelValues(string(tc.want))), cimdFetchTotal()
 
-			client, err := r.Resolve(context.Background(), clientID, audience)
+			client, ce := r.Resolve(context.Background(), clientID, audience)
 
 			wantHits := tc.wantHits
 			if wantHits == 0 {
@@ -361,14 +356,14 @@ func TestCIMDResolve(t *testing.T) {
 				if client != nil {
 					t.Errorf("want nil client, got %+v", client)
 				}
-				ce := assertCIMDResult(t, err, tc.want, before, beforeTotal)
+				assertCIMDResult(t, ce, tc.want, before, beforeTotal)
 				if tc.wantDescHas != "" && !strings.Contains(ce.Desc, tc.wantDescHas) {
 					t.Errorf("Desc = %q, want it to name %q", ce.Desc, tc.wantDescHas)
 				}
 				return
 			}
-			if err != nil {
-				t.Fatalf("Resolve: %v", err)
+			if ce != nil {
+				t.Fatalf("Resolve: %v", ce)
 			}
 			if got := testutil.ToFloat64(metrics.CIMDFetch.WithLabelValues("ok")) - before; got != 1 {
 				t.Errorf("cimd_fetch{ok} delta = %v, want 1", got)
@@ -395,7 +390,6 @@ func TestCIMDResolve(t *testing.T) {
 
 // Full semaphore: refused without a request; drained: served.
 func TestCIMDResolve_CapacityExhausted(t *testing.T) {
-	allowLoopbackDial(t)
 	var hits atomic.Int32
 	var clientID string
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -410,10 +404,10 @@ func TestCIMDResolve_CapacityExhausted(t *testing.T) {
 		r.sem <- struct{}{}
 	}
 	before, beforeTotal := testutil.ToFloat64(metrics.CIMDFetch.WithLabelValues(string(cimdFetchError))), cimdFetchTotal()
-	_, err := r.Resolve(context.Background(), clientID, "https://proxy.example")
-	assertCIMDResult(t, err, cimdFetchError, before, beforeTotal)
-	if !errors.Is(err, errCIMDCapacity) {
-		t.Errorf("want errCIMDCapacity as the cause, got %v", err)
+	_, ce := r.Resolve(context.Background(), clientID, "https://proxy.example")
+	assertCIMDResult(t, ce, cimdFetchError, before, beforeTotal)
+	if !errors.Is(ce, errCIMDCapacity) {
+		t.Errorf("want errCIMDCapacity as the cause, got %v", ce)
 	}
 	if n := hits.Load(); n != 0 {
 		t.Fatalf("server hits = %d, want 0", n)
@@ -421,8 +415,8 @@ func TestCIMDResolve_CapacityExhausted(t *testing.T) {
 	for range cap(r.sem) {
 		<-r.sem
 	}
-	if _, err := r.Resolve(context.Background(), clientID, "https://proxy.example"); err != nil {
-		t.Fatalf("after drain: %v", err)
+	if _, ce := r.Resolve(context.Background(), clientID, "https://proxy.example"); ce != nil {
+		t.Fatalf("after drain: %v", ce)
 	}
 	if n := hits.Load(); n != 1 {
 		t.Fatalf("server hits = %d, want 1", n)
@@ -438,13 +432,13 @@ func TestCIMDResolve_CapacityExhausted(t *testing.T) {
 // and before any lookup or dial: no network is involved.
 func TestCIMDResolve_LogHostSanitized(t *testing.T) {
 	core, logs := observer.New(zap.WarnLevel)
-	r := newCIMDResolver(zap.New(core), config.RedirectAllowlist{}, config.WebRedirectAllowlist{})
+	r := NewCIMDResolver(zap.New(core), config.RedirectAllowlist{}, config.WebRedirectAllowlist{}, CIMDResolverOptions{})
 	for range cap(r.sem) {
 		r.sem <- struct{}{}
 	}
-	_, err := r.Resolve(context.Background(), "https://ex\u00e4mple.invalid/c", "https://proxy.example")
-	if !errors.Is(err, errCIMDCapacity) {
-		t.Fatalf("want the capacity refusal, got %v", err)
+	_, ce := r.Resolve(context.Background(), "https://ex\u00e4mple.invalid/c", "https://proxy.example")
+	if ce == nil || !errors.Is(ce, errCIMDCapacity) {
+		t.Fatalf("want the capacity refusal, got %v", ce)
 	}
 	entries := logs.FilterMessage("cimd_resolve_failed").All()
 	if len(entries) != 1 {
@@ -458,7 +452,6 @@ func TestCIMDResolve_LogHostSanitized(t *testing.T) {
 // The logged cause is clamped: a metadata host answering with a 12 KiB
 // Content-Type must not land 12 KiB in the WARN line.
 func TestCIMDResolve_LogCauseClamped(t *testing.T) {
-	allowLoopbackDial(t)
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/"+strings.Repeat("a", 12<<10))
 	}))
@@ -466,10 +459,9 @@ func TestCIMDResolve_LogCauseClamped(t *testing.T) {
 	core, logs := observer.New(zap.WarnLevel)
 	r := newTestCIMDResolver(t, srv, "")
 	r.logger = zap.New(core)
-	_, err := r.Resolve(context.Background(), cimdURL(t, srv, "/client.json"), "https://proxy.example")
-	var ce *cimdError
-	if !errors.As(err, &ce) || ce.Result != cimdFetchError {
-		t.Fatalf("want fetch_error, got %v", err)
+	_, ce := r.Resolve(context.Background(), cimdURL(t, srv, "/client.json"), "https://proxy.example")
+	if ce == nil || ce.Result != cimdFetchError {
+		t.Fatalf("want fetch_error, got %v", ce)
 	}
 	entries := logs.FilterMessage("cimd_resolve_failed").All()
 	if len(entries) != 1 {

@@ -3,14 +3,19 @@ package main
 import (
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"html"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -194,6 +199,9 @@ type testProxyOptions struct {
 	// redirectURIsAllowlist wires REDIRECT_URIS_ALLOWLIST into /register,
 	// /authorize and /token.
 	redirectURIsAllowlist config.WebRedirectAllowlist
+	// cimd wires a Client ID Metadata Document resolver into /authorize,
+	// /token and the AS metadata; nil = CIMD_ENABLED=false.
+	cimd *handlers.CIMDResolver
 }
 
 func buildTestProxy(t *testing.T, oidcProvider *mockOIDCProvider, mcpServer *mockMCPServer, proxyBaseURL string, renderConsent bool, opts ...testProxyOptions) http.Handler {
@@ -226,6 +234,7 @@ func buildTestProxy(t *testing.T, oidcProvider *mockOIDCProvider, mcpServer *moc
 		RenderConsentPage:     renderConsent,
 		RedirectURIsExtra:     opt.redirectURIsExtra,
 		RedirectURIsAllowlist: opt.redirectURIsAllowlist,
+		CIMDEnabled:           opt.cimd != nil,
 	}
 	oauth2Cfg := newOAuth2Config(cfg, provider.Endpoint())
 
@@ -256,16 +265,16 @@ func buildTestProxy(t *testing.T, oidcProvider *mockOIDCProvider, mcpServer *moc
 	// page's CSP has to override the securityHeaders baseline, and only
 	// this chain puts that baseline there.
 	baseMiddleware(r, zap.NewNop(), &config.Config{})
-	registerDiscoveryRoutes(r, proxyBaseURL, "/mcp", "", nil)
+	registerDiscoveryRoutes(r, proxyBaseURL, "/mcp", "", nil, cfg.CIMDEnabled)
 	// The production wiring, not hand-mounted routes: the e2e suite must
 	// exercise the same router shape main builds (BrowserFacing markers
 	// included), or the two silently diverge.
 	registerOAuthRoutes(r, oauthRoutes{
 		Register:      handlers.Register(tm, zap.NewNop(), proxyBaseURL, newRegisterConfig(cfg)),
-		Authorize:     handlers.Authorize(tm, zap.NewNop(), proxyBaseURL, oauth2Cfg, newAuthorizeConfig(cfg)),
+		Authorize:     handlers.Authorize(tm, zap.NewNop(), proxyBaseURL, oauth2Cfg, newAuthorizeConfig(cfg, opt.cimd)),
 		Consent:       handlers.Consent(tm, zap.NewNop(), proxyBaseURL, oauth2Cfg, handlers.ConsentConfig{}),
 		Callback:      handlers.Callback(tm, zap.NewNop(), proxyBaseURL, oauth2Cfg, verifier, newCallbackConfig(cfg, replayStore, nil)),
-		Token:         handlers.Token(tm, zap.NewNop(), proxyBaseURL, time.Time{}, replayStore, newTokenConfig(cfg, idpRefresher, nil, verifier.Verify)),
+		Token:         handlers.Token(tm, zap.NewNop(), proxyBaseURL, time.Time{}, replayStore, newTokenConfig(cfg, idpRefresher, nil, verifier.Verify, opt.cimd)),
 		RegisterLimit: passthrough, AuthorizeLimit: passthrough, ConsentLimit: passthrough,
 		CallbackLimit: passthrough, TokenLimit: passthrough,
 	})
@@ -1121,4 +1130,135 @@ func extractE2EMetaRefresh(t *testing.T, body string) string {
 		t.Fatal("meta refresh close-quote not found")
 	}
 	return html.UnescapeString(raw)
+}
+
+// MAP-002-AC2: a Client ID Metadata Document client runs the whole flow
+// through the production router with the consent page on. The document
+// is fetched once, at /authorize; /token and the refresh never fetch.
+func TestE2E_CIMDClient(t *testing.T) {
+	const redirectURI = "https://agents.example.com/oauth/callback"
+	var hits atomic.Int32
+	var clientID string
+	doc := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"client_id": clientID, "client_name": "CIMD e2e app", "redirect_uris": []string{redirectURI},
+			"token_endpoint_auth_method": "none", "grant_types": []string{"authorization_code", "refresh_token"},
+		})
+	}))
+	defer doc.Close()
+	// A hostname, not the IP literal the server reports: an IP client_id
+	// is refused before any dial. The certificate names example.com.
+	_, port, err := net.SplitHostPort(strings.TrimPrefix(doc.URL, "https://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientID = "https://localhost:" + port + "/client.json"
+	pool := x509.NewCertPool()
+	pool.AddCert(doc.Certificate())
+	cimd := handlers.NewCIMDResolver(zap.NewNop(), config.RedirectAllowlist{}, config.WebRedirectAllowlist{}, handlers.CIMDResolverOptions{
+		DialGuardOverride:       func(netip.Addr) error { return nil },
+		TLSClientConfigOverride: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool, ServerName: "example.com"},
+	})
+
+	oidcMock := newMockOIDCProvider(t)
+	defer oidcMock.Close()
+	mcpMock := newMockMCPServer(t)
+	defer mcpMock.Close()
+	proxyServer := httptest.NewServer(buildTestProxy(t, oidcMock, mcpMock, "http://proxy.test", true, testProxyOptions{cimd: cimd}))
+	defer proxyServer.Close()
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+	// do returns status, Location and body; the response body is closed here.
+	do := func(t *testing.T, method, target string, form url.Values) (int, string, string) {
+		t.Helper()
+		var body io.Reader
+		if form != nil {
+			body = strings.NewReader(form.Encode())
+		}
+		req, err := http.NewRequestWithContext(t.Context(), method, target, body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if form != nil {
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", method, target, err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, resp.Header.Get("Location"), string(b)
+	}
+	tokens := func(t *testing.T, form url.Values) map[string]any {
+		t.Helper()
+		status, _, body := do(t, http.MethodPost, proxyServer.URL+"/token", form)
+		tok := map[string]any{}
+		_ = json.Unmarshal([]byte(body), &tok)
+		if status != http.StatusOK || tok["access_token"] == nil || tok["refresh_token"] == nil {
+			t.Fatalf("/token = %d %s, want 200 with access_token and refresh_token", status, body)
+		}
+		return tok
+	}
+
+	status, _, body := do(t, http.MethodGet, proxyServer.URL+"/.well-known/oauth-authorization-server", nil)
+	meta := map[string]any{}
+	_ = json.Unmarshal([]byte(body), &meta)
+	if status != http.StatusOK || meta["client_id_metadata_document_supported"] != true {
+		t.Fatalf("AS metadata = %d %s, want client_id_metadata_document_supported true", status, body)
+	}
+
+	params := url.Values{
+		"response_type": {"code"}, "client_id": {clientID}, "redirect_uri": {redirectURI}, "state": {"cimd-state"},
+		"code_challenge": {handlers.ComputePKCEChallenge(e2eCodeVerifier)}, "code_challenge_method": {"S256"},
+		"resource": {"http://proxy.test/mcp"},
+	}
+	status, _, page := do(t, http.MethodGet, proxyServer.URL+"/authorize?"+params.Encode(), nil)
+	if status != http.StatusOK || !strings.Contains(page, "<strong>CIMD e2e app</strong>") {
+		t.Fatalf("GET /authorize = %d, want the consent page naming the document's client_name:\n%s", status, page)
+	}
+
+	status, _, interstitial := do(t, http.MethodPost, proxyServer.URL+"/consent", url.Values{"consent_token": {extractE2EConsentToken(t, page)}, "action": {"approve"}})
+	if status != http.StatusOK {
+		t.Fatalf("POST /consent = %d: %s", status, interstitial)
+	}
+	idpURL, err := url.Parse(extractE2EMetaRefresh(t, interstitial))
+	if err != nil || !strings.HasPrefix(idpURL.String(), oidcMock.Server.URL) {
+		t.Fatalf("interstitial target = %q (%v), want the IdP", idpURL, err)
+	}
+	oidcMock.Nonce = idpURL.Query().Get("nonce")
+
+	status, location, body := do(t, http.MethodGet, proxyServer.URL+"/callback?code=fake&state="+url.QueryEscape(idpURL.Query().Get("state")), nil)
+	loc, err := url.Parse(location)
+	if err != nil || status != http.StatusFound || !strings.HasPrefix(loc.String(), redirectURI+"?") || loc.Query().Get("state") != "cimd-state" {
+		t.Fatalf("/callback = %d Location=%q: %s", status, location, body)
+	}
+
+	tok := tokens(t, url.Values{
+		"grant_type": {"authorization_code"}, "code": {loc.Query().Get("code")}, "redirect_uri": {redirectURI},
+		"client_id": {clientID}, "code_verifier": {e2eCodeVerifier},
+	})
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, proxyServer.URL+"/mcp/tool", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+tok["access_token"].(string))
+	mcpResp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("GET /mcp/tool: %v", err)
+	}
+	mcpResp.Body.Close()
+	if mcpResp.StatusCode != http.StatusOK || mcpMock.LastRequestSub != "test-subject-123" {
+		t.Fatalf("proxied MCP call = %d, upstream saw sub %q", mcpResp.StatusCode, mcpMock.LastRequestSub)
+	}
+
+	refreshed := tokens(t, url.Values{"grant_type": {"refresh_token"}, "refresh_token": {tok["refresh_token"].(string)}, "client_id": {clientID}})
+	if refreshed["refresh_token"] == tok["refresh_token"] {
+		t.Error("refresh did not rotate the refresh token")
+	}
+	if n := hits.Load(); n != 1 {
+		t.Errorf("document server hits = %d over the whole flow, want exactly 1 (at /authorize)", n)
+	}
 }

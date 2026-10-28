@@ -68,6 +68,10 @@ const (
 	codeRedirectURIMissing        = "redirect_uri_missing"
 	codeRedirectURIMismatch       = "redirect_uri_mismatch"
 	codeRedirectURIMalformed      = "redirect_uri_malformed"
+	// Client ID Metadata Document resolution (an https URL client_id):
+	// the document could not be fetched, or it is not a usable client.
+	codeClientMetadataUnavailable = "client_metadata_unavailable"
+	codeClientMetadataInvalid     = "client_metadata_invalid"
 
 	// /callback session and IdP leg.
 	codeSessionUnknown          = "session_unknown"
@@ -305,8 +309,13 @@ type sealedRefresh struct {
 	// session used. An index, not the URI, so a long redirect URI cannot
 	// make the refresh token outgrow its code (both share one open()
 	// size cap). 0 on refresh tokens sealed before this field existed.
-	RedirectURIIndex int       `json:"rui,omitempty"`
-	IssuedAt         time.Time `json:"iat"`
+	RedirectURIIndex int `json:"rui,omitempty"`
+	// RedirectURI is the URI itself for a Client ID Metadata Document
+	// client, which has no registered list to index at /token (the
+	// document is fetched only at /authorize); inherited across rotations
+	// like RedirectURIIndex. Empty for sealed (DCR) clients.
+	RedirectURI string    `json:"ru,omitempty"`
+	IssuedAt    time.Time `json:"iat"`
 	// FamilyIssuedAt is the IssuedAt of the FIRST refresh in this
 	// rotation lineage (the one minted at code redemption) and is
 	// inherited verbatim by every rotated descendant. REVOKE_BEFORE
@@ -448,7 +457,19 @@ func clientExpired(c *sealedClient) bool {
 // Factoring this out removes the near-identical 20-line block from
 // each grant handler; error shapes are preserved verbatim so the
 // existing test matrix against both paths keeps exercising them.
-func openAndValidateClient(w http.ResponseWriter, r *http.Request, tm *token.Manager, logger *zap.Logger, clientIDStr, audience string) *sealedClient {
+//
+// A Client ID Metadata Document client_id (cimdEnabled) is returned
+// without a fetch: the sealed code or refresh already pins the URL and
+// the redirect URI, so the grant handlers' string comparisons bind it.
+func openAndValidateClient(w http.ResponseWriter, r *http.Request, tm *token.Manager, logger *zap.Logger, clientIDStr, audience string, cimdEnabled bool) *sealedClient {
+	if isCIMDClientID(clientIDStr) {
+		if !cimdEnabled {
+			recordClientDenial(logger, "client_id_invalid", zap.String("kind", "cimd_disabled"))
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "invalid client_id", codeClientIDUnknown)
+			return nil
+		}
+		return &sealedClient{ID: clientIDStr, Typ: token.PurposeClient, Audience: audience}
+	}
 	var client sealedClient
 	if err := tm.OpenJSON(clientIDStr, &client, token.PurposeClient); err != nil {
 		recordClientDenial(logger, "client_id_invalid", zap.Error(err))

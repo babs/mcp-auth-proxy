@@ -49,6 +49,7 @@ type Config struct {
 	AllowedGroups               []string      // empty = allow all authenticated users
 	RevokeBefore                time.Time     // tokens issued before this time are rejected (zero = disabled)
 	PKCERequired                bool          // require PKCE on /authorize (default true, set false for Cursor/MCP Inspector)
+	CIMDEnabled                 bool          // accept https URL client_ids (Client ID Metadata Documents; default true, false = unknown client, no fetch)
 	ShutdownTimeout             time.Duration // graceful shutdown deadline; raise to drain long-lived SSE streams
 	RedisURL                    string        // optional; when set, enables single-use authorization codes (replay protection)
 	RedisKeyPrefix              string        // prefix applied to every Redis key (for shared-Redis deployments); default "mcp-auth-proxy:"
@@ -334,6 +335,7 @@ func Load() (*Config, error) {
 	}
 
 	c.PKCERequired = strings.ToLower(os.Getenv("PKCE_REQUIRED")) != "false"
+	c.CIMDEnabled = strings.ToLower(os.Getenv("CIMD_ENABLED")) != "false"
 
 	c.ShutdownTimeout = 120 * time.Second
 	if st := os.Getenv("SHUTDOWN_TIMEOUT"); st != "" {

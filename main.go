@@ -80,6 +80,7 @@ func main() {
 	logger.Info("startup_config",
 		zap.Bool("prod_mode", cfg.ProdMode),
 		zap.Bool("pkce_required", cfg.PKCERequired),
+		zap.Bool("cimd_enabled", cfg.CIMDEnabled),
 		zap.Bool("redis_required", cfg.RedisRequired),
 		zap.Bool("rate_limit_enabled", cfg.RateLimitEnabled),
 		zap.Bool("trust_proxy_headers", cfg.TrustProxyHeaders),
@@ -317,7 +318,8 @@ func main() {
 		logger.Info("per_subject_concurrency_enabled", zap.Int64("cap", cfg.PerSubjectConcurrency))
 	}
 
-	registerDiscoveryRoutes(r, cfg.ProxyBaseURL, cfg.UpstreamMCPMountPath, cfg.ResourceName, discoveryLimit)
+	registerDiscoveryRoutes(r, cfg.ProxyBaseURL, cfg.UpstreamMCPMountPath, cfg.ResourceName, discoveryLimit, cfg.CIMDEnabled)
+	cimd := newCIMDResolver(cfg, logger)
 
 	var idpExchangeLimiter *rate.Limiter
 	if cfg.IdPExchangeRatePerSec > 0 {
@@ -330,14 +332,14 @@ func main() {
 
 	registerOAuthRoutes(r, oauthRoutes{
 		Register:  handlers.Register(tm, logger, cfg.ProxyBaseURL, newRegisterConfig(cfg)),
-		Authorize: handlers.Authorize(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, newAuthorizeConfig(cfg)),
+		Authorize: handlers.Authorize(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, newAuthorizeConfig(cfg, cimd)),
 		Consent: handlers.Consent(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, handlers.ConsentConfig{
 			ReplayStore:  replayStore,
 			ResourceName: cfg.ResourceName,
 		}),
 		Callback: handlers.Callback(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, idTokenVerifier, newCallbackConfig(cfg, replayStore, idpExchangeLimiter)),
 		Token: handlers.Token(tm, logger, cfg.ProxyBaseURL, cfg.RevokeBefore, replayStore,
-			newTokenConfig(cfg, idpRefresher, idpExchangeLimiter, idTokenVerifier.Verify), cfg.ProxyBaseURL+cfg.UpstreamMCPMountPath),
+			newTokenConfig(cfg, idpRefresher, idpExchangeLimiter, idTokenVerifier.Verify, cimd), cfg.ProxyBaseURL+cfg.UpstreamMCPMountPath),
 		RegisterLimit:  registerLimit,
 		AuthorizeLimit: authorizeLimit,
 		ConsentLimit:   consentLimit,
@@ -1038,10 +1040,20 @@ func newRegisterConfig(cfg *config.Config) handlers.RegisterConfig {
 	}
 }
 
+// newCIMDResolver builds the Client ID Metadata Document resolver, nil
+// when CIMD_ENABLED=false; the same pointer feeds /authorize and /token.
+func newCIMDResolver(cfg *config.Config, logger *zap.Logger) *handlers.CIMDResolver {
+	if !cfg.CIMDEnabled {
+		return nil
+	}
+	return handlers.NewCIMDResolver(logger, cfg.RedirectURIsExtra, cfg.RedirectURIsAllowlist, handlers.CIMDResolverOptions{})
+}
+
 // newAuthorizeConfig builds the /authorize settings; same fail-open
 // caveat as newRegisterConfig.
-func newAuthorizeConfig(cfg *config.Config) handlers.AuthorizeConfig {
+func newAuthorizeConfig(cfg *config.Config, cimd *handlers.CIMDResolver) handlers.AuthorizeConfig {
 	return handlers.AuthorizeConfig{
+		CIMD:                  cimd,
 		PKCERequired:          cfg.PKCERequired,
 		ResourceURIs:          []string{cfg.ProxyBaseURL + cfg.UpstreamMCPMountPath},
 		CanonicalResource:     cfg.ProxyBaseURL + cfg.UpstreamMCPMountPath,
@@ -1063,8 +1075,9 @@ func newCallbackConfig(cfg *config.Config, replayStore replay.Store, idpLimiter 
 	}
 }
 
-func newTokenConfig(cfg *config.Config, idpRefresher *handlers.IdPRefresher, idpLimiter *rate.Limiter, verify func(context.Context, string) (*oidc.IDToken, error)) handlers.TokenConfig {
+func newTokenConfig(cfg *config.Config, idpRefresher *handlers.IdPRefresher, idpLimiter *rate.Limiter, verify func(context.Context, string) (*oidc.IDToken, error), cimd *handlers.CIMDResolver) handlers.TokenConfig {
 	return handlers.TokenConfig{
+		CIMDEnabled:           cimd != nil,
 		RefreshRaceGrace:      cfg.RefreshRaceGrace,
 		ForwardIdPToken:       cfg.UpstreamForwardIdPToken,
 		IdPRefresher:          idpRefresher,
@@ -1311,8 +1324,8 @@ func allowedMethods(r chi.Router) map[string]string {
 // limiter is the rate-limit middleware applied to every served well-
 // known path. Pass `passthrough` when rate limiting is disabled, or
 // `nil` (treated as identity) when callers don't need a limiter at
-// all (tests).
-func registerDiscoveryRoutes(r chi.Router, baseURL, mountPath, resourceName string, limiter func(http.Handler) http.Handler) {
+// all (tests). cimdEnabled is advertised in the AS metadata.
+func registerDiscoveryRoutes(r chi.Router, baseURL, mountPath, resourceName string, limiter func(http.Handler) http.Handler, cimdEnabled bool) {
 	if limiter == nil {
 		limiter = func(h http.Handler) http.Handler { return h }
 	}
@@ -1334,7 +1347,7 @@ func registerDiscoveryRoutes(r chi.Router, baseURL, mountPath, resourceName stri
 	// (Claude.ai web) probe alongside the canonical URL; serving the
 	// same document there avoids a confusing 401 from the downstream
 	// auth-gated catch-all.
-	asMeta := handlers.Discovery(baseURL)
+	asMeta := handlers.Discovery(baseURL, cimdEnabled)
 	r.With(limiter).Get("/.well-known/oauth-authorization-server", asMeta)
 	r.With(limiter).Get("/.well-known/oauth-authorization-server"+mountPath, asMeta)
 
