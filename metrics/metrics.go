@@ -105,6 +105,21 @@ var (
 		Help: "Client ID Metadata Document resolutions, by result.",
 	}, []string{"result"})
 
+	// CIMDCache counts cache lookups in front of the fetch: hit (served
+	// from the cache, no CIMDFetch increment), miss, expired. A hit is not
+	// a resolution, so CIMDFetch{ok} undercounts /authorize traffic by the
+	// hit rate on purpose.
+	CIMDCache = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "mcp_auth_cimd_cache_total",
+		Help: "Client ID Metadata Document cache lookups, by result.",
+	}, []string{"result"})
+
+	// CIMDCacheEntries is bounded by the cache capacity (1000 per replica).
+	CIMDCacheEntries = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "mcp_auth_cimd_cache_entries",
+		Help: "Client ID Metadata Documents currently cached.",
+	})
+
 	// PageRenderFailed counts proxy-rendered pages whose template failed
 	// to execute, plus interstitial navigation targets it refused. Labelled
 	// by page, because the three fail differently: the error page falls back

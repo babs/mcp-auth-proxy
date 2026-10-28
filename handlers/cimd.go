@@ -235,6 +235,7 @@ type CIMDResolver struct {
 	hosts         config.CIMDHostAllowlist
 	guard         func(netip.Addr) error
 	sem           chan struct{}
+	cache         *cimdCache
 }
 
 // CIMDResolverOptions are test-only knobs, scoped to one resolver like
@@ -247,6 +248,8 @@ type CIMDResolverOptions struct {
 	// TLSClientConfigOverride replaces the transport's TLS config (an
 	// httptest certificate is self-signed and names example.com).
 	TLSClientConfigOverride *tls.Config
+	// NowOverride replaces time.Now for cache expiry.
+	NowOverride func() time.Time
 }
 
 func NewCIMDResolver(logger *zap.Logger, extra config.RedirectAllowlist, allow config.WebRedirectAllowlist, hosts config.CIMDHostAllowlist, opts CIMDResolverOptions) *CIMDResolver {
@@ -257,6 +260,7 @@ func NewCIMDResolver(logger *zap.Logger, extra config.RedirectAllowlist, allow c
 		hosts:         hosts,
 		guard:         cimdRejectSpecialPurpose,
 		sem:           make(chan struct{}, cimdMaxInFlight),
+		cache:         newCIMDCache(opts.NowOverride),
 	}
 	if opts.DialGuardOverride != nil {
 		r.guard = opts.DialGuardOverride
@@ -295,12 +299,13 @@ func NewCIMDResolver(logger *zap.Logger, extra config.RedirectAllowlist, allow c
 // Resolve validates the client_id URL, fetches and validates the
 // document, and returns the in-memory client: ID is the client_id URL
 // verbatim, ExpiresAt zero (the document is the registration; it is
-// re-read on every use). The failure is typed so the caller maps its
-// Result without an assertion; metrics.CIMDFetch is incremented exactly
-// once per call.
+// re-read when its cache entry expires). The failure is typed so the
+// caller maps its Result without an assertion; metrics.CIMDFetch is
+// incremented exactly once per call that is not served from the cache,
+// which counts in metrics.CIMDCache instead.
 func (r *CIMDResolver) Resolve(ctx context.Context, clientID, audience string) (*sealedClient, *cimdError) {
 	var host string
-	doc, ce := r.resolve(ctx, clientID, &host)
+	client, cached, ce := r.resolve(ctx, clientID, audience, &host)
 	if ce != nil {
 		metrics.CIMDFetch.WithLabelValues(string(ce.Result)).Inc()
 		// The cause can carry up to a header's worth of bytes the metadata host chose; clamp it like a description.
@@ -313,38 +318,60 @@ func (r *CIMDResolver) Resolve(ctx context.Context, clientID, audience string) (
 		r.logger.Warn("cimd_resolve_failed", zap.String("client_id_host", sanitizeErrorDescription(host)), zap.String("reason", string(ce.Result)), zap.String("error", cause))
 		return nil, ce
 	}
-	metrics.CIMDFetch.WithLabelValues(string(cimdOK)).Inc()
-	return &sealedClient{
+	if !cached {
+		metrics.CIMDFetch.WithLabelValues(string(cimdOK)).Inc()
+	}
+	return client, nil
+}
+
+// resolve sets *host as soon as the URL parses so the failure log can
+// name it on every later step. cached reports a cache hit: the client
+// was neither fetched nor re-validated.
+func (r *CIMDResolver) resolve(ctx context.Context, clientID, audience string, host *string) (client *sealedClient, cached bool, ce *cimdError) {
+	u, ce := validateCIMDClientID(clientID)
+	if ce != nil {
+		return nil, false, ce
+	}
+	*host = u.Host
+	// Operator policy (draft -02 §8.9) runs before any network activity,
+	// and before the cache so a narrowed list applies to cached entries too.
+	if !r.hosts.Allows(u.Hostname()) {
+		return nil, false, &cimdError{Result: cimdHostNotAllowed, Desc: "client_id host is not allowed by the operator"}
+	}
+	client, res := r.cache.get(clientID)
+	metrics.CIMDCache.WithLabelValues(string(res)).Inc()
+	if res == cimdCacheHit {
+		return client, true, nil
+	}
+	// The fetch runs outside the cache lock, so concurrent misses for one
+	// URL may fetch it twice; cimdMaxInFlight bounds that, no singleflight.
+	body, ttl, ce := r.fetch(ctx, u)
+	if ce != nil {
+		return nil, false, ce
+	}
+	doc, ce := parseCIMDDocument(body, clientID, r.redirectExtra, r.redirectAllow)
+	if ce != nil {
+		return nil, false, ce
+	}
+	client = &sealedClient{
 		ID:           clientID,
 		RedirectURIs: doc.RedirectURIs,
 		ClientName:   doc.ClientName,
 		Typ:          token.PurposeClient,
 		Audience:     audience,
-	}, nil
+	}
+	// Only a validated document is cached (draft -02 §5.2 MUST NOT cache
+	// errors or invalid documents); 0 is the publisher's no-store.
+	if ttl > 0 {
+		r.cache.put(clientID, client, ttl)
+	}
+	return client, false, nil
 }
 
-// resolve sets *host as soon as the URL parses so the failure log can
-// name it on every later step.
-func (r *CIMDResolver) resolve(ctx context.Context, clientID string, host *string) (*cimdDocument, *cimdError) {
-	u, ce := validateCIMDClientID(clientID)
-	if ce != nil {
-		return nil, ce
-	}
-	*host = u.Host
-	// Operator policy (draft -02 §8.9) runs before any network activity.
-	if !r.hosts.Allows(u.Hostname()) {
-		return nil, &cimdError{Result: cimdHostNotAllowed, Desc: "client_id host is not allowed by the operator"}
-	}
-	body, ce := r.fetch(ctx, u)
-	if ce != nil {
-		return nil, ce
-	}
-	return parseCIMDDocument(body, clientID, r.redirectExtra, r.redirectAllow)
-}
-
-func (r *CIMDResolver) fetch(ctx context.Context, u *url.URL) ([]byte, *cimdError) {
-	fetchErr := func(desc string, err error) ([]byte, *cimdError) {
-		return nil, &cimdError{Result: cimdFetchError, Desc: desc, Err: err}
+// fetch returns the body and the cache lifetime its headers allow.
+func (r *CIMDResolver) fetch(ctx context.Context, u *url.URL) ([]byte, time.Duration, *cimdError) {
+	fetchErr := func(desc string, err error) ([]byte, time.Duration, *cimdError) {
+		return nil, 0, &cimdError{Result: cimdFetchError, Desc: desc, Err: err}
 	}
 	// Refuse rather than queue: a waiting caller would hold its own request slot too.
 	select {
@@ -367,7 +394,7 @@ func (r *CIMDResolver) fetch(ctx context.Context, u *url.URL) ([]byte, *cimdErro
 			err = ue.Err
 		}
 		if errors.Is(err, errCIMDBlockedAddress) {
-			return nil, &cimdError{Result: cimdSSRFBlocked, Desc: "client_id host resolves to a non-public address", Err: err}
+			return nil, 0, &cimdError{Result: cimdSSRFBlocked, Desc: "client_id host resolves to a non-public address", Err: err}
 		}
 		return fetchErr("client metadata document could not be fetched", err)
 	}
@@ -384,9 +411,9 @@ func (r *CIMDResolver) fetch(ctx context.Context, u *url.URL) ([]byte, *cimdErro
 		return fetchErr("client metadata document could not be fetched", err)
 	}
 	if len(body) > cimdMaxBodyBytes {
-		return nil, &cimdError{Result: cimdTooLarge, Desc: "client metadata document exceeds the size cap"}
+		return nil, 0, &cimdError{Result: cimdTooLarge, Desc: "client metadata document exceeds the size cap"}
 	}
-	return body, nil
+	return body, cimdCacheTTL(resp.Header), nil
 }
 
 // parseCIMDDocument decodes and validates the document for clientID,

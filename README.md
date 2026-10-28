@@ -177,7 +177,9 @@ shipped defaults give you, with no extra effort:
   `https://` `client_id` is fetched at `/authorize` behind a fixed
   boundary: the resolved address is checked against the IANA
   special-purpose registries (RFC 6890 and successors), no redirects, 5 KiB body, 5 s, 16 fetches in
-  flight per replica. `CIMD_ALLOWED_HOSTS` narrows the hosts a
+  flight per replica; validated documents are cached per replica (1 000
+  entries, `Cache-Control` TTL clamped to 60 s to 24 h, errors never
+  cached). `CIMD_ALLOWED_HOSTS` narrows the hosts a
   `client_id` may name; the consent page shows the metadata host and
   warns when the client only redirects to loopback. `CIMD_ENABLED=false`
   refuses URL `client_id`s as unknown clients and fetches nothing. Details in
@@ -290,6 +292,8 @@ ordering) live in [`specs.md`](./specs.md).
   - `mcp_auth_idp_exchange_throttled_total` — outbound bucket denials
   - `mcp_auth_cimd_fetch_total{result}` — Client ID Metadata Document
     resolutions (`https://` client_ids); `ssrf_blocked` is a probe signal
+  - `mcp_auth_cimd_cache_total{result}` — `hit` / `miss` / `expired` on
+    the document cache (a hit is not a fetch); `mcp_auth_cimd_cache_entries`
   - `mcp_auth_clients_registered_total`, `mcp_auth_token_seals_total{purpose}`,
     `mcp_auth_groups_claim_shape_mismatch_total`
   - `mcp_auth_rpc_calls_total{tool}` and friends — opt-in via

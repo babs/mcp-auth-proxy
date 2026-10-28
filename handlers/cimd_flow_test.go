@@ -110,7 +110,8 @@ func TestAuthorize_CIMDRedirectMismatch(t *testing.T) {
 func TestAuthorize_CIMDResolvedClient(t *testing.T) {
 	tm := newTestTokenManager(t)
 	srv, clientID, hits := cimdDocServer(t, cimdValidDoc)
-	rr := authorizeCIMD(t, tm, zap.NewNop(), clientID, cimdAppRedirect, AuthorizeConfig{PKCERequired: true, CIMD: newTestCIMDResolver(t, srv, "")}, "")
+	cfg := AuthorizeConfig{PKCERequired: true, CIMD: newTestCIMDResolver(t, srv, "")}
+	rr := authorizeCIMD(t, tm, zap.NewNop(), clientID, cimdAppRedirect, cfg, "")
 	if rr.Code != http.StatusFound {
 		t.Fatalf("want 302, got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -127,6 +128,29 @@ func TestAuthorize_CIMDResolvedClient(t *testing.T) {
 	}
 	if n := hits.Load(); n != 1 {
 		t.Errorf("document server hits = %d, want 1", n)
+	}
+
+	// MAP-002-AC11: a second /authorize within the TTL is served from the
+	// document cache, with the same outcome and no fetch.
+	rr = authorizeCIMD(t, tm, zap.NewNop(), clientID, cimdAppRedirect, cfg, "")
+	if rr.Code != http.StatusFound {
+		t.Fatalf("replay: want 302, got %d: %s", rr.Code, rr.Body.String())
+	}
+	loc2, err := url.Parse(rr.Header().Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loc2.Host != loc.Host || loc2.Path != loc.Path {
+		t.Errorf("replay redirected to %s%s, want %s%s", loc2.Host, loc2.Path, loc.Host, loc.Path)
+	}
+	if err := tm.OpenJSON(loc2.Query().Get("state"), &session, token.PurposeSession); err != nil {
+		t.Fatalf("replay: open state: %v", err)
+	}
+	if session.ClientID != clientID || session.RedirectURI != cimdAppRedirect {
+		t.Errorf("replay session = client %q redirect %q, want %q / %q", session.ClientID, session.RedirectURI, clientID, cimdAppRedirect)
+	}
+	if n := hits.Load(); n != 1 {
+		t.Errorf("document server hits after replay = %d, want 1: the cached document must serve the second /authorize", n)
 	}
 }
 
