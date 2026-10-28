@@ -59,9 +59,11 @@ type TokenConfig struct {
 	// refresh id_token re-applies the same identity policy as sign-in.
 	GroupsClaim   string
 	AllowedGroups []string
-	// RedirectURIsAllowlist (REDIRECT_URIS_ALLOWLIST) is re-checked on
-	// both grants, so narrowing it ends, within one access-token
-	// lifetime, the sessions whose redirect URI it no longer admits.
+	// RedirectURIsExtra (REDIRECT_URIS_EXTRA) and RedirectURIsAllowlist
+	// (REDIRECT_URIS_ALLOWLIST) are re-checked on both grants, so
+	// narrowing either ends, within one access-token lifetime, the
+	// sessions whose redirect URI it no longer admits.
+	RedirectURIsExtra     config.RedirectAllowlist
 	RedirectURIsAllowlist config.WebRedirectAllowlist
 }
 
@@ -222,8 +224,8 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 	}
 
 	// Before the single-use claim below, so a refused code burns nothing.
-	if !registeredRedirectAllowed(code.RedirectURI, cfg.RedirectURIsAllowlist) {
-		denyGrantNotAllowlisted(w, r, logger, client, "authorization_code")
+	if cause := registeredRedirectCheck(code.RedirectURI, cfg.RedirectURIsExtra, cfg.RedirectURIsAllowlist); cause != nil {
+		denyGrantNotAllowlisted(w, r, logger, client, "authorization_code", cause)
 		return
 	}
 
@@ -473,8 +475,8 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 	}
 
 	// Before the family claim, so a refused refresh burns nothing.
-	if !refreshRedirectAllowed(&refresh, client, cfg.RedirectURIsAllowlist) {
-		denyGrantNotAllowlisted(w, r, logger, client, "refresh_token")
+	if cause := refreshRedirectCheck(&refresh, client, cfg); cause != nil {
+		denyGrantNotAllowlisted(w, r, logger, client, "refresh_token", cause)
 		return
 	}
 
@@ -707,28 +709,28 @@ func sealRefreshToken(tm *token.Manager, forward bool, sr sealedRefresh) (string
 	return sealed, err
 }
 
-// refreshRedirectAllowed judges the registered redirect URI the
-// session's code was issued for. A refresh token without that index
-// (sealed before it existed, or rotated by such a release) passes only if
-// every registered URI is still admitted: one listed sibling must not
-// keep alive a session obtained through an unlisted URI.
-func refreshRedirectAllowed(refresh *sealedRefresh, client *sealedClient, allow config.WebRedirectAllowlist) bool {
+// refreshRedirectCheck judges the registered redirect URI the session's
+// code was issued for. A refresh token without that index (sealed before
+// it existed, or rotated by such a release) passes only if every
+// registered URI is still admitted: one listed sibling must not keep
+// alive a session obtained through an unlisted URI.
+func refreshRedirectCheck(refresh *sealedRefresh, client *sealedClient, cfg TokenConfig) error {
 	if i := refresh.RedirectURIIndex; i >= 1 && i <= len(client.RedirectURIs) {
-		return registeredRedirectAllowed(client.RedirectURIs[i-1], allow)
+		return registeredRedirectCheck(client.RedirectURIs[i-1], cfg.RedirectURIsExtra, cfg.RedirectURIsAllowlist)
 	}
 	for _, uri := range client.RedirectURIs {
-		if !registeredRedirectAllowed(uri, allow) {
-			return false
+		if err := registeredRedirectCheck(uri, cfg.RedirectURIsExtra, cfg.RedirectURIsAllowlist); err != nil {
+			return err
 		}
 	}
-	return true
+	return nil
 }
 
-// denyGrantNotAllowlisted refuses a grant REDIRECT_URIS_ALLOWLIST no
-// longer admits; same reason and error_code as the /authorize re-check.
-func denyGrantNotAllowlisted(w http.ResponseWriter, r *http.Request, logger *zap.Logger, client *sealedClient, grantType string) {
+// denyGrantNotAllowlisted refuses a grant the operator's redirect lists
+// no longer admit; same reason and error_code as the /authorize re-check.
+func denyGrantNotAllowlisted(w http.ResponseWriter, r *http.Request, logger *zap.Logger, client *sealedClient, grantType string, cause error) {
 	recordClientDenial(logger, "redirect_uri_not_allowlisted",
-		zap.String("internal_id", client.ID), zap.Error(errNotInWebAllowlist), zap.String("grant_type", grantType))
+		zap.String("internal_id", client.ID), zap.Error(cause), zap.String("grant_type", grantType))
 	writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "client redirect_uri is no longer allowlisted by the operator", codeRedirectURIMismatch)
 }
 

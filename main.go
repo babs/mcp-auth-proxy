@@ -1072,6 +1072,7 @@ func newTokenConfig(cfg *config.Config, idpRefresher *handlers.IdPRefresher, idp
 		VerifyIDToken:         verify,
 		GroupsClaim:           cfg.GroupsClaim,
 		AllowedGroups:         cfg.AllowedGroups,
+		RedirectURIsExtra:     cfg.RedirectURIsExtra,
 		RedirectURIsAllowlist: cfg.RedirectURIsAllowlist,
 	}
 }

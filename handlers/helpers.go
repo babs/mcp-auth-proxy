@@ -301,10 +301,10 @@ type sealedRefresh struct {
 	// RedirectURIIndex is the 1-based position, in the client's
 	// registered redirect_uris, of the one the originating code was
 	// issued for; inherited across rotations, so the refresh grant
-	// re-checks REDIRECT_URIS_ALLOWLIST against the URI this session
-	// used. An index, not the URI, so a long redirect URI cannot make the
-	// refresh token outgrow its code (both share one open() size cap). 0
-	// on refresh tokens sealed before this field existed.
+	// re-checks the operator's redirect lists against the URI this
+	// session used. An index, not the URI, so a long redirect URI cannot
+	// make the refresh token outgrow its code (both share one open()
+	// size cap). 0 on refresh tokens sealed before this field existed.
 	RedirectURIIndex int       `json:"rui,omitempty"`
 	IssuedAt         time.Time `json:"iat"`
 	// FamilyIssuedAt is the IssuedAt of the FIRST refresh in this
@@ -612,15 +612,18 @@ func webRedirectAllowed(raw string, allow config.WebRedirectAllowlist) bool {
 	return allow.Allows(raw, redirectURIMatches)
 }
 
-// registeredRedirectAllowed reports whether REDIRECT_URIS_ALLOWLIST still
-// admits a registered redirect URI, or one a code was issued for under
-// it. Custom schemes are not judged by this list; REDIRECT_URIS_EXTRA
-// governs them.
-func registeredRedirectAllowed(uri string, allow config.WebRedirectAllowlist) bool {
+// registeredRedirectCheck returns why the operator's current lists no
+// longer admit a registered redirect URI, or one a code was issued for
+// under it, or nil: REDIRECT_URIS_EXTRA judges custom schemes, as at
+// /authorize, and REDIRECT_URIS_ALLOWLIST the rest.
+func registeredRedirectCheck(uri string, extra config.RedirectAllowlist, allow config.WebRedirectAllowlist) error {
 	if u, err := url.Parse(uri); err == nil && !config.IsWebScheme(u.Scheme) {
-		return true
+		return extra.Check(uri)
 	}
-	return webRedirectAllowed(uri, allow)
+	if !webRedirectAllowed(uri, allow) {
+		return errNotInWebAllowlist
+	}
+	return nil
 }
 
 // isLoopback returns true if the URL targets a loopback address, which

@@ -206,7 +206,8 @@ func TestRedirectPolicyWiring(t *testing.T) {
 		!slices.Equal(ac.RedirectURIsExtra.Entries(), extra.Entries()) {
 		t.Errorf("authorize config = %+v", ac)
 	}
-	if tc := newTokenConfig(cfg, nil, nil, nil); !slices.Equal(tc.RedirectURIsAllowlist.Entries(), allow.Entries()) {
-		t.Errorf("token config allowlist = %v, want %v", tc.RedirectURIsAllowlist.Entries(), allow.Entries())
+	if tc := newTokenConfig(cfg, nil, nil, nil); !slices.Equal(tc.RedirectURIsAllowlist.Entries(), allow.Entries()) ||
+		!slices.Equal(tc.RedirectURIsExtra.Entries(), extra.Entries()) {
+		t.Errorf("token config lists = %v / %v, want %v / %v", tc.RedirectURIsAllowlist.Entries(), tc.RedirectURIsExtra.Entries(), allow.Entries(), extra.Entries())
 	}
 }
