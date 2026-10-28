@@ -70,8 +70,9 @@ const (
 	codeRedirectURIMalformed      = "redirect_uri_malformed"
 	// Client ID Metadata Document resolution (an https URL client_id):
 	// the document could not be fetched, or it is not a usable client.
-	codeClientMetadataUnavailable = "client_metadata_unavailable"
-	codeClientMetadataInvalid     = "client_metadata_invalid"
+	codeClientMetadataUnavailable    = "client_metadata_unavailable"
+	codeClientMetadataInvalid        = "client_metadata_invalid"
+	codeClientMetadataHostNotAllowed = "client_metadata_host_not_allowed"
 
 	// /callback session and IdP leg.
 	codeSessionUnknown          = "session_unknown"
@@ -259,9 +260,15 @@ type sealedConsent struct {
 	// one is dead once redeemed). Empty on tokens sealed before this
 	// field existed — /consent then falls through to the prior
 	// stateless behavior for that token.
-	JTI           string `json:"jti,omitempty"`
-	ClientID      string `json:"cid"`
-	ClientName    string `json:"cn,omitempty"`
+	JTI        string `json:"jti,omitempty"`
+	ClientID   string `json:"cid"`
+	ClientName string `json:"cn,omitempty"`
+	// ClientHost is the client_id URL host (port kept) of a Client ID
+	// Metadata Document client, shown next to the name; empty for DCR.
+	ClientHost string `json:"ch,omitempty"`
+	// LoopbackOnly is true when every registered redirect_uri is loopback:
+	// the page then warns that any local program could be the requester.
+	LoopbackOnly  bool   `json:"lb,omitempty"`
 	RedirectURI   string `json:"ru"`
 	OriginalState string `json:"os"`
 	CodeChallenge string `json:"cc,omitempty"`
@@ -458,14 +465,21 @@ func clientExpired(c *sealedClient) bool {
 // each grant handler; error shapes are preserved verbatim so the
 // existing test matrix against both paths keeps exercising them.
 //
-// A Client ID Metadata Document client_id (cimdEnabled) is returned
+// A Client ID Metadata Document client_id (cfg.CIMDEnabled) is returned
 // without a fetch: the sealed code or refresh already pins the URL and
 // the redirect URI, so the grant handlers' string comparisons bind it.
-func openAndValidateClient(w http.ResponseWriter, r *http.Request, tm *token.Manager, logger *zap.Logger, clientIDStr, audience string, cimdEnabled bool) *sealedClient {
+func openAndValidateClient(w http.ResponseWriter, r *http.Request, tm *token.Manager, logger *zap.Logger, clientIDStr, audience string, cfg TokenConfig) *sealedClient {
 	if isCIMDClientID(clientIDStr) {
-		if !cimdEnabled {
+		if !cfg.CIMDEnabled {
 			recordClientDenial(logger, "client_id_invalid", zap.String("kind", "cimd_disabled"))
 			writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "invalid client_id", codeClientIDUnknown)
+			return nil
+		}
+		// The host policy must reach sessions already issued, like the
+		// redirect-list re-check: /authorize ran under the list of its day.
+		if u, err := url.Parse(clientIDStr); err != nil || !cfg.CIMDAllowedHosts.Allows(u.Hostname()) {
+			recordClientDenial(logger, "cimd_host_not_allowed", zap.String("client_id_host", sanitizeErrorDescription(cimdClientHost(clientIDStr))))
+			writeOAuthError(w, r, http.StatusBadRequest, "invalid_client", "client_id host is not allowed by the operator", codeClientMetadataHostNotAllowed)
 			return nil
 		}
 		return &sealedClient{ID: clientIDStr, Typ: token.PurposeClient, Audience: audience}
@@ -651,4 +665,33 @@ func registeredRedirectCheck(uri string, extra config.RedirectAllowlist, allow c
 // is exempt from the HTTPS requirement per OAuth 2.1 §2.3.1.
 func isLoopback(u *url.URL) bool {
 	return config.IsLoopbackHost(u.Hostname())
+}
+
+// loopbackOnly reports whether every registered redirect URI is
+// loopback: the consent page then cannot tell the user which local
+// program is asking (MCP Authorization, Localhost Redirect URI Risks).
+func loopbackOnly(redirectURIs []string) bool {
+	if len(redirectURIs) == 0 {
+		return false
+	}
+	for _, raw := range redirectURIs {
+		u, err := url.Parse(raw)
+		if err != nil || !isLoopback(u) {
+			return false
+		}
+	}
+	return true
+}
+
+// cimdClientHost returns the host (port kept) of a Client ID Metadata
+// Document client_id, "" for a sealed DCR id.
+func cimdClientHost(clientID string) string {
+	if !isCIMDClientID(clientID) {
+		return ""
+	}
+	u, err := url.Parse(clientID)
+	if err != nil {
+		return ""
+	}
+	return u.Host
 }

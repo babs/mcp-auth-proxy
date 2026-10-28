@@ -159,7 +159,7 @@ production posture.
 | **`TOKEN_SIGNING_SECRET`** | ≥ 32 bytes, AES-GCM key; byte-identical across replicas. **Generate with `manifests/scripts/generate-signing-secret.sh`** (64-char base64). The startup validator rejects three weak-secret shapes: all-same-byte, short-repeating-period, and tiny alphabet (< 8 distinct values). Under `PROD_MODE=true` weak secrets fail fast. Rotation procedure (with `TOKEN_SIGNING_SECRETS_PREVIOUS` for zero-downtime rollover) in [`docs/runbooks/key-rotation.md`](./docs/runbooks/key-rotation.md) |
 
 Optional knobs (rate limits, replay store tuning, header trust,
-observability, `CIMD_ENABLED`, dev/compat) are documented in
+observability, `CIMD_ENABLED`, `CIMD_ALLOWED_HOSTS`, dev/compat) are documented in
 [`docs/configuration.md`](./docs/configuration.md).
 
 ### Production posture
@@ -177,8 +177,10 @@ shipped defaults give you, with no extra effort:
   `https://` `client_id` is fetched at `/authorize` behind a fixed
   boundary: the resolved address is checked against the IANA
   special-purpose registries (RFC 6890 and successors), no redirects, 5 KiB body, 5 s, 16 fetches in
-  flight per replica. `CIMD_ENABLED=false` refuses URL `client_id`s as
-  unknown clients and fetches nothing. Details in
+  flight per replica. `CIMD_ALLOWED_HOSTS` narrows the hosts a
+  `client_id` may name; the consent page shows the metadata host and
+  warns when the client only redirects to loopback. `CIMD_ENABLED=false`
+  refuses URL `client_id`s as unknown clients and fetches nothing. Details in
   [`specs.md`](./specs.md#get-authorize) and
   [`docs/threat-model.md`](./docs/threat-model.md).
 - **Consent page on** — `RENDER_CONSENT_PAGE=true`. Closes the

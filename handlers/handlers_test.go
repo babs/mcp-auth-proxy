@@ -363,7 +363,7 @@ func TestRegister_NeverExpires(t *testing.T) {
 	// The expiry guard must let a zero-ExpiresAt client through even
 	// though time.Now() is "after" the zero time.
 	vr := httptest.NewRecorder()
-	if got := openAndValidateClient(vr, httptest.NewRequest(http.MethodPost, "/token", nil), tm, zap.NewNop(), resp.ClientID, testBaseURL, false); got == nil {
+	if got := openAndValidateClient(vr, httptest.NewRequest(http.MethodPost, "/token", nil), tm, zap.NewNop(), resp.ClientID, testBaseURL, TokenConfig{}); got == nil {
 		t.Fatalf("non-expiring client_id rejected: %d %s", vr.Code, vr.Body.String())
 	}
 }
@@ -412,7 +412,7 @@ func TestOpenAndValidateClient_RejectionMetrics(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			before := testutil.ToFloat64(metrics.AccessDenied.WithLabelValues(tc.reason))
 			rr := httptest.NewRecorder()
-			if got := openAndValidateClient(rr, httptest.NewRequest(http.MethodPost, "/token", nil), tm, zap.NewNop(), tc.clientID, testBaseURL, false); got != nil {
+			if got := openAndValidateClient(rr, httptest.NewRequest(http.MethodPost, "/token", nil), tm, zap.NewNop(), tc.clientID, testBaseURL, TokenConfig{}); got != nil {
 				t.Fatal("expected rejection (nil), got a client")
 			}
 			if rr.Code != http.StatusBadRequest {

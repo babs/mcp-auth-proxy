@@ -81,6 +81,7 @@ func main() {
 		zap.Bool("prod_mode", cfg.ProdMode),
 		zap.Bool("pkce_required", cfg.PKCERequired),
 		zap.Bool("cimd_enabled", cfg.CIMDEnabled),
+		zap.Strings("cimd_allowed_hosts", cfg.CIMDAllowedHosts.Entries()),
 		zap.Bool("redis_required", cfg.RedisRequired),
 		zap.Bool("rate_limit_enabled", cfg.RateLimitEnabled),
 		zap.Bool("trust_proxy_headers", cfg.TrustProxyHeaders),
@@ -1046,7 +1047,7 @@ func newCIMDResolver(cfg *config.Config, logger *zap.Logger) *handlers.CIMDResol
 	if !cfg.CIMDEnabled {
 		return nil
 	}
-	return handlers.NewCIMDResolver(logger, cfg.RedirectURIsExtra, cfg.RedirectURIsAllowlist, handlers.CIMDResolverOptions{})
+	return handlers.NewCIMDResolver(logger, cfg.RedirectURIsExtra, cfg.RedirectURIsAllowlist, cfg.CIMDAllowedHosts, handlers.CIMDResolverOptions{})
 }
 
 // newAuthorizeConfig builds the /authorize settings; same fail-open
@@ -1078,6 +1079,7 @@ func newCallbackConfig(cfg *config.Config, replayStore replay.Store, idpLimiter 
 func newTokenConfig(cfg *config.Config, idpRefresher *handlers.IdPRefresher, idpLimiter *rate.Limiter, verify func(context.Context, string) (*oidc.IDToken, error), cimd *handlers.CIMDResolver) handlers.TokenConfig {
 	return handlers.TokenConfig{
 		CIMDEnabled:           cimd != nil,
+		CIMDAllowedHosts:      cfg.CIMDAllowedHosts,
 		RefreshRaceGrace:      cfg.RefreshRaceGrace,
 		ForwardIdPToken:       cfg.UpstreamForwardIdPToken,
 		IdPRefresher:          idpRefresher,

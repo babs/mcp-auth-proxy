@@ -25,7 +25,7 @@ import (
 // cimdBodyMarker is planted in document bodies; it must never reach an error message or a log.
 const cimdBodyMarker = "SECRET-FROM-BODY"
 
-var cimdAllResults = []cimdResult{cimdOK, cimdURLInvalid, cimdSSRFBlocked, cimdFetchError, cimdTooLarge, cimdDocInvalid, cimdAuthMethodUnsupported}
+var cimdAllResults = []cimdResult{cimdOK, cimdURLInvalid, cimdHostNotAllowed, cimdSSRFBlocked, cimdFetchError, cimdTooLarge, cimdDocInvalid, cimdAuthMethodUnsupported}
 
 func cimdFetchTotal() float64 {
 	var sum float64
@@ -56,9 +56,16 @@ func TestValidateCIMDClientID(t *testing.T) {
 		{"https://10.0.0.1/x", false},
 		{"https:h/x", false},
 		{"https:///x", false},
+		{"https://*.example.com/c.json", false},
+		{"https://<b>x</b>.example.com/c.json", false},
+		{"https://a..b/c", false},
+		{"https://-h/c", false},
+		{"https://" + strings.Repeat("a", 64) + ".example.com/c", false},
 		{"https://h/", true},
 		{"https://h/client.json", true},
 		{"https://h:8443/c.json", true},
+		{"https://App.Example.com/c.json", true},
+		{"https://" + strings.Repeat("a", 63) + ".example.com/c", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.id, func(t *testing.T) {
@@ -89,7 +96,7 @@ func TestValidateCIMDClientID_HostLength(t *testing.T) {
 }
 
 func TestNewCIMDResolver_Transport(t *testing.T) {
-	tr := NewCIMDResolver(zap.NewNop(), config.RedirectAllowlist{}, config.WebRedirectAllowlist{}, CIMDResolverOptions{}).client.Transport.(*http.Transport)
+	tr := NewCIMDResolver(zap.NewNop(), config.RedirectAllowlist{}, config.WebRedirectAllowlist{}, config.CIMDHostAllowlist{}, CIMDResolverOptions{}).client.Transport.(*http.Transport)
 	if tr.Proxy != nil {
 		t.Error("Proxy set: the dial guard would see the proxy, not the destination")
 	}
@@ -125,7 +132,7 @@ func TestCIMDRejectSpecialPurpose(t *testing.T) {
 		{"2620:4f:8000::1", false}, // Direct Delegation AS112 v6
 		{"3fff::1", false},         // documentation, RFC 9637
 		{"5f00::1", false},         // SRv6 SIDs, RFC 9602
-		{"100:0:0:1::1", false},    // DRIP, RFC 9780
+		{"100:0:0:1::1", false},    // Dummy IPv6 Prefix, RFC 9780
 		{"::ffff:127.0.0.1", false},
 		{"64:ff9b::a00:1", false},       // NAT64 of 10.0.0.1
 		{"64:ff9b:1::a9fe:a9fe", false}, // local-use NAT64 of 169.254.169.254
@@ -191,7 +198,7 @@ func allowLoopbackDial(netip.Addr) error { return nil }
 // exercised by TestCIMDResolve_DefaultGuardBlocksLoopback.
 func newTestCIMDResolver(t *testing.T, srv *httptest.Server, allow string) *CIMDResolver {
 	t.Helper()
-	return NewCIMDResolver(zap.NewNop(), config.RedirectAllowlist{}, mustWebAllowlist(t, allow),
+	return NewCIMDResolver(zap.NewNop(), config.RedirectAllowlist{}, mustWebAllowlist(t, allow), config.CIMDHostAllowlist{},
 		CIMDResolverOptions{DialGuardOverride: allowLoopbackDial, TLSClientConfigOverride: trustTestServer(srv)})
 }
 
@@ -223,7 +230,7 @@ func TestCIMDResolve_DefaultGuardBlocksLoopback(t *testing.T) {
 	var hits atomic.Int32
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { hits.Add(1) }))
 	defer srv.Close()
-	r := NewCIMDResolver(zap.NewNop(), config.RedirectAllowlist{}, config.WebRedirectAllowlist{}, CIMDResolverOptions{TLSClientConfigOverride: trustTestServer(srv)})
+	r := NewCIMDResolver(zap.NewNop(), config.RedirectAllowlist{}, config.WebRedirectAllowlist{}, config.CIMDHostAllowlist{}, CIMDResolverOptions{TLSClientConfigOverride: trustTestServer(srv)})
 	before, beforeTotal := testutil.ToFloat64(metrics.CIMDFetch.WithLabelValues(string(cimdSSRFBlocked))), cimdFetchTotal()
 
 	client, ce := r.Resolve(context.Background(), cimdURL(t, srv, "/client.json"), "https://proxy.example")
@@ -237,6 +244,72 @@ func TestCIMDResolve_DefaultGuardBlocksLoopback(t *testing.T) {
 	if n := hits.Load(); n != 0 {
 		t.Fatalf("server received %d requests, want 0: the guard must run before the connection", n)
 	}
+}
+
+// MAP-002-AC7: CIMD_ALLOWED_HOSTS is judged before any network activity;
+// an allowed host (entry matched case-insensitively) reaches the fetch.
+func TestCIMDResolve_HostAllowlist(t *testing.T) {
+	var hits atomic.Int32
+	var clientID string
+	// Echoes the requested URL as client_id, so a differently-cased host
+	// still yields a byte-equal document.
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"client_id":` + jsonStr("https://"+r.Host+r.URL.Path) + `,"redirect_uris":["https://app.example/cb"]}`))
+	}))
+	defer srv.Close()
+	clientID = cimdURL(t, srv, "/client.json")
+	resolver := func(t *testing.T, raw string) *CIMDResolver {
+		t.Helper()
+		hosts, err := config.ParseCIMDHostAllowlist(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return NewCIMDResolver(zap.NewNop(), config.RedirectAllowlist{}, config.WebRedirectAllowlist{}, hosts,
+			CIMDResolverOptions{DialGuardOverride: allowLoopbackDial, TLSClientConfigOverride: trustTestServer(srv)})
+	}
+
+	for _, tc := range []struct {
+		name, hosts, clientID string
+	}{
+		{"glob refuses another domain", "*.example.com", "https://example.org/c.json"},
+		{"glob refuses the apex", "*.example.com", "https://example.com/c.json"},
+		{"exact refuses a subdomain", "example.com", "https://app.example.com/c.json"},
+		{"glob refuses the document host", "*.example.com", clientID},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hits.Store(0)
+			before, beforeTotal := testutil.ToFloat64(metrics.CIMDFetch.WithLabelValues(string(cimdHostNotAllowed))), cimdFetchTotal()
+			client, ce := resolver(t, tc.hosts).Resolve(context.Background(), tc.clientID, "https://proxy.example")
+			if client != nil {
+				t.Fatalf("want nil client, got %+v", client)
+			}
+			ce = assertCIMDResult(t, ce, cimdHostNotAllowed, before, beforeTotal)
+			if ce.Desc != "client_id host is not allowed by the operator" {
+				t.Errorf("description = %q", ce.Desc)
+			}
+			if n := hits.Load(); n != 0 {
+				t.Errorf("document server hits = %d, want 0: the allowlist runs before the fetch", n)
+			}
+		})
+	}
+
+	t.Run("exact entry matches case-insensitively and fetches", func(t *testing.T) {
+		hits.Store(0)
+		before := testutil.ToFloat64(metrics.CIMDFetch.WithLabelValues("ok"))
+		upper := strings.Replace(clientID, "https://localhost:", "https://LOCALHOST:", 1)
+		client, ce := resolver(t, "*.example.com, LocalHost").Resolve(context.Background(), upper, "https://proxy.example")
+		if ce != nil {
+			t.Fatalf("Resolve: %v", ce)
+		}
+		if client.ID != upper || hits.Load() != 1 {
+			t.Errorf("client %q, hits %d; want %q and 1 fetch", client.ID, hits.Load(), upper)
+		}
+		if got := testutil.ToFloat64(metrics.CIMDFetch.WithLabelValues("ok")) - before; got != 1 {
+			t.Errorf("cimd_fetch{ok} delta = %v, want 1", got)
+		}
+	})
 }
 
 // MAP-002-AC3
@@ -449,26 +522,27 @@ func TestCIMDResolve_CapacityExhausted(t *testing.T) {
 	}
 }
 
-// The failure log names the host through the same byte filter as the
-// error page: a non-ASCII name arrives stripped, never raw. The
-// semaphore is filled first, so fetch refuses after the host is known
-// and before any lookup or dial: no network is involved.
-func TestCIMDResolve_LogHostSanitized(t *testing.T) {
+// A host that is not a hostname is refused before the host is recorded
+// for the log and before any lookup or dial: the WARN carries
+// reason=url_invalid and an empty client_id_host, never the raw bytes.
+func TestCIMDResolve_NonHostnameRefusedBeforeLog(t *testing.T) {
 	core, logs := observer.New(zap.WarnLevel)
-	r := NewCIMDResolver(zap.New(core), config.RedirectAllowlist{}, config.WebRedirectAllowlist{}, CIMDResolverOptions{})
-	for range cap(r.sem) {
-		r.sem <- struct{}{}
-	}
+	dialed := false
+	r := NewCIMDResolver(zap.New(core), config.RedirectAllowlist{}, config.WebRedirectAllowlist{}, config.CIMDHostAllowlist{},
+		CIMDResolverOptions{DialGuardOverride: func(netip.Addr) error { dialed = true; return nil }})
 	_, ce := r.Resolve(context.Background(), "https://ex\u00e4mple.invalid/c", "https://proxy.example")
-	if ce == nil || !errors.Is(ce, errCIMDCapacity) {
-		t.Fatalf("want the capacity refusal, got %v", ce)
+	if ce == nil || ce.Result != cimdURLInvalid {
+		t.Fatalf("want url_invalid, got %v", ce)
 	}
 	entries := logs.FilterMessage("cimd_resolve_failed").All()
 	if len(entries) != 1 {
 		t.Fatalf("want 1 cimd_resolve_failed entry, got %d", len(entries))
 	}
-	if got := entries[0].ContextMap()["client_id_host"]; got != "exmple.invalid" {
-		t.Errorf("client_id_host = %q, want %q", got, "exmple.invalid")
+	if ctx := entries[0].ContextMap(); ctx["client_id_host"] != "" || ctx["reason"] != string(cimdURLInvalid) {
+		t.Errorf("log fields = %v, want empty client_id_host and reason url_invalid: the host is judged before it is recorded", ctx)
+	}
+	if dialed {
+		t.Error("a dial was attempted")
 	}
 }
 
@@ -522,4 +596,24 @@ func TestIsCIMDClientID(t *testing.T) {
 func jsonStr(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
+}
+
+// A client_id whose host is not a hostname is refused before any network
+// activity, even when it would match a CIMD_ALLOWED_HOSTS glob.
+func TestCIMDResolve_HostNotHostname(t *testing.T) {
+	hosts, err := config.ParseCIMDHostAllowlist("*.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialed := false
+	r := NewCIMDResolver(zap.NewNop(), config.RedirectAllowlist{}, config.WebRedirectAllowlist{}, hosts,
+		CIMDResolverOptions{DialGuardOverride: func(netip.Addr) error { dialed = true; return nil }})
+	for _, id := range []string{"https://*.example.com/c.json", "https://<b>x</b>.example.com/c.json"} {
+		before, beforeTotal := testutil.ToFloat64(metrics.CIMDFetch.WithLabelValues(string(cimdURLInvalid))), cimdFetchTotal()
+		_, ce := r.Resolve(context.Background(), id, "https://proxy.example")
+		assertCIMDResult(t, ce, cimdURLInvalid, before, beforeTotal)
+	}
+	if dialed {
+		t.Error("a dial was attempted for a non-hostname host")
+	}
 }

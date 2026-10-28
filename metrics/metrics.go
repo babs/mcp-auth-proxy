@@ -96,7 +96,7 @@ var (
 
 	// CIMDFetch counts Client ID Metadata Document resolutions (an https
 	// client_id, MCP Authorization 2026-07-28), by result: ok, url_invalid,
-	// ssrf_blocked, fetch_error, too_large, doc_invalid,
+	// host_not_allowed, ssrf_blocked, fetch_error, too_large, doc_invalid,
 	// auth_method_unsupported. handlers/cimd.go holds the classification.
 	// A sustained ssrf_blocked rate is a probe; fetch_error with steady
 	// ok is a client whose metadata host is down.

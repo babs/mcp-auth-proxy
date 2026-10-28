@@ -107,6 +107,7 @@ control.
 | `PROD_MODE` | `true` | Fails startup if any compatibility flag that weakens a security control is set (`PKCE_REQUIRED=false`, `COMPAT_ALLOW_STATELESS=true`, `REDIS_REQUIRED=false`, `RATE_LIMIT_ENABLED=false`, `REDIS_URL` empty, `OIDC_ALLOW_INSECURE_HTTP=true`, a weak `TOKEN_SIGNING_SECRET`, or legacy `TRUST_PROXY_HEADERS=true` without `TRUSTED_PROXY_CIDRS`). Set `false` explicitly only for dev / single-replica work that needs one of the relaxation toggles. |
 | `PKCE_REQUIRED` | `true` | Set `false` for legacy clients that omit PKCE (Cursor, MCP Inspector, ChatGPT). Rejected by `PROD_MODE`. Custom-scheme redirects (`REDIRECT_URIS_EXTRA`) require client S256 regardless. |
 | `CIMD_ENABLED` | `true` | Accept an `https` URL as `client_id` (Client ID Metadata Documents, MCP Authorization 2026-07-28): `/authorize` fetches the document at that URL for `client_name` and `redirect_uris`, and the AS metadata advertises `client_id_metadata_document_supported`. Set `false` to treat such a `client_id` as unknown without fetching, at `/authorize` and at `/token` (live CIMD sessions end). Not a `PROD_MODE` violation either way. |
+| `CIMD_ALLOWED_HOSTS` | (empty) | Comma-separated hosts an `https` URL `client_id` may name (draft-ietf-oauth-client-id-metadata-document-02 §8.9 trust policy). An entry is a hostname (`app.example.com`) or a suffix glob (`*.example.com`). Matching is case-insensitive; a glob matches any host with at least one label before the suffix (`app.example.com`, `a.b.example.com`) and not the apex (`example.com`: list it separately). Entries are ASCII hostnames: give an internationalised name as its A-label (punycode, `xn--...`). Judged after the URL rules and before any fetch, so a refused host costs no network activity: 400 `invalid_client` with `error_code=client_metadata_host_not_allowed`, metric result `host_not_allowed`, denial reason `cimd_host_not_allowed`. Re-checked at `/token` on the code and refresh grants (same error, no fetch), so narrowing the list ends, within one access-token lifetime, the sessions of clients published outside it. Empty = every public host (the special-purpose address guard still applies). Startup fails on an entry with a scheme, a path or a port, a bare `*`, a `*` anywhere but as the leading `*.`, an empty label (`.example.com`), or a non-hostname character; blank items are skipped. Entries are logged in `startup_config.cimd_allowed_hosts`. Not a `PROD_MODE` item. |
 | `COMPAT_ALLOW_STATELESS` | `false` | Synthesize a server-side `state` on `/authorize` when the client omits it. Strict mode refuses the request; counter `mcp_auth_access_denied_total{reason="state_missing"}` fires either way. Rejected by `PROD_MODE`. |
 | `RENDER_CONSENT_PAGE` | `true` | Render an explicit proxy-side consent page on `/authorize` so the user sees who's asking and where they'll be redirected before the IdP login. Closes the silent-token-issuance path where a malicious DCR client + an active IdP session = tokens issued without any user interaction. Plain HTML, no JavaScript. Set `false` to fall back to the legacy silent-redirect — only when every caller is non-interactive and known-trusted. |
 | `CSP_FORM_ACTION_EXTRA` | (empty) | **Deprecated, ignored.** `POST /consent` is now answered with a same-origin navigation interstitial (200 + meta refresh) instead of a 302, which terminates Chromium's form-action redirect-chain enforcement at the proxy — the consent page's `form-action` is `'self'`-only and no IdP / client origin needs to be enumerated. Still parsed and validated so existing deployments keep starting; a `csp_form_action_extra_deprecated` startup warning fires when set. Remove it from your deployment. |
@@ -141,7 +142,8 @@ ones operators most often want to wire up.
 - `mcp_auth_clients_registered_total` — RFC 7591 registrations.
 - `mcp_auth_cimd_fetch_total{result}` — Client ID Metadata Document
   resolutions (an `https://` `client_id`): `ok`, `url_invalid`,
-  `ssrf_blocked` (the name resolved to a
+  `host_not_allowed` (`CIMD_ALLOWED_HOSTS` refused the host, nothing
+  fetched), `ssrf_blocked` (the name resolved to a
   special-purpose address; a sustained rate is a probe), `fetch_error`,
   `too_large`, `doc_invalid`, `auth_method_unsupported`. The
   `cimd_resolve_failed` WARN carries `client_id_host` and `reason`.
@@ -235,14 +237,18 @@ with no `error_code`.
     [`runbooks/client-registration-expired.md`](./runbooks/client-registration-expired.md).
   - `cimd_<result>`: a URL `client_id` whose Client ID Metadata
     Document did not resolve at `/authorize`; `<result>` is the
-    `mcp_auth_cimd_fetch_total` label (`url_invalid`, `ssrf_blocked`,
-    `fetch_error`, `too_large`, `doc_invalid`,
+    `mcp_auth_cimd_fetch_total` label (`url_invalid`, `host_not_allowed`,
+    `ssrf_blocked`, `fetch_error`, `too_large`, `doc_invalid`,
     `auth_method_unsupported`). On the wire `error_code` is
     `client_metadata_unavailable` (`fetch_error`, `ssrf_blocked`,
     `too_large`: check the client's metadata host; the
-    `cimd_resolve_failed` WARN names it) or `client_metadata_invalid`
+    `cimd_resolve_failed` WARN names it), `client_metadata_invalid`
     (`url_invalid`, `doc_invalid`, `auth_method_unsupported`: the
-    client's publisher must fix the document).
+    client's publisher must fix the document) or
+    `client_metadata_host_not_allowed` (`host_not_allowed`: the host is
+    outside `CIMD_ALLOWED_HOSTS`; widen the list or leave it refused).
+    `cimd_host_not_allowed` also counts `/token` grants of a CIMD session
+    whose host the list no longer admits (`client_metadata_host_not_allowed`).
   - `redirect_uri_missing` / `redirect_uri_mismatch` — `/authorize`
     `redirect_uri` absent or not among the registered URIs (client
     misconfiguration, not an attack signal).

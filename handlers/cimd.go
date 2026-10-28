@@ -50,6 +50,7 @@ type cimdResult string
 const (
 	cimdOK                    cimdResult = "ok"
 	cimdURLInvalid            cimdResult = "url_invalid"
+	cimdHostNotAllowed        cimdResult = "host_not_allowed"
 	cimdSSRFBlocked           cimdResult = "ssrf_blocked"
 	cimdFetchError            cimdResult = "fetch_error"
 	cimdTooLarge              cimdResult = "too_large"
@@ -203,6 +204,11 @@ func validateCIMDClientID(clientID string) (*url.URL, *cimdError) {
 	if _, err := netip.ParseAddr(u.Hostname()); err == nil {
 		return invalid("host is an IP literal")
 	}
+	// Same rule as CIMD_ALLOWED_HOSTS entries: a host that is not a hostname
+	// (`*.example.com`, `<b>x`) could otherwise match a glob or reach a log.
+	if err := config.CheckHostname(strings.ToLower(u.Hostname())); err != nil {
+		return invalid("host is not a hostname")
+	}
 	return u, nil
 }
 
@@ -226,6 +232,7 @@ type CIMDResolver struct {
 	logger        *zap.Logger
 	redirectExtra config.RedirectAllowlist
 	redirectAllow config.WebRedirectAllowlist
+	hosts         config.CIMDHostAllowlist
 	guard         func(netip.Addr) error
 	sem           chan struct{}
 }
@@ -242,11 +249,12 @@ type CIMDResolverOptions struct {
 	TLSClientConfigOverride *tls.Config
 }
 
-func NewCIMDResolver(logger *zap.Logger, extra config.RedirectAllowlist, allow config.WebRedirectAllowlist, opts CIMDResolverOptions) *CIMDResolver {
+func NewCIMDResolver(logger *zap.Logger, extra config.RedirectAllowlist, allow config.WebRedirectAllowlist, hosts config.CIMDHostAllowlist, opts CIMDResolverOptions) *CIMDResolver {
 	r := &CIMDResolver{
 		logger:        logger,
 		redirectExtra: extra,
 		redirectAllow: allow,
+		hosts:         hosts,
 		guard:         cimdRejectSpecialPurpose,
 		sem:           make(chan struct{}, cimdMaxInFlight),
 	}
@@ -300,6 +308,8 @@ func (r *CIMDResolver) Resolve(ctx context.Context, clientID, audience string) (
 		if ce.Err != nil {
 			cause = sanitizeErrorDescription(ce.Err.Error())
 		}
+		// Sanitising the host is dead by construction today (CheckHostname and
+		// the authority cap run before it is set); it survives a reordering.
 		r.logger.Warn("cimd_resolve_failed", zap.String("client_id_host", sanitizeErrorDescription(host)), zap.String("reason", string(ce.Result)), zap.String("error", cause))
 		return nil, ce
 	}
@@ -321,6 +331,10 @@ func (r *CIMDResolver) resolve(ctx context.Context, clientID string, host *strin
 		return nil, ce
 	}
 	*host = u.Host
+	// Operator policy (draft -02 §8.9) runs before any network activity.
+	if !r.hosts.Allows(u.Hostname()) {
+		return nil, &cimdError{Result: cimdHostNotAllowed, Desc: "client_id host is not allowed by the operator"}
+	}
 	body, ce := r.fetch(ctx, u)
 	if ce != nil {
 		return nil, ce

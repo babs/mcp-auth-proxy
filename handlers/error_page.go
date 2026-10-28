@@ -275,6 +275,8 @@ var codeHints = map[string]string{
 	codeClientMetadataUnavailable: hintTransientRestart,
 	// The document itself is wrong, which only its publisher can fix.
 	codeClientMetadataInvalid: hintClientPublisher,
+	// Operator policy, not the publisher's document nor a transient fault.
+	codeClientMetadataHostNotAllowed: hintContact,
 	// The callback state is claimed BEFORE the upstream exchange
 	// (callback.go), so reloading an idp_exchange_failed URL can only
 	// yield callback_state_replay: wait, then restart the flow.

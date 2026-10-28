@@ -139,6 +139,7 @@ func TestAuthorize_CIMDResolveFailures(t *testing.T) {
 		status   int
 		clientID string // "" = the document server's URL
 		guarded  bool   // production dial guard
+		hosts    string // CIMD_ALLOWED_HOSTS
 		result   cimdResult
 		wantCode string
 		wantHint string
@@ -153,6 +154,8 @@ func TestAuthorize_CIMDResolveFailures(t *testing.T) {
 			return cimdValidDoc(id)[:len(cimdValidDoc(id))-1] + `,"pad":"` + strings.Repeat("a", cimdMaxBodyBytes) + `"}`
 		}, result: cimdTooLarge, wantCode: codeClientMetadataUnavailable, wantHint: hintTransientRestart},
 		{name: "ssrf_blocked", body: cimdValidDoc, guarded: true, result: cimdSSRFBlocked, wantCode: codeClientMetadataUnavailable, wantHint: hintTransientRestart},
+		// MAP-002-AC7
+		{name: "host_not_allowed", body: cimdValidDoc, hosts: "*.example.com", result: cimdHostNotAllowed, wantCode: codeClientMetadataHostNotAllowed, wantHint: hintContact},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -174,7 +177,11 @@ func TestAuthorize_CIMDResolveFailures(t *testing.T) {
 			if tc.guarded {
 				opts.DialGuardOverride = nil
 			}
-			cfg := AuthorizeConfig{PKCERequired: true, CIMD: NewCIMDResolver(zap.NewNop(), config.RedirectAllowlist{}, config.WebRedirectAllowlist{}, opts)}
+			hosts, err := config.ParseCIMDHostAllowlist(tc.hosts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg := AuthorizeConfig{PKCERequired: true, CIMD: NewCIMDResolver(zap.NewNop(), config.RedirectAllowlist{}, config.WebRedirectAllowlist{}, hosts, opts)}
 			reason := "cimd_" + string(tc.result)
 			before := testutil.ToFloat64(metrics.AccessDenied.WithLabelValues(reason))
 
@@ -367,5 +374,145 @@ func TestToken_CIMDForwardingSealCap(t *testing.T) {
 				t.Errorf("issued refresh token (%d bytes) exceeds its own open() cap", len(rt))
 			}
 		})
+	}
+}
+
+// MAP-002-AC2: the consent page names the metadata host of a CIMD
+// client, and warns when every registered redirect_uri is loopback
+// (DCR clients get the same warning, no host).
+func TestAuthorize_ConsentTrustCues(t *testing.T) {
+	const (
+		loopbackRegistered = "http://127.0.0.1/cb"
+		loopbackRequested  = "http://127.0.0.1:5000/cb"
+		notice             = "This client runs on this computer."
+	)
+	tm := newTestTokenManager(t)
+	cases := []struct {
+		name         string
+		cimd         bool
+		redirectURIs []string
+		redirectURI  string
+		wantNotice   bool
+	}{
+		{"cimd loopback-only", true, []string{loopbackRegistered}, loopbackRequested, true},
+		{"cimd https", true, []string{cimdAppRedirect}, cimdAppRedirect, false},
+		{"cimd mixed", true, []string{loopbackRegistered, cimdAppRedirect}, loopbackRequested, false},
+		{"dcr loopback-only", false, []string{loopbackRegistered}, loopbackRequested, true},
+		{"dcr https", false, []string{cimdAppRedirect}, cimdAppRedirect, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := AuthorizeConfig{PKCERequired: true, RenderConsentPage: true}
+			var clientID, wantHost string
+			if tc.cimd {
+				uris, _ := json.Marshal(tc.redirectURIs)
+				srv, id, _ := cimdDocServer(t, func(id string) string {
+					return `{"client_id":` + jsonStr(id) + `,"client_name":` + jsonStr(cimdAppName) + `,"redirect_uris":` + string(uris) + `}`
+				})
+				cfg.CIMD = newTestCIMDResolver(t, srv, "")
+				clientID = id
+				wantHost = "<code>" + strings.TrimSuffix(strings.TrimPrefix(id, "https://"), "/client.json") + "</code>"
+			} else {
+				clientID, _ = registerClientNamed(t, tm, tc.redirectURIs, cimdAppName)
+			}
+			rr := authorizeCIMD(t, tm, zap.NewNop(), clientID, tc.redirectURI, cfg, browserAccept)
+			if rr.Code != http.StatusOK {
+				t.Fatalf("want 200 consent page, got %d: %s", rr.Code, rr.Body.String())
+			}
+			body := rr.Body.String()
+			if !strings.Contains(body, "<strong>"+cimdAppName+"</strong>") {
+				t.Errorf("client_name missing:\n%s", body)
+			}
+			if tc.cimd && !strings.Contains(body, "</strong> ("+wantHost+") is requesting") {
+				t.Errorf("client host %s missing after the name:\n%s", wantHost, body)
+			}
+			if !tc.cimd && strings.Contains(body, "<code>") {
+				t.Errorf("DCR client rendered a host:\n%s", body)
+			}
+			if got := strings.Contains(body, notice); got != tc.wantNotice {
+				t.Errorf("loopback notice present = %v, want %v:\n%s", got, tc.wantNotice, body)
+			}
+			// The cues travel in the sealed token so a replay re-render shows the same page.
+			var consent sealedConsent
+			if err := tm.OpenJSON(extractConsentToken(t, body), &consent, token.PurposeConsent); err != nil {
+				t.Fatal(err)
+			}
+			if consent.LoopbackOnly != tc.wantNotice || (consent.ClientHost != "") != tc.cimd {
+				t.Errorf("sealed consent lb=%v ch=%q", consent.LoopbackOnly, consent.ClientHost)
+			}
+		})
+	}
+}
+
+// MAP-002-AC7: CIMD_ALLOWED_HOSTS is re-checked on both /token grants,
+// so narrowing it ends the sessions of clients published outside it.
+func TestToken_CIMDHostRecheck(t *testing.T) {
+	const clientID = "https://meta.example/client.json"
+	tm := newTestTokenManager(t)
+	store := replay.NewMemoryStore()
+	t.Cleanup(func() { _ = store.Close() })
+	hosts := func(raw string) config.CIMDHostAllowlist {
+		a, err := config.ParseCIMDHostAllowlist(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return a
+	}
+	open := TokenConfig{CIMDEnabled: true}
+	admits := TokenConfig{CIMDEnabled: true, CIMDAllowedHosts: hosts("Meta.Example")}
+	narrowed := TokenConfig{CIMDEnabled: true, CIMDAllowedHosts: hosts("*.meta.example")}
+	assertRefused := func(t *testing.T, rr *httptest.ResponseRecorder, before float64) {
+		t.Helper()
+		if body := oauthErrorOf(t, rr); rr.Code != http.StatusBadRequest || body.Error != "invalid_client" || body.ErrorCode != codeClientMetadataHostNotAllowed {
+			t.Fatalf("got %d %+v, want 400 invalid_client / %s", rr.Code, body, codeClientMetadataHostNotAllowed)
+		}
+		if got := testutil.ToFloat64(metrics.AccessDenied.WithLabelValues("cimd_host_not_allowed")) - before; got != 1 {
+			t.Errorf("access_denied{cimd_host_not_allowed} delta = %v, want 1", got)
+		}
+	}
+
+	before := testutil.ToFloat64(metrics.AccessDenied.WithLabelValues("cimd_host_not_allowed"))
+	assertRefused(t, postGrant(t, tm, zap.NewNop(), store, narrowed, cimdCodeForm(t, tm, clientID, cimdAppRedirect)), before)
+
+	rr := postGrant(t, tm, zap.NewNop(), store, open, cimdCodeForm(t, tm, clientID, cimdAppRedirect))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("code grant: want 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	rt, _ := openRefresh(t, tm, rr)
+
+	before = testutil.ToFloat64(metrics.AccessDenied.WithLabelValues("cimd_host_not_allowed"))
+	assertRefused(t, postGrant(t, tm, zap.NewNop(), store, narrowed, refreshForm(clientID, rt)), before)
+
+	rr = postGrant(t, tm, zap.NewNop(), store, admits, refreshForm(clientID, rt))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("refresh under the admitting list: want 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// The consent cues derive from the registration alone: no URI, or one
+// non-loopback URI, means no notice; only a CIMD id yields a host.
+func TestConsentCueHelpers(t *testing.T) {
+	for _, tc := range []struct {
+		uris []string
+		want bool
+	}{
+		{nil, false},
+		{[]string{"http://127.0.0.1/cb"}, true},
+		{[]string{"http://localhost:8080/cb", "http://[::1]/cb"}, true},
+		{[]string{"http://127.0.0.1/cb", cimdAppRedirect}, false},
+		{[]string{"://bad"}, false},
+	} {
+		if got := loopbackOnly(tc.uris); got != tc.want {
+			t.Errorf("loopbackOnly(%v) = %v, want %v", tc.uris, got, tc.want)
+		}
+	}
+	for id, want := range map[string]string{
+		"https://meta.example:8443/c.json": "meta.example:8443",
+		"https://%zz/c.json":               "",
+		"sealed-dcr-id":                    "",
+	} {
+		if got := cimdClientHost(id); got != want {
+			t.Errorf("cimdClientHost(%q) = %q, want %q", id, got, want)
+		}
 	}
 }

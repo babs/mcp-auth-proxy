@@ -202,6 +202,9 @@ type testProxyOptions struct {
 	// cimd wires a Client ID Metadata Document resolver into /authorize,
 	// /token and the AS metadata; nil = CIMD_ENABLED=false.
 	cimd *handlers.CIMDResolver
+	// cimdAllowedHosts wires CIMD_ALLOWED_HOSTS into /token; the resolver
+	// above carries its own copy for /authorize.
+	cimdAllowedHosts config.CIMDHostAllowlist
 }
 
 func buildTestProxy(t *testing.T, oidcProvider *mockOIDCProvider, mcpServer *mockMCPServer, proxyBaseURL string, renderConsent bool, opts ...testProxyOptions) http.Handler {
@@ -235,6 +238,7 @@ func buildTestProxy(t *testing.T, oidcProvider *mockOIDCProvider, mcpServer *moc
 		RedirectURIsExtra:     opt.redirectURIsExtra,
 		RedirectURIsAllowlist: opt.redirectURIsAllowlist,
 		CIMDEnabled:           opt.cimd != nil,
+		CIMDAllowedHosts:      opt.cimdAllowedHosts,
 	}
 	oauth2Cfg := newOAuth2Config(cfg, provider.Endpoint())
 
@@ -1157,7 +1161,7 @@ func TestE2E_CIMDClient(t *testing.T) {
 	clientID = "https://localhost:" + port + "/client.json"
 	pool := x509.NewCertPool()
 	pool.AddCert(doc.Certificate())
-	cimd := handlers.NewCIMDResolver(zap.NewNop(), config.RedirectAllowlist{}, config.WebRedirectAllowlist{}, handlers.CIMDResolverOptions{
+	cimd := handlers.NewCIMDResolver(zap.NewNop(), config.RedirectAllowlist{}, config.WebRedirectAllowlist{}, config.CIMDHostAllowlist{}, handlers.CIMDResolverOptions{
 		DialGuardOverride:       func(netip.Addr) error { return nil },
 		TLSClientConfigOverride: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool, ServerName: "example.com"},
 	})
@@ -1216,8 +1220,10 @@ func TestE2E_CIMDClient(t *testing.T) {
 		"resource": {"http://proxy.test/mcp"},
 	}
 	status, _, page := do(t, http.MethodGet, proxyServer.URL+"/authorize?"+params.Encode(), nil)
-	if status != http.StatusOK || !strings.Contains(page, "<strong>CIMD e2e app</strong>") {
-		t.Fatalf("GET /authorize = %d, want the consent page naming the document's client_name:\n%s", status, page)
+	// The page names the document's client_name and the metadata host, the
+	// user's cue that this client is published at a URL.
+	if status != http.StatusOK || !strings.Contains(page, "<strong>CIMD e2e app</strong> (<code>localhost:"+port+"</code>) is requesting") {
+		t.Fatalf("GET /authorize = %d, want the consent page naming the document's client_name and host:\n%s", status, page)
 	}
 
 	status, _, interstitial := do(t, http.MethodPost, proxyServer.URL+"/consent", url.Values{"consent_token": {extractE2EConsentToken(t, page)}, "action": {"approve"}})

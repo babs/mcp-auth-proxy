@@ -263,6 +263,8 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 				JTI:                   uuid.New().String(),
 				ClientID:              client.ID,
 				ClientName:            client.ClientName,
+				ClientHost:            cimdClientHost(client.ID),
+				LoopbackOnly:          loopbackOnly(client.RedirectURIs),
 				RedirectURI:           redirectURI,
 				OriginalState:         state,
 				CodeChallenge:         codeChallenge,
@@ -351,6 +353,8 @@ func writeCIMDError(w http.ResponseWriter, r *http.Request, result cimdResult) {
 	switch result {
 	case cimdURLInvalid:
 		writeOAuthError(w, r, http.StatusBadRequest, "invalid_client", "client_id must be an https URL with a path and no query, fragment or userinfo", codeClientMetadataInvalid)
+	case cimdHostNotAllowed:
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_client", "client_id host is not allowed by the operator", codeClientMetadataHostNotAllowed)
 	case cimdDocInvalid:
 		writeOAuthError(w, r, http.StatusBadRequest, "invalid_client", "client metadata document is invalid", codeClientMetadataInvalid)
 	case cimdAuthMethodUnsupported:

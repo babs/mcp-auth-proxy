@@ -229,6 +229,11 @@ type Config struct {
 	// RedirectURIsExtra. env: REDIRECT_URIS_ALLOWLIST, comma-separated
 	// exact URIs.
 	RedirectURIsAllowlist WebRedirectAllowlist
+	// CIMDAllowedHosts, when set, limits the hosts an https URL client_id
+	// may name (Client ID Metadata Documents, draft -02 §8.9). Empty =
+	// every public host. env: CIMD_ALLOWED_HOSTS, comma-separated
+	// hostnames or `*.example.com` suffix globs.
+	CIMDAllowedHosts CIMDHostAllowlist
 	// secretWeakWarning is non-empty when TOKEN_SIGNING_SECRET matches
 	// an obvious-weakness pattern (all-same byte, or short repeating
 	// period). Exposed via
@@ -613,6 +618,10 @@ func Load() (*Config, error) {
 	c.RedirectURIsAllowlist, err = ParseWebRedirectAllowlist(os.Getenv("REDIRECT_URIS_ALLOWLIST"))
 	if err != nil {
 		return nil, fmt.Errorf("REDIRECT_URIS_ALLOWLIST: %w", err)
+	}
+	c.CIMDAllowedHosts, err = ParseCIMDHostAllowlist(os.Getenv("CIMD_ALLOWED_HOSTS"))
+	if err != nil {
+		return nil, err
 	}
 
 	c.PerSubjectConcurrency = 16
@@ -1092,6 +1101,102 @@ func IsLoopbackHost(host string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+// CIMDHostAllowlist holds the hosts an https URL client_id may name,
+// lower-cased. Empty means every public host.
+type CIMDHostAllowlist struct {
+	exact []string
+	// suffixes holds the `*.example.com` entries as ".example.com".
+	suffixes []string
+}
+
+// Entries returns the validated entries (lower-cased, globs with their
+// `*.` prefix), for startup logging.
+func (a CIMDHostAllowlist) Entries() []string {
+	out := slices.Clone(a.exact)
+	for _, s := range a.suffixes {
+		out = append(out, "*"+s)
+	}
+	return out
+}
+
+// Allows reports whether the list admits host (a URL hostname, port
+// stripped): always when the list is empty; otherwise on an exact
+// entry, or on a glob entry when host has at least one label before the
+// suffix.
+func (a CIMDHostAllowlist) Allows(host string) bool {
+	if len(a.exact) == 0 && len(a.suffixes) == 0 {
+		return true
+	}
+	host = strings.ToLower(host)
+	if slices.Contains(a.exact, host) {
+		return true
+	}
+	return slices.ContainsFunc(a.suffixes, func(s string) bool { return strings.HasSuffix(host, s) })
+}
+
+// ParseCIMDHostAllowlist parses CIMD_ALLOWED_HOSTS: comma-separated
+// hostnames (`app.example.com`) or suffix globs (`*.example.com`),
+// case-insensitive; blank items are skipped.
+func ParseCIMDHostAllowlist(raw string) (CIMDHostAllowlist, error) {
+	var a CIMDHostAllowlist
+	for _, e := range strings.Split(raw, ",") {
+		e = strings.ToLower(strings.TrimSpace(e))
+		if e == "" {
+			continue
+		}
+		name, glob := strings.CutPrefix(e, "*.")
+		if err := checkCIMDHostEntry(name); err != nil {
+			return CIMDHostAllowlist{}, fmt.Errorf("CIMD_ALLOWED_HOSTS: %q: %w", e, err)
+		}
+		if glob {
+			// Stored with its dot: `*.example.com` must not match the apex
+			// `example.com` (the operator lists it) nor `notexample.com`.
+			a.suffixes = append(a.suffixes, "."+name)
+		} else {
+			a.exact = append(a.exact, name)
+		}
+	}
+	return a, nil
+}
+
+// checkCIMDHostEntry returns why name (an entry without its `*.`
+// prefix) is not a hostname: a URL part, a stray wildcard, or an empty
+// or non-hostname label.
+func checkCIMDHostEntry(name string) error {
+	switch {
+	case strings.Contains(name, "://"), strings.Contains(name, "/"):
+		return errors.New("a hostname, not a URL")
+	case strings.Contains(name, ":"):
+		return errors.New("a hostname, without a port")
+	case strings.Contains(name, "*"):
+		return errors.New("a wildcard is allowed only as a leading `*.`")
+	}
+	return CheckHostname(name)
+}
+
+// CheckHostname returns why name (already lower-cased) is not a DNS
+// hostname: labels of 1 to 63 `[a-z0-9-]` characters, no hyphen at either
+// end (RFC 1123 §2.1). IDNs are given as their A-label (punycode). Shared
+// by CIMD_ALLOWED_HOSTS and the client_id URL so the two cannot disagree.
+func CheckHostname(name string) error {
+	for label := range strings.SplitSeq(name, ".") {
+		switch {
+		case label == "":
+			return errors.New("empty label")
+		case len(label) > 63:
+			return errors.New("label longer than 63 characters")
+		case label[0] == '-' || label[len(label)-1] == '-':
+			return errors.New("label starts or ends with a hyphen")
+		}
+		for _, c := range label {
+			if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
+				return fmt.Errorf("invalid character %q in hostname", c)
+			}
+		}
+	}
+	return nil
 }
 
 // weakSecretReason returns a non-empty human-readable reason when b

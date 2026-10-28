@@ -69,6 +69,10 @@ type TokenConfig struct {
 	// Documents). A bool, not the resolver: /token never fetches, the
 	// sealed code or refresh already pins the URL.
 	CIMDEnabled bool
+	// CIMDAllowedHosts (CIMD_ALLOWED_HOSTS) is re-checked on both grants,
+	// like the redirect lists: narrowing it ends the sessions of clients
+	// published outside it.
+	CIMDAllowedHosts config.CIMDHostAllowlist
 }
 
 // idpClaimReleaseTimeout bounds the release of a single-use claim after
@@ -212,7 +216,7 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 		return
 	}
 
-	client := openAndValidateClient(w, r, tm, logger, clientIDStr, audience, cfg.CIMDEnabled)
+	client := openAndValidateClient(w, r, tm, logger, clientIDStr, audience, cfg)
 	if client == nil {
 		return
 	}
@@ -469,7 +473,7 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 		return
 	}
 
-	client := openAndValidateClient(w, r, tm, logger, clientIDStr, audience, cfg.CIMDEnabled)
+	client := openAndValidateClient(w, r, tm, logger, clientIDStr, audience, cfg)
 	if client == nil {
 		return
 	}
