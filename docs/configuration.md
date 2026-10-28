@@ -138,6 +138,12 @@ ones operators most often want to wire up.
 - `mcp_auth_tokens_issued_total{grant_type}` — access tokens minted,
   by `authorization_code` / `refresh_token`.
 - `mcp_auth_clients_registered_total` — RFC 7591 registrations.
+- `mcp_auth_cimd_fetch_total{result}` — Client ID Metadata Document
+  resolutions (an `https://` `client_id`): `ok`, `url_invalid`,
+  `ssrf_blocked` (the name resolved to a
+  special-purpose address; a sustained rate is a probe), `fetch_error`,
+  `too_large`, `doc_invalid`, `auth_method_unsupported`. The
+  `cimd_resolve_failed` WARN carries `client_id_host` and `reason`.
 
 PromQL recipes:
 

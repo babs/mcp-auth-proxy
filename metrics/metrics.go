@@ -94,6 +94,17 @@ var (
 		Help: "Dynamic client registrations accepted.",
 	})
 
+	// CIMDFetch counts Client ID Metadata Document resolutions (an https
+	// client_id, MCP Authorization 2026-07-28), by result: ok, url_invalid,
+	// ssrf_blocked, fetch_error, too_large, doc_invalid,
+	// auth_method_unsupported. handlers/cimd.go holds the classification.
+	// A sustained ssrf_blocked rate is a probe; fetch_error with steady
+	// ok is a client whose metadata host is down.
+	CIMDFetch = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "mcp_auth_cimd_fetch_total",
+		Help: "Client ID Metadata Document resolutions, by result.",
+	}, []string{"result"})
+
 	// PageRenderFailed counts proxy-rendered pages whose template failed
 	// to execute, plus interstitial navigation targets it refused. Labelled
 	// by page, because the three fail differently: the error page falls back

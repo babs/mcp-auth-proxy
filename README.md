@@ -277,6 +277,8 @@ ordering) live in [`specs.md`](./specs.md).
     not a 4xx) — alert on sustained rate, not single ticks
   - `mcp_auth_rate_limited_total{endpoint}` — pre-auth httprate 429s
   - `mcp_auth_idp_exchange_throttled_total` — outbound bucket denials
+  - `mcp_auth_cimd_fetch_total{result}` — Client ID Metadata Document
+    resolutions (`https://` client_ids); `ssrf_blocked` is a probe signal
   - `mcp_auth_clients_registered_total`, `mcp_auth_token_seals_total{purpose}`,
     `mcp_auth_groups_claim_shape_mismatch_total`
   - `mcp_auth_rpc_calls_total{tool}` and friends — opt-in via
