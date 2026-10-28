@@ -8,9 +8,11 @@ import (
 	"encoding/base64"
 	"errors"
 	"net/http"
+	"slices"
 	"strconv"
 	"time"
 
+	"github.com/babs/mcp-auth-proxy/config"
 	"github.com/babs/mcp-auth-proxy/metrics"
 	"github.com/babs/mcp-auth-proxy/replay"
 	"github.com/babs/mcp-auth-proxy/token"
@@ -57,6 +59,10 @@ type TokenConfig struct {
 	// refresh id_token re-applies the same identity policy as sign-in.
 	GroupsClaim   string
 	AllowedGroups []string
+	// RedirectURIsAllowlist (REDIRECT_URIS_ALLOWLIST) is re-checked on
+	// both grants, so narrowing it ends, within one access-token
+	// lifetime, the sessions whose redirect URI it no longer admits.
+	RedirectURIsAllowlist config.WebRedirectAllowlist
 }
 
 // idpClaimReleaseTimeout bounds the release of a single-use claim after
@@ -215,6 +221,12 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 		return
 	}
 
+	// Before the single-use claim below, so a refused code burns nothing.
+	if !registeredRedirectAllowed(code.RedirectURI, cfg.RedirectURIsAllowlist) {
+		denyGrantNotAllowlisted(w, r, logger, client, "authorization_code")
+		return
+	}
+
 	// Every code must carry a TokenID (single-use key for the replay store)
 	// AND a FamilyID (seed for the refresh-rotation lineage, used to
 	// revoke the whole family on code reuse per RFC 6749 §4.1.2).
@@ -348,8 +360,9 @@ func handleAuthorizationCode(w http.ResponseWriter, r *http.Request, tm *token.M
 		// every descendant access + refresh in the lineage. Once
 		// minted at /authorize the binding is invariant for the
 		// life of the family.
-		Resource: code.Resource,
-		IssuedAt: now,
+		Resource:         code.Resource,
+		RedirectURIIndex: slices.IndexFunc(client.RedirectURIs, func(uri string) bool { return redirectURIMatches(code.RedirectURI, uri) }) + 1,
+		IssuedAt:         now,
 		// FamilyIssuedAt is set ONCE here at code redemption and
 		// inherited unchanged by every rotation. REVOKE_BEFORE is
 		// compared against this stamp so a steadily rotating
@@ -456,6 +469,12 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 
 	if client.ID != refresh.ClientID {
 		writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "client_id mismatch")
+		return
+	}
+
+	// Before the family claim, so a refused refresh burns nothing.
+	if !refreshRedirectAllowed(&refresh, client, cfg.RedirectURIsAllowlist) {
+		denyGrantNotAllowlisted(w, r, logger, client, "refresh_token")
 		return
 	}
 
@@ -587,19 +606,20 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request, tm *token.Manage
 		familyIssuedAt = refresh.IssuedAt
 	}
 	newRefresh := sealedRefresh{
-		TokenID:         uuid.New().String(),
-		FamilyID:        refresh.FamilyID,
-		Subject:         refresh.Subject,
-		Email:           email,
-		Groups:          groups,
-		ClientID:        client.ID,
-		Typ:             token.PurposeRefresh,
-		Audience:        audience,
-		Resource:        refresh.Resource,
-		IssuedAt:        now,
-		FamilyIssuedAt:  familyIssuedAt,
-		ExpiresAt:       now.Add(refreshTokenTTL),
-		IdPRefreshToken: idpRefreshToken,
+		TokenID:          uuid.New().String(),
+		FamilyID:         refresh.FamilyID,
+		Subject:          refresh.Subject,
+		Email:            email,
+		Groups:           groups,
+		ClientID:         client.ID,
+		Typ:              token.PurposeRefresh,
+		Audience:         audience,
+		Resource:         refresh.Resource,
+		RedirectURIIndex: refresh.RedirectURIIndex,
+		IssuedAt:         now,
+		FamilyIssuedAt:   familyIssuedAt,
+		ExpiresAt:        now.Add(refreshTokenTTL),
+		IdPRefreshToken:  idpRefreshToken,
 	}
 	newRefreshToken, err := sealRefreshToken(tm, cfg.ForwardIdPToken, newRefresh)
 	if err != nil {
@@ -685,6 +705,31 @@ func sealRefreshToken(tm *token.Manager, forward bool, sr sealedRefresh) (string
 		err = token.ErrSealedTooLarge
 	}
 	return sealed, err
+}
+
+// refreshRedirectAllowed judges the registered redirect URI the
+// session's code was issued for. A refresh token without that index
+// (sealed before it existed, or rotated by such a release) passes only if
+// every registered URI is still admitted: one listed sibling must not
+// keep alive a session obtained through an unlisted URI.
+func refreshRedirectAllowed(refresh *sealedRefresh, client *sealedClient, allow config.WebRedirectAllowlist) bool {
+	if i := refresh.RedirectURIIndex; i >= 1 && i <= len(client.RedirectURIs) {
+		return registeredRedirectAllowed(client.RedirectURIs[i-1], allow)
+	}
+	for _, uri := range client.RedirectURIs {
+		if !registeredRedirectAllowed(uri, allow) {
+			return false
+		}
+	}
+	return true
+}
+
+// denyGrantNotAllowlisted refuses a grant REDIRECT_URIS_ALLOWLIST no
+// longer admits; same reason and error_code as the /authorize re-check.
+func denyGrantNotAllowlisted(w http.ResponseWriter, r *http.Request, logger *zap.Logger, client *sealedClient, grantType string) {
+	recordClientDenial(logger, "redirect_uri_not_allowlisted",
+		zap.String("internal_id", client.ID), zap.Error(errNotInWebAllowlist), zap.String("grant_type", grantType))
+	writeOAuthError(w, r, http.StatusBadRequest, "invalid_grant", "client redirect_uri is no longer allowlisted by the operator", codeRedirectURIMismatch)
 }
 
 // writeRefreshSealFailure answers a refresh token that could not be

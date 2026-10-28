@@ -2435,6 +2435,127 @@ func TestRedirectAllowlist_NeverAllowsHTTP(t *testing.T) {
 	}
 }
 
+// TestLoad_RedirectURIsAllowlist pins the REDIRECT_URIS_ALLOWLIST
+// contract: exact http(s) URIs that /register would accept on their own,
+// everything else fails startup with a reason-specific error.
+func TestLoad_RedirectURIsAllowlist(t *testing.T) {
+	exact := func(requested, entry string) bool { return requested == entry }
+
+	t.Run("unset yields no restriction", func(t *testing.T) {
+		setAllRequired(t)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(cfg.RedirectURIsAllowlist.Entries()) != 0 || !cfg.RedirectURIsAllowlist.Allows("https://any.example/cb", exact) {
+			t.Errorf("Entries = %v; want empty and every URI allowed", cfg.RedirectURIsAllowlist.Entries())
+		}
+	})
+
+	t.Run("blank-only value yields no restriction", func(t *testing.T) {
+		setAllRequired(t)
+		t.Setenv("REDIRECT_URIS_ALLOWLIST", " , ,")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(cfg.RedirectURIsAllowlist.Entries()) != 0 {
+			t.Errorf("Entries = %v for a blank-only value, want empty", cfg.RedirectURIsAllowlist.Entries())
+		}
+	})
+
+	t.Run("accepts https and loopback http entries", func(t *testing.T) {
+		setAllRequired(t)
+		t.Setenv("REDIRECT_URIS_ALLOWLIST", " https://app.example.com/oauth/callback , , http://127.0.0.1/cb , http://localhost/cb?x=1 , http://[::1]/cb , http://localhost./cb , HTTPS://App.Example.com/cb , https://app.example.com/oauth/callback , https://App.Example.com/cb , https://app.example.com:8443/cb , https://x/"+strings.Repeat("a", 502))
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// Scheme lower-cased, host case kept; duplicates (after lower-casing)
+		// dropped; a non-loopback port stays; 512 chars is the inclusive cap.
+		want := []string{"https://app.example.com/oauth/callback", "http://127.0.0.1/cb", "http://localhost/cb?x=1", "http://[::1]/cb", "http://localhost./cb", "https://App.Example.com/cb", "https://app.example.com:8443/cb", "https://x/" + strings.Repeat("a", 502)}
+		if !slices.Equal(cfg.RedirectURIsAllowlist.Entries(), want) {
+			t.Errorf("Entries = %v, want %v", cfg.RedirectURIsAllowlist.Entries(), want)
+		}
+	})
+
+	for _, bad := range []struct {
+		name, val, wantErr string
+	}{
+		{"wildcard host", "https://*.example.com/cb", "wildcards are not supported"},
+		{"wildcard path", "https://app.example.com/*", "wildcards are not supported"},
+		{"bare wildcard", "*", "wildcards are not supported"},
+		{"custom scheme", "warp://dev.warp.Warp-Stable/mcp/callback", `scheme "warp" is not http or https; list custom-scheme URIs in REDIRECT_URIS_EXTRA`},
+		{"no scheme", "app.example.com/cb", "missing or invalid scheme"},
+		{"empty scheme", "://app.example.com/cb", "malformed URI"},
+		{"loopback with port", "http://127.0.0.1:8080/cb", "loopback entries match any port; drop the port"},
+		{"ipv6 loopback with port", "http://[::1]:1/cb", "loopback entries match any port; drop the port"},
+		{"https loopback with port", "https://localhost:8443/cb", "loopback entries match any port; drop the port"},
+		{"opaque", "https:app.example.com", "must not be opaque"},
+		{"no host", "https:///cb", "must include a host"},
+		{"fragment", "https://app.example.com/cb#frag", "must not contain a fragment"},
+		{"trailing bare #", "https://app.example.com/cb#", "must not contain a fragment"},
+		{"userinfo", "https://user@app.example.com/cb", "must not contain userinfo"},
+		{"http non-loopback", "http://app.example.com/cb", "must use HTTPS for non-loopback addresses"},
+		{"http lookalike loopback", "http://localhost.evil.example/cb", "must use HTTPS for non-loopback addresses"},
+		{"garbage", "https://app.example.com/%zz", "malformed URI"},
+		{"513 chars", "https://x/" + strings.Repeat("a", 503), "exceeds maximum length"},
+	} {
+		t.Run("rejects "+bad.name, func(t *testing.T) {
+			setAllRequired(t)
+			t.Setenv("REDIRECT_URIS_ALLOWLIST", "https://ok.example/cb,"+bad.val)
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("Load() unexpectedly succeeded for %q", bad.val)
+			}
+			if !strings.HasPrefix(err.Error(), "REDIRECT_URIS_ALLOWLIST: ") || !strings.Contains(err.Error(), bad.wantErr) {
+				t.Errorf("error = %q, want REDIRECT_URIS_ALLOWLIST prefix and %q", err, bad.wantErr)
+			}
+		})
+	}
+}
+
+// TestWebRedirectAllowlist_Allows pins the matching contract: an empty
+// list admits everything (even an unparsable URI), the scheme is
+// case-insensitive, and the loopback rule runs for loopback URIs only.
+func TestWebRedirectAllowlist_Allows(t *testing.T) {
+	var empty WebRedirectAllowlist
+	never := func(string, string) bool { t.Fatal("loopback rule called on an empty list"); return false }
+	if !empty.Allows("https://app.example.com/%zz", never) {
+		t.Error("empty list refused an unparsable URI")
+	}
+
+	a, err := ParseWebRedirectAllowlist("https://allowed.example/cb,http://127.0.0.1/cb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var loopbackCalls []string
+	relaxed := func(requested, entry string) bool {
+		loopbackCalls = append(loopbackCalls, requested, entry)
+		return entry == "http://127.0.0.1/cb" && requested == "http://127.0.0.1:5000/cb"
+	}
+	for raw, want := range map[string]bool{
+		"https://allowed.example/cb":  true,
+		"HTTPS://allowed.example/cb":  true,
+		"https://ALLOWED.example/cb":  false,
+		"https://allowed.example/cbx": false,
+		"https://other.example/cb":    false,
+		"https://allowed.example/%zz": false,
+		"HTTP://127.0.0.1:5000/cb":    true,
+		"http://127.0.0.1:6000/cb":    false,
+	} {
+		if got := a.Allows(raw, relaxed); got != want {
+			t.Errorf("Allows(%q) = %v, want %v", raw, got, want)
+		}
+	}
+	// Requests and entries alike: the rule runs on loopback pairs only.
+	for _, uri := range loopbackCalls {
+		if !strings.HasPrefix(uri, "http://127.0.0.1") {
+			t.Errorf("loopback rule called with non-loopback %q", uri)
+		}
+	}
+}
+
 // TestDocs_DeniedRedirectSchemesEnumerated keeps the denylist in the
 // REDIRECT_URIS_EXTRA rows equal to the one an operator would hit blind.
 func TestDocs_DeniedRedirectSchemesEnumerated(t *testing.T) {

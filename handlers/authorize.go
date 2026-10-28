@@ -61,6 +61,10 @@ type AuthorizeConfig struct {
 	// authorizations for clients registered under it (issued refresh
 	// tokens stay valid until expiry; set REVOKE_BEFORE to invalidate them).
 	RedirectURIsExtra config.RedirectAllowlist
+	// RedirectURIsAllowlist is re-checked here for http(s) redirects, as
+	// RedirectURIsExtra is for custom schemes: setting or narrowing it
+	// blocks new authorizations for clients registered before the change.
+	RedirectURIsAllowlist config.WebRedirectAllowlist
 }
 
 // Authorize handles GET /authorize (OAuth 2.1 PKCE authorization request).
@@ -148,7 +152,7 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 			return
 		}
 
-		customScheme, ok := checkAuthorizeRedirect(w, r, logger, &client, redirectURI, authzCfg.RedirectURIsExtra)
+		customScheme, ok := checkAuthorizeRedirect(w, r, logger, &client, redirectURI, authzCfg)
 		if !ok {
 			return
 		}
@@ -378,7 +382,7 @@ func logUnknownOIDCParams(logger *zap.Logger, q url.Values) {
 // checkAuthorizeRedirect validates redirect_uri against the client's
 // registration, rendering the error on the AS (the target is not yet
 // trusted). customScheme is meaningful only when ok.
-func checkAuthorizeRedirect(w http.ResponseWriter, r *http.Request, logger *zap.Logger, client *sealedClient, redirectURI string, extra config.RedirectAllowlist) (customScheme, ok bool) {
+func checkAuthorizeRedirect(w http.ResponseWriter, r *http.Request, logger *zap.Logger, client *sealedClient, redirectURI string, authzCfg AuthorizeConfig) (customScheme, ok bool) {
 	if redirectURI == "" {
 		recordClientDenial(logger, "redirect_uri_missing")
 		writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "redirect_uri is required", codeRedirectURIMissing)
@@ -398,17 +402,27 @@ func checkAuthorizeRedirect(w http.ResponseWriter, r *http.Request, logger *zap.
 
 	u, err := url.Parse(redirectURI)
 	if err == nil && config.IsWebScheme(u.Scheme) {
+		if !webRedirectAllowed(redirectURI, authzCfg.RedirectURIsAllowlist) {
+			denyNotAllowlisted(w, r, logger, client, u, errNotInWebAllowlist)
+			return false, false
+		}
 		return false, true
 	}
-	if checkErr := extra.Check(redirectURI); checkErr != nil {
-		fields := []zap.Field{zap.String("internal_id", client.ID), zap.Error(checkErr)}
-		if u != nil {
-			fields = append(fields, zap.String("scheme", u.Scheme))
-		}
-		recordClientDenial(logger, "redirect_uri_not_allowlisted", fields...)
-		writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "redirect_uri is not allowlisted by the operator", codeRedirectURIMismatch)
+	if checkErr := authzCfg.RedirectURIsExtra.Check(redirectURI); checkErr != nil {
+		denyNotAllowlisted(w, r, logger, client, u, checkErr)
 		return false, false
 	}
 	// Check rejects unparsable URIs, so reaching here means a parsed custom scheme.
 	return true, true
+}
+
+// denyNotAllowlisted refuses, on the AS, a registered redirect_uri that
+// the operator's current lists no longer accept. u may be nil.
+func denyNotAllowlisted(w http.ResponseWriter, r *http.Request, logger *zap.Logger, client *sealedClient, u *url.URL, cause error) {
+	fields := []zap.Field{zap.String("internal_id", client.ID), zap.Error(cause)}
+	if u != nil {
+		fields = append(fields, zap.String("scheme", u.Scheme))
+	}
+	recordClientDenial(logger, "redirect_uri_not_allowlisted", fields...)
+	writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "redirect_uri is not allowlisted by the operator", codeRedirectURIMismatch)
 }

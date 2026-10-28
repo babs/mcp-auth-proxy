@@ -3,7 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"net"
+	"errors"
 	"net/http"
 	"net/url"
 	"strings"
@@ -297,8 +297,16 @@ type sealedRefresh struct {
 	// must remain bound to the same RFC 8707 resource the client
 	// requested at /authorize. Empty on refresh tokens sealed before
 	// this field existed.
-	Resource string    `json:"res,omitempty"`
-	IssuedAt time.Time `json:"iat"`
+	Resource string `json:"res,omitempty"`
+	// RedirectURIIndex is the 1-based position, in the client's
+	// registered redirect_uris, of the one the originating code was
+	// issued for; inherited across rotations, so the refresh grant
+	// re-checks REDIRECT_URIS_ALLOWLIST against the URI this session
+	// used. An index, not the URI, so a long redirect URI cannot make the
+	// refresh token outgrow its code (both share one open() size cap). 0
+	// on refresh tokens sealed before this field existed.
+	RedirectURIIndex int       `json:"rui,omitempty"`
+	IssuedAt         time.Time `json:"iat"`
 	// FamilyIssuedAt is the IssuedAt of the FIRST refresh in this
 	// rotation lineage (the one minted at code redemption) and is
 	// inherited verbatim by every rotated descendant. REVOKE_BEFORE
@@ -593,22 +601,30 @@ func redirectURIMatches(requested, registered string) bool {
 	return true
 }
 
-// isLoopback returns true if the URL targets a loopback address, which
-// is exempt from the HTTPS requirement per OAuth 2.1 §2.3.1.
-//
-// M7: the previous implementation only matched "localhost", "127.0.0.1"
-// and "::1" verbatim, missing 127.0.0.0/8 (RFC 1122), IPv4-mapped IPv6
-// loopback (::ffff:127.0.0.1), and the trailing-dot FQDN form
-// ("localhost."). net.ParseIP().IsLoopback() handles the IP family
-// correctly; "localhost" is matched literally after stripping one
-// trailing dot so both "localhost" and "localhost." are accepted.
-func isLoopback(u *url.URL) bool {
-	host := strings.TrimSuffix(u.Hostname(), ".")
-	if host == "localhost" {
+// errNotInWebAllowlist is the log cause when REDIRECT_URIS_ALLOWLIST
+// refuses an http(s) redirect URI at /authorize or /token.
+var errNotInWebAllowlist = errors.New("not in REDIRECT_URIS_ALLOWLIST")
+
+// webRedirectAllowed reports whether REDIRECT_URIS_ALLOWLIST admits the
+// http(s) redirect URI raw, with redirectURIMatches as the loopback rule
+// so /register, /authorize and /token cannot disagree.
+func webRedirectAllowed(raw string, allow config.WebRedirectAllowlist) bool {
+	return allow.Allows(raw, redirectURIMatches)
+}
+
+// registeredRedirectAllowed reports whether REDIRECT_URIS_ALLOWLIST still
+// admits a registered redirect URI, or one a code was issued for under
+// it. Custom schemes are not judged by this list; REDIRECT_URIS_EXTRA
+// governs them.
+func registeredRedirectAllowed(uri string, allow config.WebRedirectAllowlist) bool {
+	if u, err := url.Parse(uri); err == nil && !config.IsWebScheme(u.Scheme) {
 		return true
 	}
-	if ip := net.ParseIP(host); ip != nil {
-		return ip.IsLoopback()
-	}
-	return false
+	return webRedirectAllowed(uri, allow)
+}
+
+// isLoopback returns true if the URL targets a loopback address, which
+// is exempt from the HTTPS requirement per OAuth 2.1 §2.3.1.
+func isLoopback(u *url.URL) bool {
+	return config.IsLoopbackHost(u.Hostname())
 }

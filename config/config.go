@@ -222,6 +222,12 @@ type Config struct {
 	// https / loopback-http rules. env: REDIRECT_URIS_EXTRA,
 	// comma-separated exact URIs or `<scheme>://*`.
 	RedirectURIsExtra RedirectAllowlist
+	// RedirectURIsAllowlist, when set, limits the http(s) redirect URIs
+	// /register, /authorize and /token accept to the listed ones (loopback
+	// entries match any port, RFC 8252 §7.3). Custom schemes stay under
+	// RedirectURIsExtra. env: REDIRECT_URIS_ALLOWLIST, comma-separated
+	// exact URIs.
+	RedirectURIsAllowlist WebRedirectAllowlist
 	// secretWeakWarning is non-empty when TOKEN_SIGNING_SECRET matches
 	// an obvious-weakness pattern (all-same byte, or short repeating
 	// period). Exposed via
@@ -602,6 +608,10 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("REDIRECT_URIS_EXTRA: %w", err)
 	}
+	c.RedirectURIsAllowlist, err = ParseWebRedirectAllowlist(os.Getenv("REDIRECT_URIS_ALLOWLIST"))
+	if err != nil {
+		return nil, fmt.Errorf("REDIRECT_URIS_ALLOWLIST: %w", err)
+	}
 
 	c.PerSubjectConcurrency = 16
 	if v := os.Getenv("MCP_PER_SUBJECT_CONCURRENCY"); v != "" {
@@ -775,8 +785,9 @@ func (a RedirectAllowlist) Check(raw string) error {
 	return err
 }
 
-// MaxRedirectURILength caps a redirect URI at /register and an exact
-// REDIRECT_URIS_EXTRA entry, so a listed entry is always registrable.
+// MaxRedirectURILength caps a redirect URI at /register and an entry of
+// REDIRECT_URIS_EXTRA or REDIRECT_URIS_ALLOWLIST, so a listed entry is
+// always registrable.
 const MaxRedirectURILength = 512
 
 var (
@@ -929,6 +940,156 @@ func parseExactRedirect(e string) (string, error) {
 		return "", fmt.Errorf("%q: %w", e, err)
 	}
 	return norm, nil
+}
+
+// Errors CheckRedirectShape returns; /register maps each to a fixed
+// description. Adding one: add a case in handlers.writeRedirectShapeError
+// and its test.
+var (
+	ErrRedirectTooLong         = errors.New("exceeds maximum length")
+	ErrRedirectMalformed       = errors.New("malformed URI")
+	ErrRedirectOpaque          = errors.New("must not be opaque")
+	ErrRedirectNoHost          = errors.New("must include a host")
+	ErrRedirectFragment        = errors.New("must not contain a fragment")
+	ErrRedirectUserinfo        = errors.New("must not contain userinfo")
+	ErrRedirectHTTPNotLoopback = errors.New("must use HTTPS for non-loopback addresses")
+)
+
+// CheckRedirectShape applies the redirect URI rules /register enforces
+// before any operator list, and returns the parsed URI. Custom schemes
+// get their remaining checks from RedirectAllowlist.Check. Shared with
+// the REDIRECT_URIS_ALLOWLIST startup check, so a listed entry is always
+// registrable.
+//
+// OAuth 2.1 §2.3.1: non-loopback redirect URIs must use HTTPS. Fragments
+// are forbidden by OAuth 2.1 §7.5; userinfo amplifies phishing
+// (https://attacker:pass@legit.example/cb visually legit).
+func CheckRedirectShape(raw string) (*url.URL, error) {
+	if len(raw) > MaxRedirectURILength {
+		return nil, fmt.Errorf("%w (%d characters)", ErrRedirectTooLong, MaxRedirectURILength)
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrRedirectMalformed, err)
+	}
+	// url.Parse("https:foo") → Opaque="foo"; url.Parse("https:///x") →
+	// Host="". Neither is a valid http(s) redirect target per RFC 3986
+	// §3, and /callback would emit a broken Location header for them.
+	if u.Opaque != "" {
+		return nil, ErrRedirectOpaque
+	}
+	if IsWebScheme(u.Scheme) && u.Host == "" {
+		return nil, ErrRedirectNoHost
+	}
+	// Also trip on a trailing bare "#" (url.Parse leaves Fragment
+	// empty for "https://x/cb#" even though the marker is present).
+	if u.Fragment != "" || strings.Contains(raw, "#") {
+		return nil, ErrRedirectFragment
+	}
+	if u.User != nil {
+		return nil, ErrRedirectUserinfo
+	}
+	if u.Scheme == "http" && !IsLoopbackHost(u.Hostname()) {
+		return nil, ErrRedirectHTTPNotLoopback
+	}
+	return u, nil
+}
+
+// WebRedirectAllowlist holds operator-approved http(s) redirect URIs,
+// scheme lower-cased. Empty means no restriction.
+type WebRedirectAllowlist struct {
+	entries []string
+	// loopback holds the loopback entries again, so a loopback request
+	// runs the relaxed rule against those only.
+	loopback []string
+}
+
+// Entries returns the validated entries (scheme lower-cased), for
+// startup logging.
+func (a WebRedirectAllowlist) Entries() []string {
+	return slices.Clone(a.entries)
+}
+
+// Allows reports whether the list admits the http(s) redirect URI raw:
+// always when the list is empty; otherwise when raw equals an entry
+// (scheme case-insensitive) or, for a loopback raw only, when
+// loopbackMatch(raw, entry) holds — the caller passes the loopback rule
+// /authorize applies to registered URIs.
+func (a WebRedirectAllowlist) Allows(raw string, loopbackMatch func(requested, entry string) bool) bool {
+	if len(a.entries) == 0 {
+		return true
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	raw = lowerScheme(raw, u)
+	if slices.Contains(a.entries, raw) {
+		return true
+	}
+	return IsLoopbackHost(u.Hostname()) && slices.ContainsFunc(a.loopback, func(e string) bool { return loopbackMatch(raw, e) })
+}
+
+// ParseWebRedirectAllowlist parses REDIRECT_URIS_ALLOWLIST:
+// comma-separated exact http(s) URIs, each one /register would accept.
+func ParseWebRedirectAllowlist(raw string) (WebRedirectAllowlist, error) {
+	var a WebRedirectAllowlist
+	for _, e := range strings.Split(raw, ",") {
+		e = strings.TrimSpace(e)
+		if e == "" {
+			continue
+		}
+		norm, loopback, err := checkWebRedirectEntry(e)
+		if err != nil {
+			return WebRedirectAllowlist{}, fmt.Errorf("%q: %w", e, err)
+		}
+		if slices.Contains(a.entries, norm) {
+			continue
+		}
+		a.entries = append(a.entries, norm)
+		if loopback {
+			a.loopback = append(a.loopback, norm)
+		}
+	}
+	return a, nil
+}
+
+// checkWebRedirectEntry returns e with its scheme lower-cased and
+// whether it is a loopback entry, or why it cannot be an entry.
+func checkWebRedirectEntry(e string) (string, bool, error) {
+	if strings.Contains(e, "*") {
+		return "", false, errors.New("wildcards are not supported; list each redirect URI")
+	}
+	u, err := CheckRedirectShape(e)
+	if err != nil {
+		return "", false, err
+	}
+	loopback := IsLoopbackHost(u.Hostname())
+	switch {
+	case u.Scheme == "":
+		return "", false, errors.New("missing or invalid scheme")
+	case !IsWebScheme(u.Scheme):
+		return "", false, fmt.Errorf("scheme %q is not http or https; list custom-scheme URIs in REDIRECT_URIS_EXTRA", u.Scheme)
+	// A loopback entry matches any port (RFC 8252 §7.3); a port here
+	// would read as a restriction that does not exist.
+	case loopback && u.Port() != "":
+		return "", false, errors.New("loopback entries match any port; drop the port")
+	}
+	return lowerScheme(e, u), loopback, nil
+}
+
+// IsLoopbackHost reports whether host (a URL hostname, port stripped) is
+// a loopback address: the 127/8 range and its IPv4-mapped form
+// (::ffff:127.0.0.1), ::1, or the literal localhost with at most one
+// trailing dot. net.IP.IsLoopback covers the IP forms; a verbatim list of
+// "127.0.0.1" and "::1" would miss the rest of 127/8 and the mapped form.
+func IsLoopbackHost(host string) bool {
+	host = strings.TrimSuffix(host, ".")
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // weakSecretReason returns a non-empty human-readable reason when b

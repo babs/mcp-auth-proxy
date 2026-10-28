@@ -135,6 +135,13 @@ data:
   # enforces PKCE S256 for custom schemes. Set only after every replica runs this release.
   # REDIRECT_URIS_EXTRA: "warp://*"
 
+  # Comma-separated http(s) redirect URIs /register accepts; once set, every
+  # other https or loopback URI is refused (custom schemes stay under
+  # REDIRECT_URIS_EXTRA). Exact match, scheme case-insensitive; loopback
+  # entries match any port and are written without one. /authorize and
+  # /token re-check it. Set only after every replica runs this release.
+  # REDIRECT_URIS_ALLOWLIST: "https://agents.example.com/oauth/callback"
+
   # Access-log path filter (public listener only). Go RE2 regexp matched
   # against r.URL.Path; matches are dropped from the access log. Handler
   # response, Prometheus counters, and panic recovery are unaffected.

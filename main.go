@@ -96,6 +96,7 @@ func main() {
 		// which upstream audience the IdP is asked for.
 		zap.Strings("oidc_extra_scopes", cfg.OIDCExtraScopes),
 		zap.Strings("redirect_uris_extra", cfg.RedirectURIsExtra.Entries()),
+		zap.Strings("redirect_uris_allowlist", cfg.RedirectURIsAllowlist.Entries()),
 		zap.String("access_log_skip_re", accessLogSkipPattern(cfg.AccessLogSkipRE)),
 		// Surface the per-tool metrics toggle so an operator inspecting
 		// startup logs can confirm `MCP_TOOL_METRICS=true` actually took
@@ -328,16 +329,8 @@ func main() {
 	}
 
 	registerOAuthRoutes(r, oauthRoutes{
-		Register: handlers.Register(tm, logger, cfg.ProxyBaseURL, handlers.RegisterConfig{ClientTTL: cfg.ClientRegistrationTTL, RedirectURIsExtra: cfg.RedirectURIsExtra}),
-		Authorize: handlers.Authorize(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, handlers.AuthorizeConfig{
-			PKCERequired:         cfg.PKCERequired,
-			ResourceURIs:         []string{cfg.ProxyBaseURL + cfg.UpstreamMCPMountPath},
-			CanonicalResource:    cfg.ProxyBaseURL + cfg.UpstreamMCPMountPath,
-			CompatAllowStateless: cfg.CompatAllowStateless,
-			RenderConsentPage:    cfg.RenderConsentPage,
-			ResourceName:         cfg.ResourceName,
-			RedirectURIsExtra:    cfg.RedirectURIsExtra,
-		}),
+		Register:  handlers.Register(tm, logger, cfg.ProxyBaseURL, newRegisterConfig(cfg)),
+		Authorize: handlers.Authorize(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, newAuthorizeConfig(cfg)),
 		Consent: handlers.Consent(tm, logger, cfg.ProxyBaseURL, oauth2Cfg, handlers.ConsentConfig{
 			ReplayStore:  replayStore,
 			ResourceName: cfg.ResourceName,
@@ -1035,6 +1028,31 @@ func newAuthMiddleware(cfg *config.Config, tm *token.Manager, logger *zap.Logger
 	return authMW
 }
 
+// newRegisterConfig builds the /register settings; a redirect list dropped
+// here fails open (pinned by TestRedirectPolicyWiring).
+func newRegisterConfig(cfg *config.Config) handlers.RegisterConfig {
+	return handlers.RegisterConfig{
+		ClientTTL:             cfg.ClientRegistrationTTL,
+		RedirectURIsExtra:     cfg.RedirectURIsExtra,
+		RedirectURIsAllowlist: cfg.RedirectURIsAllowlist,
+	}
+}
+
+// newAuthorizeConfig builds the /authorize settings; same fail-open
+// caveat as newRegisterConfig.
+func newAuthorizeConfig(cfg *config.Config) handlers.AuthorizeConfig {
+	return handlers.AuthorizeConfig{
+		PKCERequired:          cfg.PKCERequired,
+		ResourceURIs:          []string{cfg.ProxyBaseURL + cfg.UpstreamMCPMountPath},
+		CanonicalResource:     cfg.ProxyBaseURL + cfg.UpstreamMCPMountPath,
+		CompatAllowStateless:  cfg.CompatAllowStateless,
+		RenderConsentPage:     cfg.RenderConsentPage,
+		ResourceName:          cfg.ResourceName,
+		RedirectURIsExtra:     cfg.RedirectURIsExtra,
+		RedirectURIsAllowlist: cfg.RedirectURIsAllowlist,
+	}
+}
+
 func newCallbackConfig(cfg *config.Config, replayStore replay.Store, idpLimiter *rate.Limiter) handlers.CallbackConfig {
 	return handlers.CallbackConfig{
 		AllowedGroups:      cfg.AllowedGroups,
@@ -1047,13 +1065,14 @@ func newCallbackConfig(cfg *config.Config, replayStore replay.Store, idpLimiter 
 
 func newTokenConfig(cfg *config.Config, idpRefresher *handlers.IdPRefresher, idpLimiter *rate.Limiter, verify func(context.Context, string) (*oidc.IDToken, error)) handlers.TokenConfig {
 	return handlers.TokenConfig{
-		RefreshRaceGrace:   cfg.RefreshRaceGrace,
-		ForwardIdPToken:    cfg.UpstreamForwardIdPToken,
-		IdPRefresher:       idpRefresher,
-		IdPExchangeLimiter: idpLimiter,
-		VerifyIDToken:      verify,
-		GroupsClaim:        cfg.GroupsClaim,
-		AllowedGroups:      cfg.AllowedGroups,
+		RefreshRaceGrace:      cfg.RefreshRaceGrace,
+		ForwardIdPToken:       cfg.UpstreamForwardIdPToken,
+		IdPRefresher:          idpRefresher,
+		IdPExchangeLimiter:    idpLimiter,
+		VerifyIDToken:         verify,
+		GroupsClaim:           cfg.GroupsClaim,
+		AllowedGroups:         cfg.AllowedGroups,
+		RedirectURIsAllowlist: cfg.RedirectURIsAllowlist,
 	}
 }
 
