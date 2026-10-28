@@ -294,6 +294,7 @@ func TestToken_CIMDClientBinding(t *testing.T) {
 			t.Errorf("got %d %+v, want 400 client_id mismatch", rr.Code, body)
 		}
 	})
+	// MAP-002-AC9: the DCR path is untouched by the CIMD wiring.
 	t.Run("sealed client_id still opens", func(t *testing.T) {
 		encClientID, internalID := registerClient(t, tm, []string{cimdAppRedirect})
 		form := cimdCodeForm(t, tm, internalID, cimdAppRedirect)
