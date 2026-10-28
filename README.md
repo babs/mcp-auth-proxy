@@ -128,7 +128,8 @@ this in front, point it at your existing IdP, done.
 | [RFC 7591](https://datatracker.ietf.org/doc/html/rfc7591) | Dynamic Client Registration on `POST /register` |
 | [RFC 7636](https://datatracker.ietf.org/doc/html/rfc7636) | PKCE S256, 43-128 char verifier |
 | [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707.html) | `resource` indicator on `/authorize` and `/token` |
-| [MCP Authorization 2025-06-18](https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization) | End-to-end MCP auth flow |
+| [RFC 9207](https://datatracker.ietf.org/doc/html/rfc9207) | `iss` on every authorization response, success and error |
+| [MCP Authorization 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization) | End-to-end MCP auth flow |
 
 Companion docs:
 - [`specs.md`](./specs.md) — design + flow rationale.

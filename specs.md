@@ -14,13 +14,14 @@ This proxy MUST conform to the following specifications:
 
 | Spec | Usage |
 |---|---|
-| [OAuth 2.1 (draft-ietf-oauth-v2-1-13)](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1-13) | Authorization code + PKCE flow, token handling, security requirements. Draft-13 is the version pinned by MCP Authorization 2025-06-18; the IETF OAuth WG has since published `draft-15` — deltas tracked separately and not yet adopted here |
+| [OAuth 2.1 (draft-ietf-oauth-v2-1-13)](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1-13) | Authorization code + PKCE flow, token handling, security requirements. Draft-13 is the version pinned by MCP Authorization 2026-07-28; the IETF OAuth WG has since published `draft-15` — deltas tracked separately and not yet adopted here |
 | [RFC 8414 — OAuth 2.0 Authorization Server Metadata](https://datatracker.ietf.org/doc/html/rfc8414) | `GET /.well-known/oauth-authorization-server` discovery endpoint |
 | [RFC 7591 — OAuth 2.0 Dynamic Client Registration](https://datatracker.ietf.org/doc/html/rfc7591) | `POST /register` — automatic client registration for MCP clients |
 | [RFC 9728 — OAuth 2.0 Protected Resource Metadata](https://datatracker.ietf.org/doc/html/rfc9728) | `GET /.well-known/oauth-protected-resource` — MCP clients discover the AS through this endpoint; `WWW-Authenticate` header on 401 responses MUST include `resource_metadata` URL |
 | [RFC 8707 — Resource Indicators for OAuth 2.0](https://www.rfc-editor.org/rfc/rfc8707.html) | `resource` parameter accepted in `/authorize` and `/token` requests |
 | [RFC 7636 — PKCE](https://datatracker.ietf.org/doc/html/rfc7636) | `code_verifier` must be 43-128 characters, `code_challenge_method` must be `S256` |
-| [MCP Authorization Spec (2025-06-18)](https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization) | End-to-end MCP auth flow combining the above RFCs |
+| [RFC 9207 — OAuth 2.0 Authorization Server Issuer Identification](https://datatracker.ietf.org/doc/html/rfc9207) | `iss` parameter on every authorization response (success and error redirects); `authorization_response_iss_parameter_supported: true` in AS metadata |
+| [MCP Authorization Spec (2026-07-28)](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization) | End-to-end MCP auth flow combining the above RFCs |
 
 ### Claude-specific requirements
 
