@@ -113,12 +113,19 @@ func TestCIMDRejectSpecialPurpose(t *testing.T) {
 		{"240.0.0.1", false},
 		{"255.255.255.255", false},
 		{"0.0.0.0", false},
+		{"192.31.196.1", false}, // AS112-v4
+		{"192.52.193.1", false}, // AMT
+		{"192.175.48.1", false}, // Direct Delegation AS112
 		{"::", false},
 		{"::1", false},
 		{"fd00::1", false},
 		{"fe80::1", false},
 		{"fe80::1%eth0", false},
 		{"2001:db8::1", false},
+		{"2620:4f:8000::1", false}, // Direct Delegation AS112 v6
+		{"3fff::1", false},         // documentation, RFC 9637
+		{"5f00::1", false},         // SRv6 SIDs, RFC 9602
+		{"100:0:0:1::1", false},    // DRIP, RFC 9780
 		{"::ffff:127.0.0.1", false},
 		{"64:ff9b::a00:1", false},       // NAT64 of 10.0.0.1
 		{"64:ff9b:1::a9fe:a9fe", false}, // local-use NAT64 of 169.254.169.254
@@ -127,6 +134,22 @@ func TestCIMDRejectSpecialPurpose(t *testing.T) {
 		{"2606:4700::1111", true},
 		{"64:ff9b::808:808", true}, // NAT64 of 8.8.8.8
 		{"2002:808:808::1", true},  // 6to4 of 8.8.8.8
+		// Neighbours on both sides of each special-purpose boundary, so a
+		// prefix typed one bit too wide in either direction fails here.
+		{"192.31.195.1", true},
+		{"192.31.197.1", true},
+		{"192.52.192.1", true},
+		{"192.52.194.1", true},
+		{"192.175.47.1", true},
+		{"192.175.49.1", true},
+		{"2620:4f:7fff::1", true},
+		{"2620:4f:8001::1", true},
+		{"3ffe:ffff::1", true},
+		{"3fff:1000::1", true},
+		{"5eff:ffff::1", true},
+		{"5f01::1", true},
+		{"6000::1", true}, // further out, past the 5f00::/16 block
+		{"100:0:0:2::1", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.addr, func(t *testing.T) {
