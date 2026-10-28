@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 
 	"github.com/babs/mcp-auth-proxy/config"
@@ -133,15 +132,15 @@ func Register(tm *token.Manager, logger *zap.Logger, audience string, regCfg Reg
 			writeOAuthError(w, r, http.StatusBadRequest, "invalid_client_metadata", "client_name exceeds maximum length")
 			return
 		}
-		// Reject control bytes (NUL / CR / LF / TAB / etc.) and the
-		// X-User-Groups delimiter `,`. zap escapes the access-log
+		// Reject control bytes (NUL / CR / LF / TAB / etc.), bidi
+		// controls and the X-User-Groups delimiter `,`. zap escapes the access-log
 		// line so log injection is neutralized at the transport, but
 		// the sealed client_id carries the raw bytes — anything
 		// downstream that unseals and parses ClientName would
 		// inherit them. Mirrors the group-name filter at
 		// callback.go (M12). RFC 7591 §2 permits operator-side
 		// rejection of metadata; §3.2.2 prescribes the error code.
-		if strings.ContainsAny(req.ClientName, ",\r\n\t\x00\x0b\x0c") {
+		if clientNameForbidden(req.ClientName) {
 			writeOAuthError(w, r, http.StatusBadRequest, "invalid_client_metadata", "client_name must not contain control bytes or commas")
 			return
 		}

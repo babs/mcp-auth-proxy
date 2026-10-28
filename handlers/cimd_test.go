@@ -61,6 +61,11 @@ func TestValidateCIMDClientID(t *testing.T) {
 		{"https://a..b/c", false},
 		{"https://-h/c", false},
 		{"https://" + strings.Repeat("a", 64) + ".example.com/c", false},
+		{"https://h/a b", false},
+		{"https://h/caf\u00e9.json", false},
+		{"HTTPS://h/x", false},
+		{"https://h/a%20b", true},
+		{"https://h/%7Euser/c.json", true},
 		{"https://h/", true},
 		{"https://h/client.json", true},
 		{"https://h:8443/c.json", true},
@@ -134,9 +139,10 @@ func TestCIMDRejectSpecialPurpose(t *testing.T) {
 		{"5f00::1", false},         // SRv6 SIDs, RFC 9602
 		{"100:0:0:1::1", false},    // Dummy IPv6 Prefix, RFC 9780
 		{"::ffff:127.0.0.1", false},
-		{"64:ff9b::a00:1", false},       // NAT64 of 10.0.0.1
-		{"64:ff9b:1::a9fe:a9fe", false}, // local-use NAT64 of 169.254.169.254
-		{"2002:7f00:1::1", false},       // 6to4 of 127.0.0.1
+		{"64:ff9b::a00:1", false},        // NAT64 of 10.0.0.1
+		{"64:ff9b:1::a9fe:a9fe", false},  // local-use NAT64 (RFC 8215), not globally reachable
+		{"64:ff9b:1:808:8:800::", false}, // same block, public 8.8.8.8 in its RFC 6052 /48 layout
+		{"2002:7f00:1::1", false},        // 6to4 of 127.0.0.1
 		{"8.8.8.8", true},
 		{"2606:4700::1111", true},
 		{"64:ff9b::808:808", true}, // NAT64 of 8.8.8.8
@@ -243,6 +249,26 @@ func TestCIMDResolve_DefaultGuardBlocksLoopback(t *testing.T) {
 	}
 	if n := hits.Load(); n != 0 {
 		t.Fatalf("server received %d requests, want 0: the guard must run before the connection", n)
+	}
+}
+
+// MAP-002-AC5: IPv4 embedded in IPv6 is refused by the production
+// transport's dial hook, not only by the table it calls.
+func TestCIMDResolve_DialHookUnwrapsEmbeddedIPv4(t *testing.T) {
+	tr := NewCIMDResolver(zap.NewNop(), config.RedirectAllowlist{}, config.WebRedirectAllowlist{}, config.CIMDHostAllowlist{}, CIMDResolverOptions{}).client.Transport.(*http.Transport)
+	for _, addr := range []string{
+		"[::ffff:10.0.0.1]:443",    // IPv4-mapped
+		"[64:ff9b::7f00:1]:443",    // NAT64 well-known prefix -> 127.0.0.1
+		"[64:ff9b:1::808:808]:443", // NAT64 local-use, blocked whole
+		"[2002:c0a8:101::1]:443",   // 6to4 -> 192.168.1.1
+	} {
+		conn, err := tr.DialContext(context.Background(), "tcp", addr)
+		if conn != nil {
+			_ = conn.Close()
+		}
+		if !errors.Is(err, errCIMDBlockedAddress) {
+			t.Errorf("dial %s: want errCIMDBlockedAddress, got %v", addr, err)
+		}
 	}
 }
 
@@ -379,6 +405,12 @@ func TestCIMDResolve(t *testing.T) {
 		}, want: cimdDocInvalid},
 		{name: "client_name control byte", body: func(id string) string {
 			return `{"client_id":` + jsonStr(id) + `,"redirect_uris":["https://app.example/cb"],"client_name":"a\nb"}`
+		}, want: cimdDocInvalid},
+		{name: "client_name bidi override, JSON escape", body: func(id string) string {
+			return `{"client_id":` + jsonStr(id) + `,"redirect_uris":["https://app.example/cb"],"client_name":"Claude Desktop\u202e"}`
+		}, want: cimdDocInvalid},
+		{name: "client_name bidi isolate, raw UTF-8", body: func(id string) string {
+			return `{"client_id":` + jsonStr(id) + `,"redirect_uris":["https://app.example/cb"],"client_name":"a` + "\u2066" + `b"}`
 		}, want: cimdDocInvalid},
 		{name: "client_name comma", body: func(id string) string {
 			return `{"client_id":` + jsonStr(id) + `,"redirect_uris":["https://app.example/cb"],"client_name":"a,b"}`

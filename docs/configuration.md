@@ -152,9 +152,11 @@ ones operators most often want to wire up.
   of validated documents, judged after `CIMD_ALLOWED_HOSTS`: `hit` (no
   fetch, no validation, nothing in `cimd_fetch_total`), `miss`, `expired`
   (the entry outlived its TTL and was dropped; a fetch follows). TTL from
-  the document response: `s-maxage` over `max-age`, clamped to 60 s to
-  24 h, 5 min when absent or unparsable; `no-store`, `no-cache` or
-  `private` is not cached. Only a validated document is cached: fetch errors and invalid
+  the document response: `s-maxage`, `max-age`, else `Expires` minus
+  `Date`, less the current age (`Age`, or the time since `Date` if
+  larger); clamped to 60 s to 24 h, 5 min when none is
+  given; `no-store`, `no-cache`, `private`, an invalid `Expires` or a
+  stale response is not cached. Only a validated document is cached: fetch errors and invalid
   documents never are.
 - `mcp_auth_cimd_cache_entries` — documents currently cached, at most
   1 000 per replica (least recently used evicted first).

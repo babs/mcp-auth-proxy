@@ -30,9 +30,9 @@ const consentTTL = 5 * time.Minute
 
 // consentPageData is the model passed to the embedded HTML template.
 // All fields go through html/template's contextual escaping so an
-// attacker-supplied client_name (already control-byte-filtered at
-// DCR time but accepted as arbitrary printable bytes) cannot inject
-// markup or scripts.
+// attacker-supplied client_name (filtered by clientNameForbidden at
+// /register and in CIMD documents, otherwise arbitrary printable text)
+// cannot inject markup or scripts.
 type consentPageData struct {
 	ClientName      string
 	ClientHost      string
@@ -44,10 +44,10 @@ type consentPageData struct {
 	HasClientName   bool
 	HasClientHost   bool
 	HasResourceURI  bool
-	// LoopbackOnly adds the "runs on this computer" notice: every
-	// registered redirect_uri is loopback, so any local program could be
+	// LoopbackRedirect adds the "runs on this computer" notice: the
+	// requested redirect_uri is loopback, so any local program could be
 	// the requester.
-	LoopbackOnly bool
+	LoopbackRedirect bool
 	// ReplayNotice is set when this render replaces a rejected
 	// replayed submit — the user sees why they are being asked again.
 	ReplayNotice bool
@@ -77,13 +77,13 @@ var consentTmpl = template.Must(template.New("consent").Parse(`<!doctype html>
   want to authorize this client again, please confirm below.</p>
   {{end}}
   {{if .HasClientName}}
-  <p><strong>{{.ClientName}}</strong>{{if .HasClientHost}} (<code>{{.ClientHost}}</code>){{end}} is requesting access to {{if .ResourceName}}<strong>{{.ResourceName}}</strong>{{else}}this MCP service{{end}}.</p>
+  <p><strong><bdi>{{.ClientName}}</bdi></strong>{{if .HasClientHost}} (<code>{{.ClientHost}}</code>){{end}} is requesting access to {{if .ResourceName}}<strong>{{.ResourceName}}</strong>{{else}}this MCP service{{end}}.</p>
   {{else if .HasClientHost}}
   <p>An MCP client published at <code>{{.ClientHost}}</code> is requesting access to {{if .ResourceName}}<strong>{{.ResourceName}}</strong>{{else}}this MCP service{{end}}. The client did not provide a name.</p>
   {{else}}
   <p>An MCP client is requesting access to {{if .ResourceName}}<strong>{{.ResourceName}}</strong>{{else}}this MCP service{{end}}. The client did not provide a registered name.</p>
   {{end}}
-  {{if .LoopbackOnly}}
+  {{if .LoopbackRedirect}}
   <p class="notice">This client runs on this computer. Any program running
   here could present this screen; approve only if you started the request.</p>
   {{end}}
@@ -239,18 +239,18 @@ func renderConsent(w http.ResponseWriter, r *http.Request, tm *token.Manager, lo
 	}
 
 	data := consentPageData{
-		ClientName:      consent.ClientName,
-		HasClientName:   consent.ClientName != "",
-		ClientHost:      consent.ClientHost,
-		HasClientHost:   consent.ClientHost != "",
-		LoopbackOnly:    consent.LoopbackOnly,
-		ResourceName:    resourceName,
-		ResourceURI:     consent.Resource,
-		HasResourceURI:  consent.Resource != "" && resourceName == "",
-		RedirectDisplay: redirectDisplay(consent.RedirectURI),
-		ConsentToken:    consentToken,
-		ApproveURL:      baseURL + "/consent",
-		ReplayNotice:    replayNotice,
+		ClientName:       consent.ClientName,
+		HasClientName:    consent.ClientName != "",
+		ClientHost:       consent.ClientHost,
+		HasClientHost:    consent.ClientHost != "",
+		LoopbackRedirect: consent.LoopbackRedirect,
+		ResourceName:     resourceName,
+		ResourceURI:      consent.Resource,
+		HasResourceURI:   consent.Resource != "" && resourceName == "",
+		RedirectDisplay:  redirectDisplay(consent.RedirectURI),
+		ConsentToken:     consentToken,
+		ApproveURL:       baseURL + "/consent",
+		ReplayNotice:     replayNotice,
 	}
 
 	// Consent page must not be cached: a back-button replay after a

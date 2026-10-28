@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -155,34 +156,63 @@ func TestCIMDResolve_NotCached(t *testing.T) {
 
 // MAP-002-AC11
 func TestCIMDCacheTTL(t *testing.T) {
+	now := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) string { return now.Add(d).Format(http.TimeFormat) }
 	cases := []struct {
 		header string
+		other  http.Header
 		want   time.Duration
 	}{
-		{"", 5 * time.Minute},
-		{"max-age=1", 60 * time.Second},
-		{"max-age=86401", 24 * time.Hour},
-		{"s-maxage=120, max-age=10", 120 * time.Second},
-		{"max-age=10, s-maxage=120", 120 * time.Second},
-		{"no-store", 0},
-		{"no-cache", 0},
-		{"public, max-age=600, no-store", 0},
-		{"private, max-age=300", 0},
-		{"public, max-age=300", 300 * time.Second},
-		{"max-age=abc", 5 * time.Minute},
-		{"max-age=-5", 5 * time.Minute},
-		{"max-age=99999999999999999999", 24 * time.Hour},
-		{"Max-Age=120", 120 * time.Second},
-		{`max-age="120"`, 120 * time.Second},
+		{"", nil, 5 * time.Minute},
+		{"max-age=1", nil, 60 * time.Second},
+		{"max-age=86401", nil, 24 * time.Hour},
+		{"s-maxage=120, max-age=10", nil, 120 * time.Second},
+		{"max-age=10, s-maxage=120", nil, 120 * time.Second},
+		{"no-store", nil, 0},
+		{"no-cache", nil, 0},
+		{"public, max-age=600, no-store", nil, 0},
+		{"private, max-age=300", nil, 0},
+		{"public, max-age=300", nil, 300 * time.Second},
+		{"max-age=abc", nil, 5 * time.Minute},
+		{"max-age=-5", nil, 5 * time.Minute},
+		{"max-age=99999999999999999999", nil, 24 * time.Hour},
+		{"Max-Age=120", nil, 120 * time.Second},
+		{`max-age="120"`, nil, 120 * time.Second},
+		{"max-age=600", http.Header{"Age": {"100"}}, 500 * time.Second},
+		{"max-age=300", http.Header{"Age": {"290"}}, 60 * time.Second},
+		{"max-age=300", http.Header{"Age": {"300"}}, 0},
+		{"s-maxage=120, max-age=900", http.Header{"Age": {"60"}}, 60 * time.Second},
+		{"max-age=31536000", http.Header{"Age": {"172800"}}, 24 * time.Hour},
+		{"max-age=600", http.Header{"Age": {"x"}}, 600 * time.Second},
+		{"", http.Header{"Age": {"9999"}}, 5 * time.Minute},
+		{"", http.Header{"Expires": {"0"}}, 0},
+		{"", http.Header{"Expires": {"garbage"}}, 0},
+		{"", http.Header{"Expires": {""}}, 0},
+		{"", http.Header{"Expires": {at(-time.Hour)}}, 0},
+		{"", http.Header{"Expires": {at(10 * time.Minute)}}, 10 * time.Minute},
+		{"", http.Header{"Expires": {at(10 * time.Minute)}, "Date": {at(8 * time.Minute)}}, 2 * time.Minute},
+		{"", http.Header{"Expires": {at(10 * time.Minute)}, "Age": {"420"}}, 3 * time.Minute},
+		{"max-age=300", http.Header{"Expires": {"0"}}, 300 * time.Second},
+		{"", http.Header{"Expires": {at(10 * time.Minute)}, "Date": {at(-time.Hour)}}, 10 * time.Minute},
+		{"max-age=900", http.Header{"Date": {at(-300 * time.Second)}}, 600 * time.Second},
+		{"max-age=900", http.Header{"Date": {at(-300 * time.Second)}, "Age": {"400"}}, 500 * time.Second},
+		{"max-age=900", http.Header{"Date": {at(time.Hour)}}, 900 * time.Second},
+		{"", http.Header{"Expires": {"Mon, 01 Jan 1600 00:00:00 GMT"}, "Age": {"1"}}, 0},
+		{"", http.Header{"Expires": {at(time.Hour)}, "Date": {"Fri, 31 Dec 9999 23:59:59 GMT"}, "Age": {"1"}}, 0},
+		{"", http.Header{"Expires": {"Thu, 01 Jan 1970 00:00:00 GMT"}, "Age": {"99999999999999999999"}}, 0},
+		{"max-age=600", http.Header{"Age": {"99999999999999999999"}}, 0},
 	}
 	for _, tc := range cases {
-		t.Run(tc.header, func(t *testing.T) {
-			h := http.Header{}
+		t.Run(fmt.Sprintf("%s|%v", tc.header, tc.other), func(t *testing.T) {
+			h := tc.other.Clone()
+			if h == nil {
+				h = http.Header{}
+			}
 			if tc.header != "" {
 				h.Set(cimdCacheControlHeader, tc.header)
 			}
-			if got := cimdCacheTTL(h); got != tc.want {
-				t.Errorf("cimdCacheTTL(%q) = %v, want %v", tc.header, got, tc.want)
+			if got := cimdCacheTTL(h, now); got != tc.want {
+				t.Errorf("cimdCacheTTL(%q, %v) = %v, want %v", tc.header, tc.other, got, tc.want)
 			}
 		})
 	}

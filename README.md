@@ -178,10 +178,10 @@ shipped defaults give you, with no extra effort:
   boundary: the resolved address is checked against the IANA
   special-purpose registries (RFC 6890 and successors), no redirects, 5 KiB body, 5 s, 16 fetches in
   flight per replica; validated documents are cached per replica (1 000
-  entries, `Cache-Control` TTL clamped to 60 s to 24 h, errors never
+  entries, TTL from the response headers, clamped to 60 s to 24 h, errors never
   cached). `CIMD_ALLOWED_HOSTS` narrows the hosts a
   `client_id` may name; the consent page shows the metadata host and
-  warns when the client only redirects to loopback. `CIMD_ENABLED=false`
+  warns when the requested redirect URI is loopback. `CIMD_ENABLED=false`
   refuses URL `client_id`s as unknown clients and fetches nothing. Details in
   [`specs.md`](./specs.md#get-authorize) and
   [`docs/threat-model.md`](./docs/threat-model.md).

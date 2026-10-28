@@ -405,6 +405,9 @@ func TestRegister_RejectsClientNameControlBytes(t *testing.T) {
 		"null":        "foo\x00bar",
 		"vtab":        "foo\x0bbar",
 		"comma_delim": "team-a,team-b",
+		"bidi_rlo":    "Claude Desktop\u202e",
+		"bidi_rli":    "a\u2067b",
+		"bidi_rlm":    "a\u200fb",
 	}
 	for name, value := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -427,6 +430,22 @@ func TestRegister_RejectsClientNameControlBytes(t *testing.T) {
 				t.Errorf("error = %q, want invalid_client_metadata", oe.Error)
 			}
 		})
+	}
+}
+
+// Every Unicode bidi control is refused: one left open after the name
+// would reverse the consent-page host shown next to it. Letters of RTL
+// scripts are not controls and stay accepted.
+func TestClientNameForbidden(t *testing.T) {
+	for _, r := range "\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069" {
+		if !clientNameForbidden("app" + string(r)) {
+			t.Errorf("U+%04X accepted", r)
+		}
+	}
+	for _, name := range []string{"Claude Desktop", "日本語クライアント", "عميل", "émoji 🚀"} {
+		if clientNameForbidden(name) {
+			t.Errorf("%q refused", name)
+		}
 	}
 }
 

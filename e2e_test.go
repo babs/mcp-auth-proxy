@@ -1222,7 +1222,7 @@ func TestE2E_CIMDClient(t *testing.T) {
 	status, _, page := do(t, http.MethodGet, proxyServer.URL+"/authorize?"+params.Encode(), nil)
 	// The page names the document's client_name and the metadata host, the
 	// user's cue that this client is published at a URL.
-	if status != http.StatusOK || !strings.Contains(page, "<strong>CIMD e2e app</strong> (<code>localhost:"+port+"</code>) is requesting") {
+	if status != http.StatusOK || !strings.Contains(page, "<strong><bdi>CIMD e2e app</bdi></strong> (<code>localhost:"+port+"</code>) is requesting") {
 		t.Fatalf("GET /authorize = %d, want the consent page naming the document's client_name and host:\n%s", status, page)
 	}
 

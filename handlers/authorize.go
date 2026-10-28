@@ -264,7 +264,7 @@ func Authorize(tm *token.Manager, logger *zap.Logger, baseURL string, oauth2Cfg 
 				ClientID:              client.ID,
 				ClientName:            client.ClientName,
 				ClientHost:            cimdClientHost(client.ID),
-				LoopbackOnly:          loopbackOnly(client.RedirectURIs),
+				LoopbackRedirect:      loopbackRedirect(redirectURI),
 				RedirectURI:           redirectURI,
 				OriginalState:         state,
 				CodeChallenge:         codeChallenge,

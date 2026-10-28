@@ -402,8 +402,8 @@ func TestToken_CIMDForwardingSealCap(t *testing.T) {
 }
 
 // MAP-002-AC2: the consent page names the metadata host of a CIMD
-// client, and warns when every registered redirect_uri is loopback
-// (DCR clients get the same warning, no host).
+// client, and warns when the requested redirect_uri is loopback (DCR
+// clients get the same warning, no host).
 func TestAuthorize_ConsentTrustCues(t *testing.T) {
 	const (
 		loopbackRegistered = "http://127.0.0.1/cb"
@@ -420,7 +420,9 @@ func TestAuthorize_ConsentTrustCues(t *testing.T) {
 	}{
 		{"cimd loopback-only", true, []string{loopbackRegistered}, loopbackRequested, true},
 		{"cimd https", true, []string{cimdAppRedirect}, cimdAppRedirect, false},
-		{"cimd mixed", true, []string{loopbackRegistered, cimdAppRedirect}, loopbackRequested, false},
+		{"cimd mixed, loopback requested", true, []string{loopbackRegistered, cimdAppRedirect}, loopbackRequested, true},
+		{"cimd mixed, https requested", true, []string{loopbackRegistered, cimdAppRedirect}, cimdAppRedirect, false},
+		{"dcr mixed, loopback requested", false, []string{cimdAppRedirect, loopbackRegistered}, loopbackRequested, true},
 		{"dcr loopback-only", false, []string{loopbackRegistered}, loopbackRequested, true},
 		{"dcr https", false, []string{cimdAppRedirect}, cimdAppRedirect, false},
 	}
@@ -444,7 +446,7 @@ func TestAuthorize_ConsentTrustCues(t *testing.T) {
 				t.Fatalf("want 200 consent page, got %d: %s", rr.Code, rr.Body.String())
 			}
 			body := rr.Body.String()
-			if !strings.Contains(body, "<strong>"+cimdAppName+"</strong>") {
+			if !strings.Contains(body, "<strong><bdi>"+cimdAppName+"</bdi></strong>") {
 				t.Errorf("client_name missing:\n%s", body)
 			}
 			if tc.cimd && !strings.Contains(body, "</strong> ("+wantHost+") is requesting") {
@@ -461,8 +463,8 @@ func TestAuthorize_ConsentTrustCues(t *testing.T) {
 			if err := tm.OpenJSON(extractConsentToken(t, body), &consent, token.PurposeConsent); err != nil {
 				t.Fatal(err)
 			}
-			if consent.LoopbackOnly != tc.wantNotice || (consent.ClientHost != "") != tc.cimd {
-				t.Errorf("sealed consent lb=%v ch=%q", consent.LoopbackOnly, consent.ClientHost)
+			if consent.LoopbackRedirect != tc.wantNotice || (consent.ClientHost != "") != tc.cimd {
+				t.Errorf("sealed consent lb=%v ch=%q", consent.LoopbackRedirect, consent.ClientHost)
 			}
 		})
 	}
@@ -513,21 +515,18 @@ func TestToken_CIMDHostRecheck(t *testing.T) {
 	}
 }
 
-// The consent cues derive from the registration alone: no URI, or one
-// non-loopback URI, means no notice; only a CIMD id yields a host.
+// The notice follows the requested redirect_uri; only a CIMD id yields a host.
 func TestConsentCueHelpers(t *testing.T) {
-	for _, tc := range []struct {
-		uris []string
-		want bool
-	}{
-		{nil, false},
-		{[]string{"http://127.0.0.1/cb"}, true},
-		{[]string{"http://localhost:8080/cb", "http://[::1]/cb"}, true},
-		{[]string{"http://127.0.0.1/cb", cimdAppRedirect}, false},
-		{[]string{"://bad"}, false},
+	for raw, want := range map[string]bool{
+		"":                         false,
+		"http://127.0.0.1/cb":      true,
+		"http://localhost:8080/cb": true,
+		"http://[::1]/cb":          true,
+		cimdAppRedirect:            false,
+		"://bad":                   false,
 	} {
-		if got := loopbackOnly(tc.uris); got != tc.want {
-			t.Errorf("loopbackOnly(%v) = %v, want %v", tc.uris, got, tc.want)
+		if got := loopbackRedirect(raw); got != want {
+			t.Errorf("loopbackRedirect(%q) = %v, want %v", raw, got, want)
 		}
 	}
 	for id, want := range map[string]string{

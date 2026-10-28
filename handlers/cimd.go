@@ -108,6 +108,7 @@ var cimdSpecialPurpose = []netip.Prefix{
 	netip.MustParsePrefix("240.0.0.0/4"),
 	netip.MustParsePrefix("::/128"),
 	netip.MustParsePrefix("::1/128"),
+	netip.MustParsePrefix("64:ff9b:1::/48"),
 	netip.MustParsePrefix("100::/64"),
 	netip.MustParsePrefix("100:0:0:1::/64"),
 	netip.MustParsePrefix("2001::/23"),
@@ -124,9 +125,8 @@ var cimdSpecialPurpose = []netip.Prefix{
 // one that gets judged, so NAT64 or 6to4 cannot smuggle 10.0.0.1 past
 // the table.
 var (
-	cimdNAT64      = netip.MustParsePrefix("64:ff9b::/96")
-	cimdNAT64Local = netip.MustParsePrefix("64:ff9b:1::/48")
-	cimd6to4       = netip.MustParsePrefix("2002::/16")
+	cimdNAT64 = netip.MustParsePrefix("64:ff9b::/96")
+	cimd6to4  = netip.MustParsePrefix("2002::/16")
 )
 
 // cimdRejectSpecialPurpose returns errCIMDBlockedAddress (wrapped, naming
@@ -152,7 +152,7 @@ func cimdEmbeddedIPv4(addr netip.Addr) netip.Addr {
 	}
 	b := addr.As16()
 	switch {
-	case cimdNAT64.Contains(addr), cimdNAT64Local.Contains(addr):
+	case cimdNAT64.Contains(addr):
 		return netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]})
 	case cimd6to4.Contains(addr):
 		return netip.AddrFrom4([4]byte{b[2], b[3], b[4], b[5]})
@@ -208,6 +208,11 @@ func validateCIMDClientID(clientID string) (*url.URL, *cimdError) {
 	// (`*.example.com`, `<b>x`) could otherwise match a glob or reach a log.
 	if err := config.CheckHostname(strings.ToLower(u.Hostname())); err != nil {
 		return invalid("host is not a hostname")
+	}
+	// draft -02 §4: the fetched URL must be the client_id itself, and
+	// url.URL re-escapes a raw space or non-ASCII byte on the wire.
+	if u.String() != clientID {
+		return invalid("not in canonical URL form")
 	}
 	return u, nil
 }
@@ -413,7 +418,7 @@ func (r *CIMDResolver) fetch(ctx context.Context, u *url.URL) ([]byte, time.Dura
 	if len(body) > cimdMaxBodyBytes {
 		return nil, 0, &cimdError{Result: cimdTooLarge, Desc: "client metadata document exceeds the size cap"}
 	}
-	return body, cimdCacheTTL(resp.Header), nil
+	return body, cimdCacheTTL(resp.Header, r.cache.now()), nil
 }
 
 // parseCIMDDocument decodes and validates the document for clientID,
@@ -450,9 +455,9 @@ func parseCIMDDocument(body []byte, clientID string, extra config.RedirectAllowl
 	if len(doc.ClientName) > maxClientNameLength {
 		return invalid("client metadata document client_name exceeds maximum length", nil)
 	}
-	// Same byte filter as /register: the name is logged and shown on the
-	// consent page, and `,` is the X-User-Groups delimiter.
-	if strings.ContainsAny(doc.ClientName, ",\r\n\t\x00\x0b\x0c") {
+	// Same filter as /register: the name is logged and shown on the
+	// consent page next to the client_id host.
+	if clientNameForbidden(doc.ClientName) {
 		return invalid("client metadata document client_name must not contain control bytes or commas", nil)
 	}
 	if len(doc.RedirectURIs) == 0 {

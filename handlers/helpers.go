@@ -266,12 +266,12 @@ type sealedConsent struct {
 	// ClientHost is the client_id URL host (port kept) of a Client ID
 	// Metadata Document client, shown next to the name; empty for DCR.
 	ClientHost string `json:"ch,omitempty"`
-	// LoopbackOnly is true when every registered redirect_uri is loopback:
+	// LoopbackRedirect is true when the requested redirect_uri is loopback:
 	// the page then warns that any local program could be the requester.
-	LoopbackOnly  bool   `json:"lb,omitempty"`
-	RedirectURI   string `json:"ru"`
-	OriginalState string `json:"os"`
-	CodeChallenge string `json:"cc,omitempty"`
+	LoopbackRedirect bool   `json:"lb,omitempty"`
+	RedirectURI      string `json:"ru"`
+	OriginalState    string `json:"os"`
+	CodeChallenge    string `json:"cc,omitempty"`
 	// SvrChallengeRequested is true when /authorize is operating
 	// under PKCE_REQUIRED=false AND the client omitted
 	// code_challenge — POST /consent then mints the server-side
@@ -667,20 +667,19 @@ func isLoopback(u *url.URL) bool {
 	return config.IsLoopbackHost(u.Hostname())
 }
 
-// loopbackOnly reports whether every registered redirect URI is
+// loopbackRedirect reports whether the requested redirect URI is
 // loopback: the consent page then cannot tell the user which local
 // program is asking (MCP Authorization, Localhost Redirect URI Risks).
-func loopbackOnly(redirectURIs []string) bool {
-	if len(redirectURIs) == 0 {
-		return false
-	}
-	for _, raw := range redirectURIs {
-		u, err := url.Parse(raw)
-		if err != nil || !isLoopback(u) {
-			return false
-		}
-	}
-	return true
+func loopbackRedirect(raw string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && isLoopback(u)
+}
+
+// clientNameForbidden reports a client_name the proxy refuses: control
+// bytes, `,` (the X-User-Groups delimiter), and Unicode bidi controls,
+// which would reorder the consent-page text after the name, host included.
+func clientNameForbidden(name string) bool {
+	return strings.ContainsAny(name, ",\r\n\t\x00\x0b\x0c\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
 }
 
 // cimdClientHost returns the host (port kept) of a Client ID Metadata
