@@ -57,9 +57,9 @@ type AuthorizeConfig struct {
 	// name via MCP_RESOURCE_NAME. Falls back to CanonicalResource
 	// when empty.
 	ResourceName string
-	// RedirectURIsExtra is re-checked here: removing an entry blocks new
-	// authorizations for clients registered under it (issued refresh
-	// tokens stay valid until expiry; set REVOKE_BEFORE to invalidate them).
+	// RedirectURIsExtra is re-checked here, and at /token: removing an
+	// entry blocks new authorizations, and ends sessions, for clients
+	// registered under it.
 	RedirectURIsExtra config.RedirectAllowlist
 	// RedirectURIsAllowlist is re-checked here for http(s) redirects, as
 	// RedirectURIsExtra is for custom schemes: setting or narrowing it

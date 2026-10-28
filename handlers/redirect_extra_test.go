@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/babs/mcp-auth-proxy/config"
 	"github.com/babs/mcp-auth-proxy/metrics"
+	"github.com/babs/mcp-auth-proxy/replay"
 	"github.com/babs/mcp-auth-proxy/token"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
@@ -424,5 +426,59 @@ func TestCheckCustomRedirect_DistinctDescriptions(t *testing.T) {
 	}
 	if !checkCustomRedirect(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/register", nil), nil) {
 		t.Error("nil error rejected")
+	}
+}
+
+// TestToken_RedirectURIsExtraRecheck pins the /token re-check of
+// REDIRECT_URIS_EXTRA: once the entry that admitted a custom-scheme
+// session is gone (list emptied, scheme dropped, exact entry for another
+// URI), the code and refresh grants are refused before their single-use
+// claims, and pass again when the entry comes back.
+func TestToken_RedirectURIsExtraRecheck(t *testing.T) {
+	const listedURI = "https://allowed.example/cb"
+	tm := newTestTokenManager(t)
+	encClientID, internalID := registerClientWith(t, tm, RegisterConfig{ClientTTL: DefaultClientTTL, RedirectURIsExtra: mustAllowlist(t, "warp://*")}, []string{warpURI, listedURI})
+	codeForm := func() url.Values {
+		return url.Values{
+			"grant_type":    {"authorization_code"},
+			"code":          {sealCode(t, tm, internalID, warpURI, pkceChallenge(fwdVerifier), "user", "u@example.com")},
+			"redirect_uri":  {warpURI},
+			"client_id":     {encClientID},
+			"code_verifier": {fwdVerifier},
+		}
+	}
+	grants := []struct {
+		name string
+		form func() url.Values
+	}{
+		{"authorization_code", codeForm},
+		{"refresh_token", func() url.Values { return refreshForm(encClientID, sealSession(t, tm, internalID, 1)) }},
+	}
+	for _, removed := range []string{"", "other://*", "warp://dev.warp.Warp-Stable/other"} {
+		for _, g := range grants {
+			t.Run(fmt.Sprintf("%s under %q", g.name, removed), func(t *testing.T) {
+				store := replay.NewMemoryStore()
+				t.Cleanup(func() { _ = store.Close() })
+				form := g.form()
+				before := notAllowlistedDenials()
+				core, logs := observer.New(zap.WarnLevel)
+				rr := postGrant(t, tm, zap.New(core), store, TokenConfig{RedirectURIsExtra: mustAllowlist(t, removed)}, form)
+				assertNotAllowlisted(t, rr, logs, before, "invalid_grant", noLongerAllowlistedErr, "grant_type", g.name)
+				if cause := logs.FilterMessage("access_denied_redirect_uri_not_allowlisted").All()[0].ContextMap()["error"]; cause != config.ErrRedirectNotAllowlisted.Error() {
+					t.Errorf("log error = %v, want %q", cause, config.ErrRedirectNotAllowlisted)
+				}
+
+				for _, extra := range []string{"warp://*", warpURI} {
+					rr = postGrant(t, tm, zap.NewNop(), store, TokenConfig{RedirectURIsExtra: mustAllowlist(t, extra)}, g.form())
+					if rr.Code != http.StatusOK {
+						t.Fatalf("listed again as %q: want 200, got %d: %s", extra, rr.Code, rr.Body.String())
+					}
+				}
+				rr = postGrant(t, tm, zap.NewNop(), store, TokenConfig{RedirectURIsExtra: mustAllowlist(t, "warp://*")}, form)
+				if rr.Code != http.StatusOK {
+					t.Fatalf("refused grant replayed once listed again: want 200 (nothing burned), got %d: %s", rr.Code, rr.Body.String())
+				}
+			})
+		}
 	}
 }

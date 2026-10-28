@@ -701,9 +701,10 @@ func driveAuthToCallbackURI(t *testing.T, client *http.Client, proxyURL string, 
 	return cbResp, clientID
 }
 
-// TestE2E_CustomSchemeRedirect drives register → authorize → callback
-// through the real router with REDIRECT_URIS_EXTRA set, for a scheme
-// wildcard and a host-less exact entry.
+// TestE2E_CustomSchemeRedirect drives register → authorize → callback →
+// token → refresh through the real router with REDIRECT_URIS_EXTRA set,
+// for a scheme wildcard and a host-less exact entry, and checks that a
+// deployment without the entry refuses the session's refresh.
 func TestE2E_CustomSchemeRedirect(t *testing.T) {
 	extra, err := config.ParseRedirectAllowlist("warp://*,com.example.app:/cb")
 	if err != nil {
@@ -760,7 +761,34 @@ func TestE2E_CustomSchemeRedirect(t *testing.T) {
 				t.Fatalf("decode /token: %v", err)
 			}
 			if tokResp.StatusCode != http.StatusOK || tok["access_token"] == nil || tok["access_token"] == "" {
-				t.Errorf("/token = %d %v, want 200 with access_token", tokResp.StatusCode, tok)
+				t.Fatalf("/token = %d %v, want 200 with access_token", tokResp.StatusCode, tok)
+			}
+
+			// A deployment sharing the signing secret without the entry
+			// refuses the session's refresh; the original one still honors it.
+			bare := httptest.NewServer(buildTestProxy(t, oidcMock, mcpMock, "http://proxy.test", false, testProxyOptions{}))
+			defer bare.Close()
+			refresh, _ := tok["refresh_token"].(string)
+			for _, tc := range []struct {
+				base string
+				want int
+			}{{bare.URL, http.StatusBadRequest}, {proxyServer.URL, http.StatusOK}} {
+				form := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {refresh}, "client_id": {clientID}}
+				req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, tc.base+"/token", strings.NewReader(form.Encode()))
+				if err != nil {
+					t.Fatalf("build refresh: %v", err)
+				}
+				req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+				resp, err := client.Do(req)
+				if err != nil {
+					t.Fatalf("POST /token refresh: %v", err)
+				}
+				var body map[string]any
+				_ = json.NewDecoder(resp.Body).Decode(&body)
+				resp.Body.Close()
+				if resp.StatusCode != tc.want || (tc.want == http.StatusBadRequest && body["error_code"] != "redirect_uri_mismatch") {
+					t.Fatalf("refresh on %s = %d %v, want %d", tc.base, resp.StatusCode, body, tc.want)
+				}
 			}
 		})
 	}

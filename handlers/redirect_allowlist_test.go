@@ -398,25 +398,28 @@ func TestToken_RefreshJudgesSessionURI(t *testing.T) {
 }
 
 // TestToken_RefreshLegacyTokenNeedsEveryURI pins the fallback for refresh
-// tokens sealed before the session URI existed: every registered http(s)
-// URI must be admitted; custom schemes are not judged.
+// tokens sealed before the session URI existed: every registered URI must
+// be admitted, http(s) by REDIRECT_URIS_ALLOWLIST and custom schemes by
+// REDIRECT_URIS_EXTRA.
 func TestToken_RefreshLegacyTokenNeedsEveryURI(t *testing.T) {
 	const listed = "https://allowed.example/cb"
 	for _, tc := range []struct {
-		name     string
-		uris     []string
-		index    int
-		wantCode int
+		name, extra string
+		uris        []string
+		index       int
+		wantCode    int
 	}{
-		{"one unlisted sibling refuses", []string{"https://second.example/cb", listed}, 0, http.StatusBadRequest},
-		{"every URI listed passes", []string{listed}, 0, http.StatusOK},
-		{"custom-scheme sibling not judged", []string{warpURI, listed}, 0, http.StatusOK},
-		{"out-of-range index falls back", []string{"https://second.example/cb", listed}, 7, http.StatusBadRequest},
+		{"one unlisted sibling refuses", "warp://*", []string{"https://second.example/cb", listed}, 0, http.StatusBadRequest},
+		{"every URI listed passes", "warp://*", []string{listed}, 0, http.StatusOK},
+		{"custom-scheme sibling still in REDIRECT_URIS_EXTRA passes", "warp://*", []string{warpURI, listed}, 0, http.StatusOK},
+		{"custom-scheme sibling dropped from REDIRECT_URIS_EXTRA refuses", "", []string{warpURI, listed}, 0, http.StatusBadRequest},
+		{"out-of-range index falls back", "warp://*", []string{"https://second.example/cb", listed}, 7, http.StatusBadRequest},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			tm := newTestTokenManager(t)
 			encClientID, internalID := registerClientWith(t, tm, RegisterConfig{ClientTTL: DefaultClientTTL, RedirectURIsExtra: mustAllowlist(t, "warp://*")}, tc.uris)
-			rr := postGrant(t, tm, zap.NewNop(), nil, TokenConfig{RedirectURIsAllowlist: mustWebAllowlist(t, listed)}, refreshForm(encClientID, sealSession(t, tm, internalID, tc.index)))
+			cfg := TokenConfig{RedirectURIsExtra: mustAllowlist(t, tc.extra), RedirectURIsAllowlist: mustWebAllowlist(t, listed)}
+			rr := postGrant(t, tm, zap.NewNop(), nil, cfg, refreshForm(encClientID, sealSession(t, tm, internalID, tc.index)))
 			if rr.Code != tc.wantCode {
 				t.Fatalf("want %d, got %d: %s", tc.wantCode, rr.Code, rr.Body.String())
 			}
@@ -425,9 +428,10 @@ func TestToken_RefreshLegacyTokenNeedsEveryURI(t *testing.T) {
 }
 
 // TestToken_RefreshAllowlistPasses pins sessions that keep refreshing:
-// loopback on another port, a custom-scheme session whatever the list
-// says, and an unset list, which changes nothing even for registrations
-// today's /register would refuse.
+// loopback on another port, a custom-scheme session still in
+// REDIRECT_URIS_EXTRA whatever REDIRECT_URIS_ALLOWLIST says, and an unset
+// list, which changes nothing even for registrations today's /register
+// would refuse.
 func TestToken_RefreshAllowlistPasses(t *testing.T) {
 	for _, tc := range []struct {
 		name, allowlist string
@@ -436,6 +440,7 @@ func TestToken_RefreshAllowlistPasses(t *testing.T) {
 	}{
 		{"loopback registered with a port", "http://127.0.0.1/cb", 1, []string{"http://127.0.0.1:5000/cb"}},
 		{"custom-scheme session", "https://allowed.example/cb", 1, []string{warpURI}},
+		{"custom-scheme session, list unset", "", 1, []string{warpURI}},
 		{"list unset", "", 1, []string{"https://second.example/cb"}},
 		{"list unset, unparsable legacy URI", "", 0, []string{"https://app.example.com/%zz"}},
 		{"list unset, no registered URI", "", 0, nil},
@@ -443,7 +448,8 @@ func TestToken_RefreshAllowlistPasses(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			tm := newTestTokenManager(t)
 			encClientID, internalID := sealClientDirect(t, tm, tc.uris)
-			rr := postGrant(t, tm, zap.NewNop(), nil, TokenConfig{RedirectURIsAllowlist: mustWebAllowlist(t, tc.allowlist)}, refreshForm(encClientID, sealSession(t, tm, internalID, tc.session)))
+			cfg := TokenConfig{RedirectURIsExtra: mustAllowlist(t, "warp://*"), RedirectURIsAllowlist: mustWebAllowlist(t, tc.allowlist)}
+			rr := postGrant(t, tm, zap.NewNop(), nil, cfg, refreshForm(encClientID, sealSession(t, tm, internalID, tc.session)))
 			if rr.Code != http.StatusOK {
 				t.Fatalf("want 200, got %d: %s", rr.Code, rr.Body.String())
 			}
