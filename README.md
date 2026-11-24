@@ -62,7 +62,7 @@ already wired up, see [Demo stack](#demo-stack).
 - **Public HTTPS** terminating at an ingress that reaches the proxy's
   `LISTEN_ADDR` (`:8080` by default). The IdP and the MCP clients both
   see `PROXY_BASE_URL` over the public network.
-- **Go 1.27.3+** (matches `go.mod`) if building from source. Container images are static
+- **Go 1.27.4+** (matches `go.mod`) if building from source. Container images are static
   (`CGO_ENABLED=0`).
 - **Kubernetes**: any conformant cluster. Sample manifests under
   [`manifests/`](./manifests). Production overlay enforces the safe
@@ -400,9 +400,11 @@ runs both paths automatically on every PR.
 Tagged releases are built by
 [`release.yml`](./.github/workflows/release.yml) with **SLSA
 provenance** (`mode=max`) + **SBOM** attestations embedded in the OCI
-image index, and **keyless cosign signatures** over both the
-per-platform image digests and the merged multi-arch index, anchored
-in the Rekor transparency log.
+image index, and **keyless cosign signatures** over the merged
+multi-arch index and every manifest under it (`cosign sign
+--recursive`), anchored in the Rekor transparency log. A pull by tag
+or by platform digest verifies. `unsigned-staging` is a CI scratch
+tag: never deploy it.
 
 Image tags strip the `v` prefix (`ghcr.io/babs/mcp-auth-proxy:1.0.0`)
 while git tags carry it (`v1.0.0`). The identity regex below matches
