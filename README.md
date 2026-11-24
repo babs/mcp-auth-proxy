@@ -400,9 +400,11 @@ runs both paths automatically on every PR.
 Tagged releases are built by
 [`release.yml`](./.github/workflows/release.yml) with **SLSA
 provenance** (`mode=max`) + **SBOM** attestations embedded in the OCI
-image index, and **keyless cosign signatures** over both the
-per-platform image digests and the merged multi-arch index, anchored
-in the Rekor transparency log.
+image index, and **keyless cosign signatures** over the merged
+multi-arch index and every manifest under it (`cosign sign
+--recursive`), anchored in the Rekor transparency log. A pull by tag
+or by platform digest verifies. `unsigned-staging` is a CI scratch
+tag: never deploy it.
 
 Image tags strip the `v` prefix (`ghcr.io/babs/mcp-auth-proxy:1.0.0`)
 while git tags carry it (`v1.0.0`). The identity regex below matches

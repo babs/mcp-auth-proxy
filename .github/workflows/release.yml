@@ -19,7 +19,6 @@ jobs:
     permissions:
       contents: read
       packages: write
-      id-token: write
 
     strategy:
       fail-fast: false
@@ -115,22 +114,6 @@ jobs:
           provenance: mode=max
           sbom: true
 
-      - name: Install cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-
-      - name: Sign published image (keyless, Fulcio+Rekor)
-        env:
-          # All tags in $TARGETS point at the same content digest from
-          # this build step, so one signature per digest covers every
-          # tag. Keyless: Fulcio mints a short-lived cert from the
-          # GitHub Actions OIDC token; Rekor records the signature in
-          # the public transparency log.
-          DIGEST: ${{ steps.build-and-push.outputs.digest }}
-        run: |
-          for REPO in $REPOS; do
-            cosign sign --yes "${REPO}@${DIGEST}"
-          done
-
       - name: Summary
         run: |
           echo "✅ Docker image created:" | tee -a $GITHUB_STEP_SUMMARY
@@ -143,9 +126,9 @@ jobs:
     needs: build-image
     runs-on: ubuntu-latest
     # contents:write is required to create the GitHub Release below.
-    # packages:write lets docker manifest push into GHCR.
-    # id-token:write is required for cosign keyless signing of the
-    # merged multi-arch index (Fulcio needs the OIDC token).
+    # packages:write lets imagetools and cosign push into GHCR.
+    # id-token:write is required for cosign keyless signing (Fulcio
+    # needs the OIDC token); only this job holds it.
     permissions:
       contents: write
       packages: write
@@ -160,44 +143,43 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Merge images
-        # docker buildx imagetools (vs the classic docker manifest CLI)
-        # is required because per-platform builds with provenance/sbom
-        # attestations push an OCI index (image + attestations) rather
-        # than a plain image. `docker manifest create` rejects indexes
-        # with "is a manifest list"; imagetools handles them and
-        # preserves the per-platform attestations in the merged index.
-        run: |
-          for IMG_TAG in ${{ needs.build-image.outputs.RAW_IMG_TAGS }}; do
-            for REPO in $REPOS; do
-              TGT=${REPO}:${IMG_TAG}
-              docker buildx imagetools create \
-                -t "$TGT" \
-                "$TGT-linux-amd64" \
-                "$TGT-linux-arm64"
-              echo "merged image $TGT" | tee -a $GITHUB_STEP_SUMMARY
-            done
-          done
+      # --metadata-file on imagetools create needs a recent buildx.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
-      - name: Sign merged multi-arch index
-        # build-image signs the per-platform digests; this step signs
-        # the multi-arch INDEX digest that consumers pull by tag. Without
-        # this, `cosign verify $REPO:$TAG` fails even though the children
-        # are signed, because cosign looks up signatures on the tag's
-        # manifest digest (the index) first.
+      - name: Merge, sign and tag the multi-arch index
+        # imagetools, not `docker manifest`: per-platform builds with
+        # provenance/sbom push an OCI index, which `docker manifest create`
+        # rejects.
+        env:
+          IMG_TAGS: ${{ needs.build-image.outputs.RAW_IMG_TAGS }}
+          ISSUER: https://token.actions.githubusercontent.com
+          IDENTITY: ${{ github.server_url }}/${{ github.workflow_ref }}
         run: |
-          for IMG_TAG in ${{ needs.build-image.outputs.RAW_IMG_TAGS }}; do
-            for REPO in $REPOS; do
-              TGT=${REPO}:${IMG_TAG}
-              # docker buildx imagetools reads the index digest straight
-              # from the registry; more robust than parsing `docker
-              # manifest push` stdout across CLI versions.
-              DIGEST=$(docker buildx imagetools inspect "$TGT" --format '{{.Manifest.Digest}}')
-              cosign sign --yes "${REPO}@${DIGEST}"
-              echo "signed index $TGT @ $DIGEST" | tee -a $GITHUB_STEP_SUMMARY
+          set -euo pipefail
+          # Merge once, from the run's most specific tag (the full version on a tag run):
+          # `latest-linux-*` is shared with dispatch runs and can be moved under us.
+          read -ra TAGS <<< "$IMG_TAGS"
+          SRC=${TAGS[1]:-${TAGS[0]}}
+          for REPO in $REPOS; do
+            # imagetools needs a tag to push to. Scratch tag, moved every run: never deploy it.
+            docker buildx imagetools create --metadata-file "$RUNNER_TEMP/index.json" \
+              -t "$REPO:unsigned-staging" \
+              "$REPO:$SRC-linux-amd64" \
+              "$REPO:$SRC-linux-arm64"
+            DIGEST=$(jq -re '."containerimage.descriptor".digest' "$RUNNER_TEMP/index.json")
+            # --recursive also signs each platform image: without it a pull by
+            # platform digest has no signature.
+            cosign sign --yes --recursive "${REPO}@${DIGEST}"
+            cosign verify --certificate-identity "$IDENTITY" --certificate-oidc-issuer "$ISSUER" "${REPO}@${DIGEST}" >/dev/null
+            # Public tags move only after the signature verifies.
+            for IMG_TAG in $IMG_TAGS; do
+              docker buildx imagetools create -t "$REPO:$IMG_TAG" "${REPO}@${DIGEST}"
+              GOT=$(docker buildx imagetools inspect "$REPO:$IMG_TAG" --format '{{json .Manifest}}' | jq -r .digest)
+              [[ "$GOT" == "$DIGEST" ]] || { echo "::error::$REPO:$IMG_TAG is $GOT, not the signed $DIGEST"; exit 1; }
+              echo "signed $REPO:$IMG_TAG @ $DIGEST" | tee -a "$GITHUB_STEP_SUMMARY"
             done
           done
 
