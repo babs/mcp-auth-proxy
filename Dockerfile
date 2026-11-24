@@ -1,7 +1,7 @@
 # Base images pinned by digest for supply-chain reproducibility.
 # Bump deliberately — the human-readable tag in the comment after `#`
 # is for review context, only the @sha256 selects the image.
-FROM golang:1.27-alpine@sha256:b8c9b82affbbb82a020bbcf998dad2ba9516944ac7e883524642a481a9505e9c AS builder
+FROM golang:1.27-alpine@sha256:70bd7ddea8b6cbe5d6943cde279d6b67feb10cc924fb9100d1d8757c1575b280 AS builder
 
 ARG VERSION="v0.0.0"
 ARG COMMIT_HASH="00000000-dirty"
